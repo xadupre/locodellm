@@ -20,10 +20,17 @@ command line::
 #
 # Default values can be overridden with ``--model``, ``--precision``, and
 # ``--provider`` when running the script directly.
+#
+# When the environment variable ``UNITTEST_GOING`` is set to ``"1"`` (as done
+# while running the unit tests or building the documentation), the example
+# skips the download and conversion of the real model and uses a small mock
+# ONNX model instead, so the example stays cheap and offline-friendly.
 
 import argparse
 import os
 import sys
+
+UNITTEST_GOING = os.environ.get("UNITTEST_GOING") == "1"
 
 # Ensure the project root is on sys.path when running the script directly.
 if "__file__" in dir():
@@ -96,8 +103,11 @@ print(
 #         -p fp32 \
 #         -e cpu \
 #         -c docs/examples/Qwen_Qwen2.5-Coder-0.5B-Instruct/cache
+#
+# Under ``UNITTEST_GOING=1`` this step is replaced by
+# :func:`locodellm.test_models.create_mock_generate_model`, which builds a
+# tiny lookup-table ONNX model reproducing the exact outputs of this example.
 
-from modelbuilder.builder import create_model  # noqa: E402
 from locodellm import extract_code  # noqa: E402
 from locodellm.session import create_session  # noqa: E402
 
@@ -107,7 +117,15 @@ root_dir = os.path.join(here, folder_name)
 output_dir = os.path.join(root_dir, "onnx_model")
 cache_dir = os.path.join(root_dir, "cache")
 
-if not os.path.exists(os.path.join(output_dir, "model.onnx")):
+if os.path.exists(os.path.join(output_dir, "model.onnx")):
+    print("ONNX model already exists, skipping conversion.")
+elif UNITTEST_GOING:
+    from locodellm.test_models import create_mock_generate_model
+
+    create_mock_generate_model(output_dir)
+else:
+    from modelbuilder.builder import create_model
+
     create_model(
         model_name=MODEL_ID,
         input_path="",
@@ -116,8 +134,6 @@ if not os.path.exists(os.path.join(output_dir, "model.onnx")):
         execution_provider=PROVIDER,
         cache_dir=cache_dir,
     )
-else:
-    print("ONNX model already exists, skipping conversion.")
 
 print(
     "Converted model files:", sorted(f for f in os.listdir(output_dir) if not f.startswith("."))
