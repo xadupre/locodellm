@@ -36,9 +36,7 @@ def main(args: list[str] | None = None) -> None:
         parser.print_help()
         sys.exit(1)
 
-    dispatch = {
-        "version": _cmd_version,
-    }
+    dispatch = {"version": _cmd_version}
     dispatch[parsed.command](parsed)
 
 
