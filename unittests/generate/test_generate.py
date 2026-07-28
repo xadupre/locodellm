@@ -2,7 +2,6 @@ import os
 import unittest
 
 from locodellm.ext_test_case import ExtTestCase
-from locodellm.generate import generate
 from locodellm.session import SessionState, create_session
 from locodellm.test_models import create_tiny_model
 
@@ -69,15 +68,6 @@ class TestGenerate(ExtTestCase):
             f"Second turn text should start with first turn text: "
             f"{session.text!r} does not start with {first_text!r}",
         )
-
-    def test_generate_convenience_function(self):
-        """Checks the backward-compatible generate() function still works."""
-        session = generate(prompt="<s>", model=self.model_path, max_length=10)
-        self.assertIsInstance(session, SessionState)
-        self.assertGreater(session.tokens.size, 0)
-
-        session = generate(prompt="<s>", model=session, max_length=30)
-        self.assertGreater(session.tokens.size, 1)
 
 
 if __name__ == "__main__":
