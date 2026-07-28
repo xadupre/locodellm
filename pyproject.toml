@@ -38,6 +38,7 @@ docs = [
     "sphinx>=7",
     "sphinx-copybutton",
     "sphinx-design",
+    "sphinx-gallery",
     "sphinx-runpython",
 ]
 
