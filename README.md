@@ -22,47 +22,57 @@ python -m locodellm version
 
 ### Python API
 
-#### `generate`
+#### `create_session` and `session.generate`
 
 ```python
-from locodellm.generate import generate
+from locodellm.session import create_session
 ```
 
-Calls a local LLM loaded from an ONNX model directory (compatible with
+Creates a session from an ONNX model directory (compatible with
 [onnxruntime-genai](https://github.com/microsoft/onnxruntime-genai)) and
-returns a `SessionState`.
+generates text.
 
 ```python
-session = generate(
-    prompt="Once upon a time",
-    model="path/to/model",          # model directory, og.Model, or SessionState
+session = create_session(
+    "path/to/model",                # model directory or og.Model
     providers=None,                  # e.g. ["CUDAExecutionProvider"]
+)
+session.generate(
+    "Once upon a time",
     max_length=200,                  # max tokens (prompt + generated)
     temperature=0.7,                 # extra search options
 )
 print(session.text)
 ```
 
-**Parameters:**
+**`create_session` parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `model` | `str \| og.Model` | A path to the model directory or an already-loaded `onnxruntime_genai.Model`. |
+| `providers` | `list[str] \| None` | Ordered list of execution providers. Ignored when `model` is not a path. |
+| `verbose` | `int` | Verbosity level (0 = silent). |
+| `chat_template` | `str \| None` | Chat template to wrap prompts (e.g. `"chatml"`). |
+
+**`session.generate` parameters:**
 
 | Name | Type | Description |
 |------|------|-------------|
 | `prompt` | `str` | The text prompt to send to the model. |
-| `model` | `str \| SessionState \| og.Model` | A path to the model directory, an already-loaded `onnxruntime_genai.Model`, or a `SessionState` from a previous call to continue the conversation. |
-| `providers` | `list[str] \| None` | Ordered list of execution providers. Ignored when `model` is not a path. |
-| `max_length` | `int` | Maximum number of tokens to generate (including all tokens across turns). |
+| `max_length` | `int` | Maximum number of tokens (including all tokens across turns). |
 | `**search_options` | | Extra options forwarded to `GeneratorParams.set_search_options` (e.g. `temperature`, `top_k`, `top_p`). |
 
-**Returns:** A `SessionState` instance.
+**Returns:** The `SessionState` instance (for chaining).
 
 #### Multi-turn conversations
 
-Pass the returned `SessionState` back as the `model` argument to continue
-the conversation with full context:
+Call `session.generate` multiple times to continue the conversation with
+full context:
 
 ```python
-session = generate("Hello, who are you?", "path/to/model")
-session = generate("Tell me more about that.", session, max_length=500)
+session = create_session("path/to/model")
+session.generate("Hello, who are you?", max_length=200)
+session.generate("Tell me more about that.", max_length=500)
 print(session.text)  # only the latest turn's output
 ```
 
@@ -93,7 +103,8 @@ enough for onnxruntime-genai to load and run.
 
 ```python
 model_path = create_tiny_model("/tmp/my-tiny-llm")
-session = generate("<s>", model_path, max_length=10)
+session = create_session(model_path)
+session.generate("<s>", max_length=10)
 ```
 
 ## Development

@@ -4,8 +4,7 @@ API
 .. toctree::
     :maxdepth: 1
 
-    generate
-    session
-    test_models
+    session/index
+    test_models/index
 
 .. automodule:: locodellm
