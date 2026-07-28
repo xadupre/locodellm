@@ -28,6 +28,11 @@ class TestDocumentationExamples(ExtTestCase):
 
         Returns:
             ``1`` when the example ran successfully.
+
+        Raises:
+            unittest.SkipTest: When the failure is caused by a lack of
+                connectivity to the HuggingFace Hub.
+            AssertionError: When the example fails for any other reason.
         """
         env = os.environ.copy()
         env["UNITTEST_GOING"] = "1"
