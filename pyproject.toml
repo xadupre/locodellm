@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "locodellm"
+version = "0.1.0"
+description = "locodellm"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+style = [
+    "black==26.5.1",
+    "ruff==0.15.20",
+]
+typing = [
+    "mypy==2.1.0",
+    "pyrefly==1.1.1",
+]
+dev = [
+    "locodellm[style]",
+    "pytest>=7",
+    "pytest-coverage",
+]
+
+[tool.setuptools.packages.find]
+include = ["locodellm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["unittests"]
+
+[tool.black]
+line-length = 98
+extend-exclude = '''.*clones*'''
+skip-magic-trailing-comma = true
+
+[tool.ruff]
+exclude = [
+    ".eggs",
+    ".git",
+    "build",
+    "dist",
+]
+line-length = 98
+
+[tool.ruff.lint]
+fixable = ["UP006", "UP035"]
+unfixable = ["E731", "F401", "I001"]
+select = [
+    "B",
+    "C4",
+    "E",
+    "F",
+    "G",
+    "ISC",
+    "LOG",
+    "PIE",
+    "PYI",
+    "RUF",
+    "SIM",
+    "SLOT",
+    "T10",
+    "UP",
+    "W",
+    "YTT",
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"**" = [
+    "B028", "B905",
+    "C401", "C408", "C413",
+    "PYI041",
+    "RUF002", "RUF003", "RUF010", "RUF012", "RUF100",
+    "SIM102", "SIM103", "SIM108", "SIM114", "SIM300", "SIM910",
+    "UP006", "UP007", "UP015", "UP027", "UP031", "UP032", "UP034", "UP035", "UP037", "UP045",
+]
+"*/__init__.py" = ["F401"]
+"unittests/**" = ["B023", "B904", "E731", "SIM300"]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.pyrefly]
+project-includes = ["locodellm/**/*.py"]
