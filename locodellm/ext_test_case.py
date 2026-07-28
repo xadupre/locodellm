@@ -25,6 +25,16 @@ def is_apple() -> bool:
     return sys.platform == "darwin"
 
 
+def is_unittest_going() -> bool:
+    """Returns ``True`` when the code runs inside the unit tests.
+
+    The flag is enabled by setting the environment variable
+    ``UNITTEST_GOING`` to ``"1"``.  It lets documentation examples and other
+    scripts pick cheaper, offline-friendly code paths while being tested.
+    """
+    return os.environ.get("UNITTEST_GOING") == "1"
+
+
 def has_onnxruntime_genai() -> bool:
     """Returns ``True`` when ``onnxruntime-genai`` is importable."""
     try:
