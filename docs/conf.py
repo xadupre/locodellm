@@ -1,4 +1,3 @@
-import os
 import sys
 
 import locodellm
@@ -36,9 +35,7 @@ intersphinx_mapping = {
     "python": (f"https://docs.python.org/{sys.version_info.major}", None),
 }
 
-suppress_warnings = [
-    "intersphinx.external",
-]
+suppress_warnings = ["intersphinx.external"]
 
 epkg_dictionary = {
     "numpy": "https://numpy.org/",

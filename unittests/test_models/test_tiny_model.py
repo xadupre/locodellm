@@ -19,7 +19,12 @@ class TestTinyModel(unittest.TestCase):
 
     def test_tiny_model_files_exist(self):
         """Checks that the tiny model directory contains the expected files."""
-        for name in ("model.onnx", "genai_config.json", "tokenizer.json", "tokenizer_config.json"):
+        for name in (
+            "model.onnx",
+            "genai_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ):
             path = os.path.join(self.model_path, name)
             self.assertTrue(os.path.isfile(path), f"missing {name}")
 

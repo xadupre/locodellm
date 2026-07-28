@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 
-
 # Architecture constants kept deliberately small so that the model
 # loads and runs in a fraction of a second with negligible memory.
 VOCAB_SIZE = 32
@@ -91,46 +90,60 @@ def make_decoder_model():
     # the accumulated sequence).
     #
     # new_kv_shape = [batch, NUM_KEY_VALUE_HEADS, seq_len, HEAD_SIZE]
-    nodes.extend([
-        helper.make_node("Shape", ["input_ids"], ["ids_shape"]),
-        helper.make_node(
-            "Constant", [], ["idx_0"],
-            value=helper.make_tensor("idx_0", TensorProto.INT64, [], [0]),
-        ),
-        helper.make_node(
-            "Constant", [], ["idx_1"],
-            value=helper.make_tensor("idx_1", TensorProto.INT64, [], [1]),
-        ),
-        helper.make_node("Gather", ["ids_shape", "idx_0"], ["batch_dim"], axis=0),
-        helper.make_node("Gather", ["ids_shape", "idx_1"], ["seq_dim"], axis=0),
-        helper.make_node(
-            "Constant", [], ["one_shape"],
-            value=helper.make_tensor("one_shape", TensorProto.INT64, [1], [1]),
-        ),
-        helper.make_node("Reshape", ["batch_dim", "one_shape"], ["batch_1d"]),
-        helper.make_node("Reshape", ["seq_dim", "one_shape"], ["seq_1d"]),
-        helper.make_node(
-            "Constant", [], ["kv_heads_dim"],
-            value=helper.make_tensor(
-                "kv_heads_dim", TensorProto.INT64, [1], [NUM_KEY_VALUE_HEADS]
+    nodes.extend(
+        [
+            helper.make_node("Shape", ["input_ids"], ["ids_shape"]),
+            helper.make_node(
+                "Constant",
+                [],
+                ["idx_0"],
+                value=helper.make_tensor("idx_0", TensorProto.INT64, [], [0]),
             ),
-        ),
-        helper.make_node(
-            "Constant", [], ["head_dim"],
-            value=helper.make_tensor(
-                "head_dim", TensorProto.INT64, [1], [HEAD_SIZE]
+            helper.make_node(
+                "Constant",
+                [],
+                ["idx_1"],
+                value=helper.make_tensor("idx_1", TensorProto.INT64, [], [1]),
             ),
-        ),
-        # [batch, NUM_KEY_VALUE_HEADS, seq_len, HEAD_SIZE]
-        helper.make_node(
-            "Concat", ["batch_1d", "kv_heads_dim", "seq_1d", "head_dim"],
-            ["new_kv_shape"], axis=0,
-        ),
-        helper.make_node(
-            "ConstantOfShape", ["new_kv_shape"], ["new_kv_zeros"],
-            value=helper.make_tensor("zero", TensorProto.FLOAT, [1], [0.0]),
-        ),
-    ])
+            helper.make_node("Gather", ["ids_shape", "idx_0"], ["batch_dim"], axis=0),
+            helper.make_node("Gather", ["ids_shape", "idx_1"], ["seq_dim"], axis=0),
+            helper.make_node(
+                "Constant",
+                [],
+                ["one_shape"],
+                value=helper.make_tensor("one_shape", TensorProto.INT64, [1], [1]),
+            ),
+            helper.make_node("Reshape", ["batch_dim", "one_shape"], ["batch_1d"]),
+            helper.make_node("Reshape", ["seq_dim", "one_shape"], ["seq_1d"]),
+            helper.make_node(
+                "Constant",
+                [],
+                ["kv_heads_dim"],
+                value=helper.make_tensor(
+                    "kv_heads_dim", TensorProto.INT64, [1], [NUM_KEY_VALUE_HEADS]
+                ),
+            ),
+            helper.make_node(
+                "Constant",
+                [],
+                ["head_dim"],
+                value=helper.make_tensor("head_dim", TensorProto.INT64, [1], [HEAD_SIZE]),
+            ),
+            # [batch, NUM_KEY_VALUE_HEADS, seq_len, HEAD_SIZE]
+            helper.make_node(
+                "Concat",
+                ["batch_1d", "kv_heads_dim", "seq_1d", "head_dim"],
+                ["new_kv_shape"],
+                axis=0,
+            ),
+            helper.make_node(
+                "ConstantOfShape",
+                ["new_kv_shape"],
+                ["new_kv_zeros"],
+                value=helper.make_tensor("zero", TensorProto.FLOAT, [1], [0.0]),
+            ),
+        ]
+    )
 
     # Concat past KV with the new zero slice along the sequence axis (axis=2)
     for i in range(NUM_HIDDEN_LAYERS):
@@ -200,9 +213,7 @@ def make_genai_config() -> dict:
                     "present_key_names": "present.%d.key",
                     "present_value_names": "present.%d.value",
                 },
-                "session_options": {
-                    "provider_options": [],
-                },
+                "session_options": {"provider_options": []},
             },
         },
         "search": {
