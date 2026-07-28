@@ -21,12 +21,73 @@ class SessionState:
         verbose: Verbosity level (0 = silent, 1+ = print progress).
     """
 
-    def __init__(self, model: Any, tokenizer: Any, verbose: int = 0) -> None:
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        verbose: int = 0,
+        model_path: str | None = None,
+        chat_template: str | None = None,
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.tokens: np.ndarray = np.array([], dtype=np.int32)
         self.text: str = ""
         self.verbose = verbose
+        self._model_path = model_path
+        self._eos_ids: set[int] | None = None
+        self._chat_template = chat_template
+        self._turn_count = 0
+
+    def _get_eos_token_ids(self) -> set[int]:
+        """Return the set of EOS token ids from the model config."""
+        if self._eos_ids is not None:
+            return self._eos_ids
+
+        import json
+        import os
+
+        if self._model_path is None:
+            self._eos_ids = set()
+            return self._eos_ids
+
+        genai_config = os.path.join(self._model_path, "genai_config.json")
+        if not os.path.exists(genai_config):
+            self._eos_ids = set()
+            return self._eos_ids
+
+        with open(genai_config) as f:
+            config = json.load(f)
+
+        eos = config.get("model", {}).get("decoder", {}).get("eos_token_id", None)
+        if eos is None:
+            self._eos_ids = set()
+        elif isinstance(eos, int):
+            self._eos_ids = {eos}
+        elif isinstance(eos, list):
+            self._eos_ids = set(eos)
+        else:
+            self._eos_ids = set()
+        return self._eos_ids
+
+    def _wrap_prompt(self, prompt: str) -> str:
+        """Wrap *prompt* with the chat template if one is configured.
+
+        For ChatML (used by Qwen, many instruct models):
+        - First turn: ``<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n``
+        - Subsequent turns:
+          ``<|im_end|>\\n<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n``
+        """
+        if self._chat_template is None:
+            return prompt
+        if self._chat_template == "chatml":
+            if self._turn_count == 0:
+                return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            else:
+                return (
+                    f"<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                )
+        raise ValueError(f"Unknown chat template: {self._chat_template!r}")
 
     def generate(self, prompt: str, max_length: int = 200, **search_options: Any) -> SessionState:
         """Generate text from *prompt*, appending to the conversation history.
@@ -49,7 +110,9 @@ class SessionState:
 
         if self.verbose:
             print(f"[generate] encoding prompt ({len(prompt)} chars)")
-        prompt_ids = self.tokenizer.encode(prompt)
+
+        wrapped = self._wrap_prompt(prompt)
+        prompt_ids = self.tokenizer.encode(wrapped)
 
         if self.tokens.size > 0:
             context = np.concatenate([self.tokens, prompt_ids])
@@ -77,8 +140,16 @@ class SessionState:
             token = generator.get_next_tokens()
             new_tokens.extend(token.tolist())
 
+        # Strip trailing EOS tokens so the next turn doesn't start with them.
+        # When the model finishes via EOS (not max_length), these tokens would
+        # cause immediate EOS generation on the next turn.
+        eos_ids = self._get_eos_token_ids()
+        while new_tokens and new_tokens[-1] in eos_ids:
+            new_tokens.pop()
+
         self.tokens = np.concatenate([context, np.array(new_tokens, dtype=np.int32)])
         self.text = self.tokenizer.decode(new_tokens)
+        self._turn_count += 1
 
         if self.verbose:
             print(
@@ -90,7 +161,10 @@ class SessionState:
 
 
 def create_session(
-    model: str | Any, providers: list[str] | None = None, verbose: int = 0
+    model: str | Any,
+    providers: list[str] | None = None,
+    verbose: int = 0,
+    chat_template: str | None = None,
 ) -> SessionState:
     """Create a :class:`SessionState` from a model path or loaded model.
 
@@ -103,6 +177,9 @@ def create_session(
             Ignored when *model* is not a path.
         verbose: Verbosity level (0 = silent, 1+ = print progress
             messages during model loading and generation).
+        chat_template: Chat template to apply around prompts.
+            Use ``"chatml"`` for Qwen and other ChatML-based instruct models.
+            When *None*, prompts are sent as-is.
 
     Returns:
         A new :class:`SessionState` ready for :meth:`SessionState.generate`.
@@ -124,8 +201,14 @@ def create_session(
             loaded = og.Model(model)
         if verbose:
             print("[create_session] model loaded, creating tokenizer")
-        return SessionState(loaded, og.Tokenizer(loaded), verbose=verbose)
+        return SessionState(
+            loaded,
+            og.Tokenizer(loaded),
+            verbose=verbose,
+            model_path=model,
+            chat_template=chat_template,
+        )
 
     if verbose:
         print("[create_session] using pre-loaded model, creating tokenizer")
-    return SessionState(model, og.Tokenizer(model), verbose=verbose)
+    return SessionState(model, og.Tokenizer(model), verbose=verbose, chat_template=chat_template)

@@ -57,11 +57,15 @@ dmypy.json
 
 # Generated model weights (sphinx-gallery examples)
 docs/examples/arnir0_*/
+docs/examples/Beebey_*/
+docs/examples/codeparrot_*/
+docs/examples/Qwen_*/
 docs/examples/tiny-llm/
 
 # Sphinx build output
 docs/_build/
 docs/auto_examples/
+docs/sg_execution_times.rst
 
 # Test dump folder
 dump_test/

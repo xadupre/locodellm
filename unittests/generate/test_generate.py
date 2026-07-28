@@ -80,7 +80,5 @@ class TestGenerate(ExtTestCase):
         self.assertGreater(session.tokens.size, 1)
 
 
-import unittest
-
 if __name__ == "__main__":
     unittest.main()
