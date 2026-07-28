@@ -1,3 +1,4 @@
+import os
 import sys
 
 import locodellm
@@ -18,11 +19,19 @@ extensions = [
     "sphinx.ext.todo",
     "sphinx_copybutton",
     "sphinx_design",
+    "sphinx_gallery.gen_gallery",
     "sphinx_runpython.epkg",
     "sphinx_runpython.runpython",
 ]
 
-exclude_patterns = ["_build"]
+sphinx_gallery_conf = {
+    "examples_dirs": [os.path.join(os.path.dirname(__file__), "examples")],
+    "gallery_dirs": ["auto_examples"],
+    "parallel": 1,
+    "within_subsection_order": "ExampleTitleSortKey",
+}
+
+exclude_patterns = ["_build", "examples/README.rst"]
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
 html_theme_options = {

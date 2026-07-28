@@ -55,5 +55,16 @@ dmypy.json
 .idea/
 .vscode/
 
+# Generated model weights (sphinx-gallery examples)
+docs/examples/arnir0_*/
+docs/examples/tiny-llm/
+
+# Sphinx build output
+docs/_build/
+docs/auto_examples/
+
+# Test dump folder
+dump_test/
+
 # Pixi
 .pixi/

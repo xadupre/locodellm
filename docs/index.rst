@@ -16,13 +16,15 @@ Quick start
 
 .. code-block:: python
 
-    from locodellm.generate import generate
+    from locodellm.session import create_session
 
-    session = generate("Once upon a time", "path/to/model")
+    session = create_session("path/to/model")
+    session.generate("Once upon a time")
     print(session.text)
 
 .. toctree::
     :maxdepth: 2
     :caption: Contents
 
+    auto_examples/index
     api/index
