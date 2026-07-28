@@ -1,5 +1,7 @@
 # locodellm
 
+Experimentation around local LLM.
+
 ## Install
 
 ```bash
