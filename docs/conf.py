@@ -25,9 +25,12 @@ extensions = [
 exclude_patterns = ["_build"]
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
+html_logo = "_static/logo.svg"
+html_favicon = "_static/logo.svg"
 html_theme_options = {
     "github_url": "https://github.com/xadupre/locodellm",
     "header_links_before_dropdown": 10,
+    "logo": {"text": "locodellm"},
 }
 
 intersphinx_mapping = {

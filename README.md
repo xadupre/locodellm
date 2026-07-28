@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/_static/logo.svg" alt="locodellm logo" width="128" height="128">
+</p>
+
 # locodellm
 
 Experimentation around local LLM.
