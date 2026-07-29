@@ -1,6 +1,8 @@
+import os
+import tempfile
 import unittest
 
-from locodellm.bench import ExpectedResult, PromptTest
+from locodellm.bench import ExpectedResult, PromptTest, dump_prompt_tests, load_prompt_tests
 
 
 class TestPromptTestSerialization(unittest.TestCase):
@@ -78,6 +80,62 @@ class TestPromptTestSerialization(unittest.TestCase):
         restored = PromptTest.from_json(pt.to_json())
         self.assertEqual(restored.expected[0].expected, {"sum": 3})
         self.assertEqual(restored.expected[0].args, ([1, 2],))
+
+
+class TestDumpLoadPromptTests(unittest.TestCase):
+    """Tests for dump_prompt_tests and load_prompt_tests."""
+
+    def setUp(self):
+        """Creates a temporary directory for test files."""
+        self._tmpdir = tempfile.mkdtemp()
+        self._path = os.path.join(self._tmpdir, "tests.jsonl")
+
+    def _make_tests(self):
+        """Creates a sample list of PromptTest instances."""
+        return [
+            PromptTest(
+                prompt="write add",
+                expected=[
+                    ExpectedResult(args=(1, 2), expected=3),
+                    ExpectedResult(args=(0, 0), expected=0),
+                ],
+            ),
+            PromptTest(prompt="write noop", expected=[ExpectedResult(args=(), expected=None)]),
+            PromptTest(prompt="empty test", expected=[]),
+        ]
+
+    def test_roundtrip(self):
+        """Checks that dump/load is a lossless roundtrip."""
+        tests = self._make_tests()
+        dump_prompt_tests(tests, self._path)
+        loaded = load_prompt_tests(self._path)
+        self.assertEqual(loaded, tests)
+
+    def test_file_format_is_jsonl(self):
+        """Checks that the file contains one JSON object per line."""
+        tests = self._make_tests()
+        dump_prompt_tests(tests, self._path)
+        with open(self._path) as f:
+            lines = [line for line in f if line.strip()]
+        self.assertEqual(len(lines), 3)
+
+    def test_empty_list(self):
+        """Checks that an empty list produces an empty file."""
+        dump_prompt_tests([], self._path)
+        loaded = load_prompt_tests(self._path)
+        self.assertEqual(loaded, [])
+
+    def test_blank_lines_are_skipped(self):
+        """Checks that blank lines in the file are ignored."""
+        tests = self._make_tests()
+        dump_prompt_tests(tests, self._path)
+        # Insert blank lines
+        with open(self._path) as f:
+            content = f.read()
+        with open(self._path, "w") as f:
+            f.write("\n" + content + "\n\n")
+        loaded = load_prompt_tests(self._path)
+        self.assertEqual(loaded, tests)
 
 
 if __name__ == "__main__":

@@ -56,3 +56,44 @@ class PromptTest:
             prompt=data["prompt"],
             expected=[ExpectedResult.from_dict(e) for e in data.get("expected", [])],
         )
+
+
+def dump_prompt_tests(tests: list[PromptTest], path: str) -> None:
+    """Writes a list of :class:`PromptTest` to a JSON Lines file.
+
+    Each line in the output file is a self-contained JSON object
+    representing one :class:`PromptTest`.
+
+    Args:
+        tests: The list of prompt tests to serialize.
+        path: File path to write to.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        for test in tests:
+            row = {"prompt": test.prompt, "expected": [e.to_dict() for e in test.expected]}
+            f.write(json.dumps(row) + "\n")
+
+
+def load_prompt_tests(path: str) -> list[PromptTest]:
+    """Reads a list of :class:`PromptTest` from a JSON Lines file.
+
+    Args:
+        path: File path to read from.
+
+    Returns:
+        The deserialized list of prompt tests.
+    """
+    tests: list[PromptTest] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            tests.append(
+                PromptTest(
+                    prompt=data["prompt"],
+                    expected=[ExpectedResult.from_dict(e) for e in data.get("expected", [])],
+                )
+            )
+    return tests
