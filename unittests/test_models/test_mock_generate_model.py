@@ -58,6 +58,27 @@ class TestMockGenerateModel(ExtTestCase):
         session.generate("change hello into bonjour", max_length=500)
         self.assertEqual(session.tokens.size, 114)
 
+    @skipif_no_genai()
+    def test_new_session(self):
+        """Checks that new_session resets conversation state."""
+        from locodellm.session import create_session
+
+        session = create_session(self.model_path, chat_template="chatml")
+        session.generate('write a python function which returns "hello"', max_length=200)
+        self.assertGreater(session.tokens.size, 0)
+        self.assertNotEqual(session.text, "")
+
+        new = session.new_session()
+        self.assertEqual(new.tokens.size, 0)
+        self.assertEqual(new.text, "")
+        self.assertIs(new.model, session.model)
+        self.assertIs(new.tokenizer, session.tokenizer)
+        self.assertEqual(new.verbose, session.verbose)
+
+        # The new session can generate independently.
+        new.generate('write a python function which returns "hello"', max_length=200)
+        self.assertEqual(new.tokens.size, session.tokens.size)
+
 
 if __name__ == "__main__":
     unittest.main()
