@@ -98,30 +98,49 @@ class TestGenerateFromModel(ExtTestCase):
         with self.assertRaises(KeyError):
             generate_from_model("mock/nonexistent", prompt="hello", cache_dir=self._tmpdir)
 
-    def test_convert_model_success(self):
-        """Checks that _convert_model passes correct args to create_model."""
+    def _inject_fake_modelbuilder(self, calls):
+        """Replaces modelbuilder.builder in sys.modules with a fake."""
         import sys
         import types
-        from locodellm.generate.generate_from_model import _convert_model
-
-        calls = []
 
         def fake_create_model(**kwargs):
             calls.append(kwargs)
 
+        fake_parent = types.ModuleType("modelbuilder")
         fake_builder = types.ModuleType("modelbuilder.builder")
         fake_builder.create_model = fake_create_model
-        original = sys.modules.get("modelbuilder.builder")
+        fake_parent.builder = fake_builder
+
+        originals = {
+            "modelbuilder": sys.modules.get("modelbuilder"),
+            "modelbuilder.builder": sys.modules.get("modelbuilder.builder"),
+        }
+        sys.modules["modelbuilder"] = fake_parent
         sys.modules["modelbuilder.builder"] = fake_builder
+        return originals
+
+    def _restore_modelbuilder(self, originals):
+        """Restores the original modelbuilder modules."""
+        import sys
+
+        for key, value in originals.items():
+            if value is not None:
+                sys.modules[key] = value
+            else:
+                sys.modules.pop(key, None)
+
+    def test_convert_model_success(self):
+        """Checks that _convert_model passes correct args to create_model."""
+        from locodellm.generate.generate_from_model import _convert_model
+
+        calls = []
+        originals = self._inject_fake_modelbuilder(calls)
         try:
             _convert_model(
                 "Qwen/Qwen2.5-Coder-0.5B-Instruct", "/tmp/out", precision="fp16", verbose=1
             )
         finally:
-            if original is not None:
-                sys.modules["modelbuilder.builder"] = original
-            else:
-                del sys.modules["modelbuilder.builder"]
+            self._restore_modelbuilder(originals)
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model_name"], "Qwen/Qwen2.5-Coder-0.5B-Instruct")
@@ -130,54 +149,35 @@ class TestGenerateFromModel(ExtTestCase):
 
     def test_convert_model_default_precision(self):
         """Checks that _convert_model defaults to fp32 precision."""
-        import sys
-        import types
         from locodellm.generate.generate_from_model import _convert_model
 
         calls = []
-
-        def fake_create_model(**kwargs):
-            calls.append(kwargs)
-
-        fake_builder = types.ModuleType("modelbuilder.builder")
-        fake_builder.create_model = fake_create_model
-        original = sys.modules.get("modelbuilder.builder")
-        sys.modules["modelbuilder.builder"] = fake_builder
+        originals = self._inject_fake_modelbuilder(calls)
         try:
             _convert_model("some/model", "/tmp/out")
         finally:
-            if original is not None:
-                sys.modules["modelbuilder.builder"] = original
-            else:
-                del sys.modules["modelbuilder.builder"]
+            self._restore_modelbuilder(originals)
 
         self.assertEqual(calls[0]["precision"], "fp32")
 
     def test_download_and_convert(self):
         """Checks _download_and_convert delegates to _convert_model."""
-        import sys
-        import types
         from locodellm.generate.generate_from_model import _download_and_convert
 
         calls = []
-
-        def fake_create_model(**kwargs):
-            calls.append(kwargs)
-
-        fake_builder = types.ModuleType("modelbuilder.builder")
-        fake_builder.create_model = fake_create_model
-        original = sys.modules.get("modelbuilder.builder")
-        sys.modules["modelbuilder.builder"] = fake_builder
+        originals = self._inject_fake_modelbuilder(calls)
         model_dir = os.path.join(self._tmpdir, "model_out")
         try:
             _download_and_convert(
                 "owner/repo", model_dir, self._tmpdir, "model", precision="int4", verbose=1
             )
         finally:
-            if original is not None:
-                sys.modules["modelbuilder.builder"] = original
-            else:
-                del sys.modules["modelbuilder.builder"]
+            self._restore_modelbuilder(originals)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["model_name"], "owner/repo")
+        self.assertEqual(calls[0]["output_dir"], model_dir)
+        self.assertEqual(calls[0]["precision"], "int4")
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model_name"], "owner/repo")
