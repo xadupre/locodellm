@@ -1,6 +1,14 @@
 locodellm
 =========
 
+.. image:: https://github.com/xadupre/locodellm/actions/workflows/ci.yml/badge.svg
+    :target: https://github.com/xadupre/locodellm/actions/workflows/ci.yml
+    :alt: CI
+
+.. image:: https://codecov.io/gh/xadupre/locodellm/branch/main/graph/badge.svg
+    :target: https://codecov.io/gh/xadupre/locodellm
+    :alt: Coverage
+
 Experimentation around local LLM using
 `onnxruntime-genai <https://github.com/microsoft/onnxruntime-genai>`_.
 
