@@ -14,13 +14,11 @@ dependencies = [
     "numpy",
     "onnx",
     "onnxruntime-genai",
+    "pandas",
     "transformers",
 ]
 
 [project.optional-dependencies]
-bench = [
-    "pandas",
-]
 style = [
     "black==26.5.1",
     "ruff==0.15.20",
