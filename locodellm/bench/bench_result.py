@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pandas
+
 from locodellm.bench.prompt_test import ExpectedResult, PromptTest
 from locodellm.bench.run_code import RunStatus
 
@@ -58,7 +60,7 @@ class BenchResult:
         """Returns the number of prompt tests with at least one failure."""
         return self.total - self.passed
 
-    def to_dataframe(self) -> "pandas.DataFrame":  # noqa: F821
+    def to_dataframe(self) -> pandas.DataFrame:
         """Exports the results as a pandas DataFrame.
 
         Each row represents one expected result assertion. Columns are:
@@ -75,8 +77,6 @@ class BenchResult:
         Returns:
             A :class:`pandas.DataFrame` with one row per assertion.
         """
-        import pandas
-
         rows: list[dict[str, Any]] = []
         for result in self.results:
             base = {

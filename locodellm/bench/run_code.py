@@ -79,7 +79,7 @@ class RunStatus:
     ran: bool = False
     run_error: BaseException | None = None
     result: Any = None
-    _function: types.FunctionType | None = field(default=None, repr=False)
+    _function: Any = field(default=None, repr=False)
 
     @property
     def success(self) -> bool:

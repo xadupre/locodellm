@@ -4,6 +4,7 @@ import unittest
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
 from locodellm.ext_test_case import ExtTestCase, skipif_no_genai
 from locodellm.test_models import create_mock_generate_model
+from locodellm.session import create_session
 
 
 class TestBenchPromptTest(ExtTestCase):
@@ -18,8 +19,6 @@ class TestBenchPromptTest(ExtTestCase):
     @skipif_no_genai()
     def test_passing_test(self):
         """Checks that a correct expected result passes."""
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         tests = [
             PromptTest(
@@ -39,8 +38,6 @@ class TestBenchPromptTest(ExtTestCase):
     @skipif_no_genai()
     def test_failing_test(self):
         """Checks that an incorrect expected result fails."""
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         tests = [
             PromptTest(
@@ -58,8 +55,6 @@ class TestBenchPromptTest(ExtTestCase):
     @skipif_no_genai()
     def test_multiple_tests(self):
         """Checks running multiple prompt tests in one bench."""
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         tests = [
             PromptTest(
@@ -80,8 +75,6 @@ class TestBenchPromptTest(ExtTestCase):
     @skipif_no_genai()
     def test_session_is_restarted_between_tests(self):
         """Checks that each test gets a fresh session."""
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         tests = [
             PromptTest(
@@ -102,8 +95,6 @@ class TestBenchPromptTest(ExtTestCase):
     @skipif_no_genai()
     def test_generated_code_is_captured(self):
         """Checks that the generated code is stored in the result."""
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         tests = [
             PromptTest(
@@ -119,8 +110,6 @@ class TestBenchPromptTest(ExtTestCase):
     def test_to_dataframe(self):
         """Checks that to_dataframe returns a correct DataFrame."""
         import pandas
-
-        from locodellm.session import create_session
 
         session = create_session(self.model_path, chat_template="chatml")
         tests = [

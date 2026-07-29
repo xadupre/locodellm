@@ -50,6 +50,14 @@ include = ["locodellm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["unittests"]
+env = [
+    "UNITTEST_GOING=1",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:importlib.metadata",
+    "ignore:builtin type Swig:DeprecationWarning",
+    "ignore:builtin type swig:DeprecationWarning",
+]
 
 [tool.black]
 line-length = 98
