@@ -3,6 +3,8 @@ import unittest
 
 from locodellm.ext_test_case import ExtTestCase, skipif_no_genai
 from locodellm.test_models import create_mock_generate_model
+from locodellm import extract_code
+from locodellm.session import create_session
 
 
 class TestMockGenerateModel(ExtTestCase):
@@ -26,9 +28,6 @@ class TestMockGenerateModel(ExtTestCase):
     @skipif_no_genai()
     def test_first_prompt(self):
         """Checks that the first prompt produces the expected code."""
-        from locodellm import extract_code
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         session.generate('write a python function which returns "hello"', max_length=200)
         code = extract_code(session.text)
@@ -37,9 +36,6 @@ class TestMockGenerateModel(ExtTestCase):
     @skipif_no_genai()
     def test_second_prompt(self):
         """Checks that the second prompt produces the expected code."""
-        from locodellm import extract_code
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         session.generate('write a python function which returns "hello"', max_length=200)
         session.generate("change hello into bonjour", max_length=500)
@@ -49,14 +45,31 @@ class TestMockGenerateModel(ExtTestCase):
     @skipif_no_genai()
     def test_token_counts(self):
         """Checks the expected token counts for both turns."""
-        from locodellm.session import create_session
-
         session = create_session(self.model_path, chat_template="chatml")
         session.generate('write a python function which returns "hello"', max_length=200)
         self.assertEqual(session.tokens.size, 56)
 
         session.generate("change hello into bonjour", max_length=500)
         self.assertEqual(session.tokens.size, 114)
+
+    @skipif_no_genai()
+    def test_new_session(self):
+        """Checks that new_session resets conversation state."""
+        session = create_session(self.model_path, chat_template="chatml")
+        session.generate('write a python function which returns "hello"', max_length=200)
+        self.assertGreater(session.tokens.size, 0)
+        self.assertNotEqual(session.text, "")
+
+        new = session.new_session()
+        self.assertEqual(new.tokens.size, 0)
+        self.assertEqual(new.text, "")
+        self.assertIs(new.model, session.model)
+        self.assertIs(new.tokenizer, session.tokenizer)
+        self.assertEqual(new.verbose, session.verbose)
+
+        # The new session can generate independently.
+        new.generate('write a python function which returns "hello"', max_length=200)
+        self.assertEqual(new.tokens.size, session.tokens.size)
 
 
 if __name__ == "__main__":

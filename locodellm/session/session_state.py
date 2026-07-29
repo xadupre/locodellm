@@ -89,6 +89,23 @@ class SessionState:
                 )
         raise ValueError(f"Unknown chat template: {self._chat_template!r}")
 
+    def new_session(self) -> SessionState:
+        """Starts a new session, resetting the conversation history.
+
+        The model and tokenizer are preserved but all accumulated tokens,
+        generated text, and turn count are cleared.
+
+        Returns:
+            A new :class:`SessionState` sharing the same model and settings.
+        """
+        return SessionState(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            verbose=self.verbose,
+            model_path=self._model_path,
+            chat_template=self._chat_template,
+        )
+
     def generate(self, prompt: str, max_length: int = 200, **search_options: Any) -> SessionState:
         """Generate text from *prompt*, appending to the conversation history.
 
