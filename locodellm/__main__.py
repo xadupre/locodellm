@@ -30,8 +30,8 @@ generate
 
         python -m locodellm generate mock/generate \
             'write a python function which returns "hello"' --chat-template chatml
-        python -m locodellm generate Qwen/Qwen2.5-Coder-0.5B-Instruct \
-            "write hello" --chat-template chatml
+        python -m locodellm generate ./Qwen2.5-Coder-0.5B-onnx \
+            'write a python function which returns "hello"' --chat-template chatml
 """
 
 from __future__ import annotations
@@ -101,11 +101,16 @@ def main(args: list[str] | None = None) -> None:
             "  python -m locodellm generate mock/generate \\\n"
             "      'write a python function which returns \"hello\"'"
             " --chat-template chatml\n"
-            "  python -m locodellm generate Qwen/Qwen2.5-Coder-0.5B-Instruct \\\n"
-            '      "write hello" --chat-template chatml\n'
-            "  python -m locodellm generate ./my-local-model \\\n"
-            '      "summarize this" --max-length 500'
-            " --provider CUDAExecutionProvider"
+            "  python -m locodellm generate ./Qwen2.5-Coder-0.5B-onnx \\\n"
+            "      'write hello' --chat-template chatml\n"
+            "\n"
+            "note:\n"
+            "  HuggingFace models are automatically downloaded and converted\n"
+            "  to ONNX format using modelbuilder. You can also convert\n"
+            "  manually with:\n"
+            "    python -m modelbuilder.builder \\\n"
+            "      -m Qwen/Qwen2.5-Coder-0.5B-Instruct"
+            " -o ./Qwen2.5-Coder-0.5B-onnx -p fp32 -e cpu"
         ),
     )
     gen_parser.add_argument(

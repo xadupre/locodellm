@@ -22,6 +22,49 @@ _DEFAULT_CACHE_DIR = os.path.join(
 )
 
 
+def _convert_model(
+    model_id: str,
+    output_dir: str,
+    precision: str | None = None,
+    execution_provider: str = "cpu",
+    cache_dir: str | None = None,
+    verbose: int = 0,
+) -> None:
+    """Converts a HuggingFace model to ONNX format using modelbuilder.
+
+    Uses :func:`modelbuilder.builder.create_model` to perform the
+    conversion.
+    """
+    from modelbuilder.builder import create_model
+
+    if verbose:
+        print(f"[generate_from_model] converting {model_id!r} with modelbuilder")
+
+    create_model(
+        model_name=model_id,
+        input_path="",
+        output_dir=output_dir,
+        precision=precision or "fp32",
+        execution_provider=execution_provider,
+        cache_dir=cache_dir or os.path.join(output_dir, "..", "cache"),
+    )
+
+
+def _download_and_convert(
+    model_id: str,
+    model_dir: str,
+    base_dir: str,
+    safe_name: str,
+    precision: str | None = None,
+    verbose: int = 0,
+) -> None:
+    """Downloads a HuggingFace model and converts it to ONNX."""
+    # Use a precision-independent cache so the download is shared.
+    base_name = model_id.replace("/", "_")
+    cache_dir = os.path.join(base_dir, f"{base_name}_cache")
+    _convert_model(model_id, model_dir, precision=precision, cache_dir=cache_dir, verbose=verbose)
+
+
 def _get_model_path(
     model_id: str, precision: str | None = None, cache_dir: str | None = None, verbose: int = 0
 ) -> str:
@@ -67,8 +110,23 @@ def _get_model_path(
             print(f"[generate_from_model] reusing cached model at {model_dir}")
 
         path = os.path.abspath(model_dir)
+    elif "/" in model_id and not os.path.exists(model_id):
+        # Looks like a HuggingFace repo id — download and convert if needed.
+        safe_name = model_id.replace("/", "_")
+        if precision:
+            safe_name = f"{safe_name}_{precision}"
+        model_dir = os.path.join(base_dir, safe_name)
+
+        if not os.path.exists(os.path.join(model_dir, "model.onnx")):
+            _download_and_convert(
+                model_id, model_dir, base_dir, safe_name, precision=precision, verbose=verbose
+            )
+        elif verbose:
+            print(f"[generate_from_model] reusing cached model at {model_dir}")
+
+        path = os.path.abspath(model_dir)
     else:
-        # Assume model_id is a path or HuggingFace id handled externally.
+        # Assume model_id is a local filesystem path.
         path = model_id
 
     with _path_lock:

@@ -98,6 +98,56 @@ class TestGenerateFromModel(ExtTestCase):
         with self.assertRaises(KeyError):
             generate_from_model("mock/nonexistent", prompt="hello", cache_dir=self._tmpdir)
 
+    def test_convert_model_success(self):
+        """Checks that _convert_model calls modelbuilder.builder.create_model."""
+        from unittest.mock import patch, MagicMock
+        from locodellm.generate.generate_from_model import _convert_model
+
+        mock_create = MagicMock()
+
+        with patch("modelbuilder.builder.create_model", mock_create):
+            _convert_model(
+                "Qwen/Qwen2.5-Coder-0.5B-Instruct", "/tmp/out", precision="fp16", verbose=1
+            )
+
+        mock_create.assert_called_once()
+        kwargs = mock_create.call_args[1]
+        self.assertEqual(kwargs["model_name"], "Qwen/Qwen2.5-Coder-0.5B-Instruct")
+        self.assertEqual(kwargs["output_dir"], "/tmp/out")
+        self.assertEqual(kwargs["precision"], "fp16")
+
+    def test_convert_model_default_precision(self):
+        """Checks that _convert_model defaults to fp32 precision."""
+        from unittest.mock import patch, MagicMock
+        from locodellm.generate.generate_from_model import _convert_model
+
+        mock_create = MagicMock()
+
+        with patch("modelbuilder.builder.create_model", mock_create):
+            _convert_model("some/model", "/tmp/out")
+
+        kwargs = mock_create.call_args[1]
+        self.assertEqual(kwargs["precision"], "fp32")
+
+    def test_download_and_convert(self):
+        """Checks _download_and_convert delegates to _convert_model."""
+        from unittest.mock import patch, MagicMock
+        from locodellm.generate.generate_from_model import _download_and_convert
+
+        mock_create = MagicMock()
+        model_dir = os.path.join(self._tmpdir, "model_out")
+
+        with patch("modelbuilder.builder.create_model", mock_create):
+            _download_and_convert(
+                "owner/repo", model_dir, self._tmpdir, "model", precision="int4", verbose=1
+            )
+
+        mock_create.assert_called_once()
+        kwargs = mock_create.call_args[1]
+        self.assertEqual(kwargs["model_name"], "owner/repo")
+        self.assertEqual(kwargs["output_dir"], model_dir)
+        self.assertEqual(kwargs["precision"], "int4")
+
 
 if __name__ == "__main__":
     unittest.main()
