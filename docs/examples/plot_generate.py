@@ -144,6 +144,14 @@ print(
 # ------------
 #
 # Ask the model to write a Python function that returns ``"hello"``.
+#
+# The equivalent command line using the ``locodellm`` CLI is:
+#
+# .. code-block:: bash
+#
+#     python -m locodellm generate Qwen/Qwen2.5-Coder-0.5B-Instruct \
+#         'write a python function which returns "hello"' \
+#         --chat-template chatml --precision fp32 --verbose 1
 
 
 session = create_session(output_dir, verbose=VERBOSE, chat_template=CHAT_TEMPLATE)

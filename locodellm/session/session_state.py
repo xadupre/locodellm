@@ -33,6 +33,7 @@ class SessionState:
         self.tokenizer = tokenizer
         self.tokens: np.ndarray = np.array([], dtype=np.int32)
         self.text: str = ""
+        self.generated_token_count: int = 0
         self.verbose = verbose
         self._model_path = model_path
         self._eos_ids: set[int] | None = None
@@ -166,6 +167,7 @@ class SessionState:
 
         self.tokens = np.concatenate([context, np.array(new_tokens, dtype=np.int32)])
         self.text = self.tokenizer.decode(new_tokens)
+        self.generated_token_count = len(new_tokens)
         self._turn_count += 1
 
         if self.verbose:

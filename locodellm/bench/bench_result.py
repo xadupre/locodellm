@@ -22,12 +22,22 @@ class PromptTestResult:
             with undefined arguments.
         results: A list of tuples ``(expected, actual, passed)`` for each
             :class:`ExpectedResult` entry.
+        duration: Time in seconds spent generating the answer.
     """
 
     prompt_test: PromptTest
     generated_code: str
     run_status: RunStatus
     results: list[tuple[ExpectedResult, Any, bool]] = field(default_factory=list)
+    duration: float = 0.0
+    token_count: int = 0
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Returns the token generation speed."""
+        if self.duration > 0:
+            return self.token_count / self.duration
+        return 0.0
 
     @property
     def all_passed(self) -> bool:
@@ -66,12 +76,10 @@ class BenchResult:
         Each row represents one expected result assertion. Columns are:
 
         - ``prompt``: the prompt text
+        - ``duration``: time in seconds spent generating the answer
         - ``compiled``: whether the generated code compiled
         - ``ran``: whether the generated code ran without error
-        - ``generated_code``: the extracted code
-        - ``args``: the input arguments
-        - ``expected``: the expected return value
-        - ``actual``: the actual return value
+        - ``input_index``: index of the input set
         - ``passed``: whether expected matched actual
 
         Returns:
@@ -81,23 +89,48 @@ class BenchResult:
         for result in self.results:
             base = {
                 "prompt": result.prompt_test.prompt,
+                "duration": result.duration,
+                "token_count": result.token_count,
+                "tokens_per_second": result.tokens_per_second,
+                "compiled": result.run_status.compiled,
+                "ran": result.run_status.ran,
+            }
+            if result.results:
+                for i, (_, _, passed) in enumerate(result.results):
+                    rows.append({**base, "input_index": i, "passed": passed})
+            else:
+                rows.append({**base, "input_index": None, "passed": None})
+        return pandas.DataFrame(rows)
+
+    def to_json(self) -> list[dict[str, Any]]:
+        """Exports the results as a JSON-serializable list.
+
+        Each entry contains the prompt, the generated code, and the
+        detailed results for each input set.
+
+        Returns:
+            A list of dictionaries, one per prompt test.
+        """
+        entries: list[dict[str, Any]] = []
+        for result in self.results:
+            entry: dict[str, Any] = {
+                "prompt": result.prompt_test.prompt,
+                "duration": result.duration,
+                "token_count": result.token_count,
+                "tokens_per_second": result.tokens_per_second,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
                 "generated_code": result.generated_code,
+                "results": [],
             }
-            if result.results:
-                for expected_result, actual, passed in result.results:
-                    rows.append(
-                        {
-                            **base,
-                            "args": expected_result.args,
-                            "expected": expected_result.expected,
-                            "actual": actual,
-                            "passed": passed,
-                        }
-                    )
-            else:
-                rows.append(
-                    {**base, "args": None, "expected": None, "actual": None, "passed": None}
+            for expected_result, actual, passed in result.results:
+                entry["results"].append(
+                    {
+                        "args": list(expected_result.args),
+                        "expected": expected_result.expected,
+                        "actual": actual,
+                        "passed": passed,
+                    }
                 )
-        return pandas.DataFrame(rows)
+            entries.append(entry)
+        return entries

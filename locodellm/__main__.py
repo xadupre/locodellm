@@ -32,6 +32,14 @@ generate
             'write a python function which returns "hello"' --chat-template chatml
         python -m locodellm generate ./Qwen2.5-Coder-0.5B-onnx \
             'write a python function which returns "hello"' --chat-template chatml
+
+bench
+    Runs a benchmark against a model and outputs results as a markdown table.
+
+    Usage::
+
+        python -m locodellm bench mock/generate basic --chat-template chatml
+        python -m locodellm bench mock/generate basic --chat-template chatml -o results.csv
 """
 
 from __future__ import annotations
@@ -81,6 +89,131 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         verbose=args.verbose,
     )
     print(session.text)
+
+
+def _compute_case_stats(df):  # noqa: ANN001, ANN202
+    """Computes per-case statistics from the benchmark results DataFrame."""
+    import pandas
+
+    grouped = df.groupby("prompt", sort=False)
+    rows = []
+    for prompt, group in grouped:
+        total_inputs = len(group)
+        compiled = bool(group["compiled"].iloc[0])
+        ran = bool(group["ran"].iloc[0])
+        passed_count = int(group["passed"].sum())
+        duration = float(group["duration"].iloc[0])
+        token_count = int(group["token_count"].iloc[0])
+        tokens_per_second = float(group["tokens_per_second"].iloc[0])
+        rows.append(
+            {
+                "prompt": prompt,
+                "duration": duration,
+                "token_count": token_count,
+                "tokens_per_second": tokens_per_second,
+                "compiled": compiled,
+                "ran": ran,
+                "inputs": total_inputs,
+                "passed": passed_count,
+                "failed": total_inputs - passed_count,
+                "score": passed_count / total_inputs if total_inputs > 0 else 0.0,
+            }
+        )
+    return pandas.DataFrame(rows)
+
+
+def _cmd_bench(args: argparse.Namespace) -> None:
+    """Runs a benchmark against a model and outputs results."""
+    from locodellm.bench import load_benchmark
+    from locodellm.generate.generate_from_model import get_session
+
+    inner_verbose = max(args.verbose - 1, 0)
+
+    session = get_session(
+        model_id=args.model,
+        precision=args.precision,
+        provider=args.provider,
+        chat_template=args.chat_template,
+        verbose=inner_verbose,
+    )
+
+    # Determine JSON output path.
+    json_output = None
+    if args.output and args.output.endswith(".json"):
+        json_output = args.output
+
+    benchmark = load_benchmark(args.benchmark)
+    benchmark.max_length = args.max_length
+    result = benchmark.run(session, verbose=args.verbose, json_output=json_output)
+    df = result.to_dataframe()
+
+    # Add model metadata columns.
+    df.insert(0, "model_id", args.model)
+    df.insert(1, "precision", args.precision or "")
+    df.insert(2, "provider", args.provider or "")
+
+    # Compute per-case statistics.
+    stats = _compute_case_stats(df)
+
+    # Print as markdown table to stdout.
+    columns = [
+        "prompt",
+        "duration",
+        "token_count",
+        "tokens_per_second",
+        "compiled",
+        "ran",
+        "input_index",
+        "passed",
+    ]
+    df_display = df[columns]
+    print(df_display.to_markdown(index=False))
+    print("\n\nStatistics\n")
+    print(stats.to_markdown(index=False))
+
+    # Compute aggregated summary.
+    import pandas
+
+    total_cases = len(stats)
+    total_inputs = int(stats["inputs"].sum())
+    total_passed = int(stats["passed"].sum())
+    total_failed = int(stats["failed"].sum())
+    cases_compiled = int(stats["compiled"].sum())
+    cases_ran = int(stats["ran"].sum())
+    avg_duration = float(stats["duration"].mean())
+    avg_tokens_per_second = float(stats["tokens_per_second"].mean())
+    avg_score = float(stats["score"].mean())
+    summary = pandas.DataFrame(
+        [
+            {"metric": "total_cases", "value": total_cases},
+            {"metric": "total_inputs", "value": total_inputs},
+            {"metric": "total_passed", "value": total_passed},
+            {"metric": "total_failed", "value": total_failed},
+            {"metric": "cases_compiled", "value": cases_compiled},
+            {"metric": "cases_ran", "value": cases_ran},
+            {"metric": "avg_duration", "value": avg_duration},
+            {"metric": "avg_tokens_per_second", "value": avg_tokens_per_second},
+            {"metric": "avg_score", "value": avg_score},
+        ]
+    )
+
+    print("\n\nSummary\n")
+    print(summary.to_markdown(index=False))
+
+    # Export to CSV/Excel if requested (JSON is written incrementally above).
+    if args.output and not args.output.endswith(".json"):
+        output = args.output
+        if output.endswith(".csv"):
+            df.to_csv(output, index=False)
+        elif output.endswith(".xlsx"):
+            with pandas.ExcelWriter(output) as writer:
+                df.to_excel(writer, sheet_name="results", index=False)
+                stats.to_excel(writer, sheet_name="statistics", index=False)
+                summary.to_excel(writer, sheet_name="summary", index=False)
+        else:
+            df.to_csv(output, index=False)
+        if args.verbose:
+            print(f"\n[bench] results saved to {output}")
 
 
 def main(args: list[str] | None = None) -> None:
@@ -135,6 +268,48 @@ def main(args: list[str] | None = None) -> None:
         "--verbose", "-v", type=int, default=0, help="Verbosity level (default: 0)."
     )
 
+    bench_parser = sub.add_parser(
+        "bench",
+        help="Run a benchmark against a model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python -m locodellm bench mock/generate basic --chat-template chatml\n"
+            "  python -m locodellm bench Qwen/Qwen2.5-Coder-0.5B-Instruct basic \\\n"
+            "      --chat-template chatml --output results.csv\n"
+            "  python -m locodellm bench mock/generate basic \\\n"
+            "      --chat-template chatml --output results.xlsx"
+        ),
+    )
+    bench_parser.add_argument(
+        "model",
+        help=(
+            "Model id or path. Use mock/generate for the mock model, "
+            "or a HuggingFace id like Qwen/Qwen2.5-Coder-0.5B-Instruct."
+        ),
+    )
+    bench_parser.add_argument(
+        "benchmark", help="Benchmark name (use 'python -m locodellm benchmarks' to list)."
+    )
+    bench_parser.add_argument(
+        "--precision", default=None, help="Precision qualifier (e.g. fp16, int4)."
+    )
+    bench_parser.add_argument(
+        "--provider", default=None, help="Execution provider (e.g. CUDAExecutionProvider)."
+    )
+    bench_parser.add_argument(
+        "--max-length", type=int, default=200, help="Maximum token length (default: 200)."
+    )
+    bench_parser.add_argument(
+        "--chat-template", default=None, help="Chat template (e.g. chatml)."
+    )
+    bench_parser.add_argument(
+        "--output", "-o", default=None, help="Output file path (.csv, .xlsx, or .json)."
+    )
+    bench_parser.add_argument(
+        "--verbose", "-v", type=int, default=0, help="Verbosity level (default: 0)."
+    )
+
     parsed = parser.parse_args(args)
 
     if parsed.command is None:
@@ -146,6 +321,7 @@ def main(args: list[str] | None = None) -> None:
         "benchmarks": _cmd_benchmarks,
         "models": _cmd_models,
         "generate": _cmd_generate,
+        "bench": _cmd_bench,
     }
     dispatch[parsed.command](parsed)
 

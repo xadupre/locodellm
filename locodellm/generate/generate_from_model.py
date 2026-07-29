@@ -134,7 +134,7 @@ def _get_model_path(
     return path
 
 
-def _get_session(
+def get_session(
     model_id: str,
     precision: str | None = None,
     provider: str | None = None,
@@ -142,7 +142,22 @@ def _get_session(
     chat_template: str | None = None,
     verbose: int = 0,
 ) -> SessionState:
-    """Returns a cached session, creating it on first access."""
+    """Returns a cached session for the given model, creating it on first access.
+
+    This loads the model without generating any text. Useful when you
+    need the session object for benchmarking or multiple prompts.
+
+    Args:
+        model_id: The model identifier (mock id, HuggingFace id, or path).
+        precision: Optional precision qualifier (e.g. ``"fp16"``).
+        provider: Execution provider name.
+        cache_dir: Directory for storing converted models.
+        chat_template: Chat template name (e.g. ``"chatml"``).
+        verbose: Verbosity level.
+
+    Returns:
+        A :class:`~locodellm.session.SessionState` ready for generation.
+    """
     key = (model_id, precision, provider)
     with _cache_lock:
         if key in _session_cache:
@@ -203,7 +218,7 @@ def generate_from_model(
         A :class:`~locodellm.session.SessionState` with the generation
         results.  Access ``.text`` for the generated text.
     """
-    session = _get_session(
+    session = get_session(
         model_id,
         precision=precision,
         provider=provider,

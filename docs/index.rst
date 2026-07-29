@@ -35,4 +35,5 @@ Quick start
     :caption: Contents
 
     auto_examples/index
+    cli/index
     api/index

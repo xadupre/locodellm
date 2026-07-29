@@ -60,5 +60,47 @@ class TestMainGenerate(ExtTestCase):
         self.assertIn("def hello", output)
 
 
+class TestMainBench(ExtTestCase):
+    """Tests for the bench subcommand."""
+
+    @skipif_no_genai()
+    def test_bench_mock_model(self):
+        """Checks that bench subcommand produces a markdown table."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["bench", "mock/generate", "basic", "--chat-template", "chatml"])
+        output = buf.getvalue()
+        self.assertIn("| prompt", output)
+        self.assertIn("compiled", output)
+        self.assertIn("passed", output)
+
+    @skipif_no_genai()
+    def test_bench_output_csv(self):
+        """Checks that bench subcommand can write a CSV file."""
+        import os
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp()
+        csv_path = os.path.join(tmpdir, "results.csv")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(
+                [
+                    "bench",
+                    "mock/generate",
+                    "basic",
+                    "--chat-template",
+                    "chatml",
+                    "--output",
+                    csv_path,
+                ]
+            )
+        self.assertTrue(os.path.exists(csv_path))
+        with open(csv_path) as f:
+            content = f.read()
+        self.assertIn("prompt", content)
+        self.assertIn("compiled", content)
+
+
 if __name__ == "__main__":
     unittest.main()
