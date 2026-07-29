@@ -9,8 +9,12 @@ locodellm
     :target: https://codecov.io/gh/xadupre/locodellm
     :alt: Coverage
 
-Experimentation around local LLM using
-`onnxruntime-genai <https://github.com/microsoft/onnxruntime-genai>`_.
+**locodellm** is a small toolkit for experimenting with local large
+language models. It wraps
+`onnxruntime-genai <https://github.com/microsoft/onnxruntime-genai>`_ behind a
+simple session API to load an ONNX model directory and generate text,
+supports multi-turn conversations, and ships helpers to build tiny dummy
+models for testing. A minimal command line interface is also provided.
 
 Install
 -------

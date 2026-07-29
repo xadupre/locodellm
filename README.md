@@ -7,7 +7,12 @@
 [![CI](https://github.com/xadupre/locodellm/actions/workflows/ci.yml/badge.svg)](https://github.com/xadupre/locodellm/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/xadupre/locodellm/branch/main/graph/badge.svg)](https://codecov.io/gh/xadupre/locodellm)
 
-Experimentation around local LLM.
+**locodellm** is a small toolkit for experimenting with local large
+language models. It wraps
+[onnxruntime-genai](https://github.com/microsoft/onnxruntime-genai) behind a
+simple session API to load an ONNX model directory and generate text,
+supports multi-turn conversations, and ships helpers to build tiny dummy
+models for testing. A minimal command line interface is also provided.
 
 ## Install
 
