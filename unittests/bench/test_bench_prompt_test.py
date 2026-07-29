@@ -115,6 +115,33 @@ class TestBenchPromptTest(ExtTestCase):
         result = bench.run(session)
         self.assertIn("def hello", result.results[0].generated_code)
 
+    @skipif_no_genai()
+    def test_to_dataframe(self):
+        """Checks that to_dataframe returns a correct DataFrame."""
+        import pandas
+
+        from locodellm.session import create_session
+
+        session = create_session(self.model_path, chat_template="chatml")
+        tests = [
+            PromptTest(
+                prompt='write a python function which returns "hello"',
+                expected=[
+                    ExpectedResult(args=(), expected="hello"),
+                    ExpectedResult(args=(), expected="wrong"),
+                ],
+            )
+        ]
+        bench = BenchPromptTest(tests, max_length=200)
+        result = bench.run(session)
+        df = result.to_dataframe()
+        self.assertIsInstance(df, pandas.DataFrame)
+        self.assertEqual(len(df), 2)
+        self.assertIn("prompt", df.columns)
+        self.assertIn("passed", df.columns)
+        self.assertTrue(df.iloc[0]["passed"])
+        self.assertFalse(df.iloc[1]["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

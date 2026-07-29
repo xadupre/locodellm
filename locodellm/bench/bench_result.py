@@ -57,3 +57,47 @@ class BenchResult:
     def failed(self) -> int:
         """Returns the number of prompt tests with at least one failure."""
         return self.total - self.passed
+
+    def to_dataframe(self) -> "pandas.DataFrame":  # noqa: F821
+        """Exports the results as a pandas DataFrame.
+
+        Each row represents one expected result assertion. Columns are:
+
+        - ``prompt``: the prompt text
+        - ``compiled``: whether the generated code compiled
+        - ``ran``: whether the generated code ran without error
+        - ``generated_code``: the extracted code
+        - ``args``: the input arguments
+        - ``expected``: the expected return value
+        - ``actual``: the actual return value
+        - ``passed``: whether expected matched actual
+
+        Returns:
+            A :class:`pandas.DataFrame` with one row per assertion.
+        """
+        import pandas
+
+        rows: list[dict[str, Any]] = []
+        for result in self.results:
+            base = {
+                "prompt": result.prompt_test.prompt,
+                "compiled": result.run_status.compiled,
+                "ran": result.run_status.ran,
+                "generated_code": result.generated_code,
+            }
+            if result.results:
+                for expected_result, actual, passed in result.results:
+                    rows.append(
+                        {
+                            **base,
+                            "args": expected_result.args,
+                            "expected": expected_result.expected,
+                            "actual": actual,
+                            "passed": passed,
+                        }
+                    )
+            else:
+                rows.append(
+                    {**base, "args": None, "expected": None, "actual": None, "passed": None}
+                )
+        return pandas.DataFrame(rows)
