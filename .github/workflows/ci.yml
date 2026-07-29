@@ -26,6 +26,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install
         run: pip install -e ".[dev]"
+      - name: Pip freeze
+        run: pip freeze
       - name: Run tests
         env:
           UNITTEST_GOING: "1"
