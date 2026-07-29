@@ -2,7 +2,8 @@
 
 # ruff: noqa: RUF022
 
-from locodellm.bench.bench_prompt_test import BenchPromptTest, BenchResult, PromptTestResult
+from locodellm.bench.bench_prompt_test import BenchPromptTest
+from locodellm.bench.bench_result import BenchResult, PromptTestResult
 from locodellm.bench.prompt_test import (
     ExpectedResult,
     PromptTest,
