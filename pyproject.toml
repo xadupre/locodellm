@@ -16,6 +16,7 @@ dependencies = [
     "onnx",
     "onnxruntime-genai",
     "pandas",
+    "tabulate",
     "transformers",
 ]
 
