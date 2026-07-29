@@ -30,7 +30,7 @@ typing = [
 dev = [
     "locodellm[style]",
     "pytest>=7",
-    "pytest-coverage",
+    "pytest-cov",
     "onnx",
     "onnxruntime-genai",
 ]
@@ -109,6 +109,10 @@ select = [
 
 [tool.mypy]
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["locodellm"]
+branch = true
 
 [tool.pyrefly]
 project-includes = ["locodellm/**/*.py"]
