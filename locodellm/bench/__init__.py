@@ -2,6 +2,7 @@
 
 # ruff: noqa: RUF022
 
+from locodellm.bench.bench_prompt_test import BenchPromptTest, BenchResult, PromptTestResult
 from locodellm.bench.prompt_test import (
     ExpectedResult,
     PromptTest,
@@ -11,8 +12,11 @@ from locodellm.bench.prompt_test import (
 from locodellm.bench.run_code import UNDEFINED, RunStatus, run_function
 
 __all__ = [
+    "BenchPromptTest",
+    "BenchResult",
     "ExpectedResult",
     "PromptTest",
+    "PromptTestResult",
     "RunStatus",
     "UNDEFINED",
     "dump_prompt_tests",
