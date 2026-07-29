@@ -14,11 +14,15 @@ class BenchPromptTest:
 
     Attributes:
         tests: The list of :class:`PromptTest` to evaluate.
+        description: A short description of the benchmark.
         max_length: Maximum token length for generation.
     """
 
-    def __init__(self, tests: list[PromptTest], max_length: int = 200) -> None:
+    def __init__(
+        self, tests: list[PromptTest], description: str = "", max_length: int = 200
+    ) -> None:
         self.tests = tests
+        self.description = description
         self.max_length = max_length
 
     def run(self, session: Any, **search_options: Any) -> BenchResult:
