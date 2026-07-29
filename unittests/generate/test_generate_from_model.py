@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from locodellm.ext_test_case import ExtTestCase, skipif_no_genai
-from locodellm.general.generate_from_model import (
+from locodellm.generate.generate_from_model import (
     _model_path_cache,
     _session_cache,
     generate_from_model,

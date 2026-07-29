@@ -69,7 +69,7 @@ def _cmd_models(args: argparse.Namespace) -> None:  # noqa: ARG001
 
 def _cmd_generate(args: argparse.Namespace) -> None:
     """Generates text from a prompt using a model."""
-    from locodellm.general.generate_from_model import generate_from_model
+    from locodellm.generate.generate_from_model import generate_from_model
 
     session = generate_from_model(
         model_id=args.model,

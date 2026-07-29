@@ -13,7 +13,7 @@ benchmarks and :func:`~locodellm.bench.load_benchmark` to load one by name.
         print(f"{name}: {description}")
 
     # Load a benchmark
-    tests = load_benchmark("basic")
+    bench = load_benchmark("basic")
 
 Built-in Benchmarks
 --------------------
@@ -21,45 +21,28 @@ Built-in Benchmarks
 basic
 ^^^^^
 
-10 Python function prompts with growing difficulty.  Each prompt asks the
-model to generate a single Python function.  The difficulty ranges from
-returning a constant string to computing an edit distance (Levenshtein
-distance).
+.. runpython::
+    :showcode:
+    :rst:
 
-.. list-table::
-   :header-rows: 1
-   :widths: 5 55 10
+    from locodellm.bench import load_benchmark
 
-   * - #
-     - Task
-     - Expected results
-   * - 1
-     - Return the string ``"hello"``
-     - 2
-   * - 2
-     - Add two numbers
-     - 3
-   * - 3
-     - Reverse a string
-     - 3
-   * - 4
-     - Find the maximum in a list
-     - 3
-   * - 5
-     - Check if a number is prime
-     - 4
-   * - 6
-     - Compute factorial
-     - 4
-   * - 7
-     - Count character frequencies
-     - 3
-   * - 8
-     - Palindrome check (ignoring case and spaces)
-     - 4
-   * - 9
-     - Compute nth Fibonacci number
-     - 4
-   * - 10
-     - Compute edit distance between two strings
-     - 4
+    bench = load_benchmark("basic")
+    print(bench.description)
+    print()
+    print(f"**{len(bench.tests)} prompt tests:**")
+    print()
+    print(".. list-table::")
+    print("   :header-rows: 1")
+    print("   :widths: 5 60 10")
+    print()
+    print("   * - #")
+    print("     - Task")
+    print("     - Expected results")
+    for i, test in enumerate(bench.tests, 1):
+        prompt = test.prompt
+        if len(prompt) > 80:
+            prompt = prompt[:77] + "..."
+        print(f"   * - {i}")
+        print(f"     - {prompt}")
+        print(f"     - {len(test.expected)}")
