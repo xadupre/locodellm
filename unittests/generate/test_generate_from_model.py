@@ -99,54 +99,90 @@ class TestGenerateFromModel(ExtTestCase):
             generate_from_model("mock/nonexistent", prompt="hello", cache_dir=self._tmpdir)
 
     def test_convert_model_success(self):
-        """Checks that _convert_model calls modelbuilder.builder.create_model."""
-        from unittest.mock import patch, MagicMock
+        """Checks that _convert_model passes correct args to create_model."""
+        import sys
+        import types
         from locodellm.generate.generate_from_model import _convert_model
 
-        mock_create = MagicMock()
+        calls = []
 
-        with patch("modelbuilder.builder.create_model", mock_create):
+        def fake_create_model(**kwargs):
+            calls.append(kwargs)
+
+        fake_builder = types.ModuleType("modelbuilder.builder")
+        fake_builder.create_model = fake_create_model
+        original = sys.modules.get("modelbuilder.builder")
+        sys.modules["modelbuilder.builder"] = fake_builder
+        try:
             _convert_model(
                 "Qwen/Qwen2.5-Coder-0.5B-Instruct", "/tmp/out", precision="fp16", verbose=1
             )
+        finally:
+            if original is not None:
+                sys.modules["modelbuilder.builder"] = original
+            else:
+                del sys.modules["modelbuilder.builder"]
 
-        mock_create.assert_called_once()
-        kwargs = mock_create.call_args[1]
-        self.assertEqual(kwargs["model_name"], "Qwen/Qwen2.5-Coder-0.5B-Instruct")
-        self.assertEqual(kwargs["output_dir"], "/tmp/out")
-        self.assertEqual(kwargs["precision"], "fp16")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["model_name"], "Qwen/Qwen2.5-Coder-0.5B-Instruct")
+        self.assertEqual(calls[0]["output_dir"], "/tmp/out")
+        self.assertEqual(calls[0]["precision"], "fp16")
 
     def test_convert_model_default_precision(self):
         """Checks that _convert_model defaults to fp32 precision."""
-        from unittest.mock import patch, MagicMock
+        import sys
+        import types
         from locodellm.generate.generate_from_model import _convert_model
 
-        mock_create = MagicMock()
+        calls = []
 
-        with patch("modelbuilder.builder.create_model", mock_create):
+        def fake_create_model(**kwargs):
+            calls.append(kwargs)
+
+        fake_builder = types.ModuleType("modelbuilder.builder")
+        fake_builder.create_model = fake_create_model
+        original = sys.modules.get("modelbuilder.builder")
+        sys.modules["modelbuilder.builder"] = fake_builder
+        try:
             _convert_model("some/model", "/tmp/out")
+        finally:
+            if original is not None:
+                sys.modules["modelbuilder.builder"] = original
+            else:
+                del sys.modules["modelbuilder.builder"]
 
-        kwargs = mock_create.call_args[1]
-        self.assertEqual(kwargs["precision"], "fp32")
+        self.assertEqual(calls[0]["precision"], "fp32")
 
     def test_download_and_convert(self):
         """Checks _download_and_convert delegates to _convert_model."""
-        from unittest.mock import patch, MagicMock
+        import sys
+        import types
         from locodellm.generate.generate_from_model import _download_and_convert
 
-        mock_create = MagicMock()
-        model_dir = os.path.join(self._tmpdir, "model_out")
+        calls = []
 
-        with patch("modelbuilder.builder.create_model", mock_create):
+        def fake_create_model(**kwargs):
+            calls.append(kwargs)
+
+        fake_builder = types.ModuleType("modelbuilder.builder")
+        fake_builder.create_model = fake_create_model
+        original = sys.modules.get("modelbuilder.builder")
+        sys.modules["modelbuilder.builder"] = fake_builder
+        model_dir = os.path.join(self._tmpdir, "model_out")
+        try:
             _download_and_convert(
                 "owner/repo", model_dir, self._tmpdir, "model", precision="int4", verbose=1
             )
+        finally:
+            if original is not None:
+                sys.modules["modelbuilder.builder"] = original
+            else:
+                del sys.modules["modelbuilder.builder"]
 
-        mock_create.assert_called_once()
-        kwargs = mock_create.call_args[1]
-        self.assertEqual(kwargs["model_name"], "owner/repo")
-        self.assertEqual(kwargs["output_dir"], model_dir)
-        self.assertEqual(kwargs["precision"], "int4")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["model_name"], "owner/repo")
+        self.assertEqual(calls[0]["output_dir"], model_dir)
+        self.assertEqual(calls[0]["precision"], "int4")
 
 
 if __name__ == "__main__":
