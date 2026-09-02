@@ -115,7 +115,19 @@ session = create_session(model_path)
 session.generate("<s>", max_length=10)
 ```
 
-## LM Evaluation Harness
+## Benchmarks
+
+### Built-in benchmark
+
+Run the built-in `basic` benchmark against a local ONNX model:
+
+```bash
+python -m locodellm bench path/to/model basic --chat-template chatml
+```
+
+Use `python -m locodellm benchmarks` to list the available built-in benchmarks.
+
+### LM Evaluation Harness
 
 Install the optional dependency and run a generation-based
 [LM Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness)
