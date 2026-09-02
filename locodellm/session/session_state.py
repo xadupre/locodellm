@@ -222,9 +222,17 @@ def create_session(
             if session_options:
                 import json
 
-                config.overlay(
-                    json.dumps({"model": {"decoder": {"session_options": session_options}}})
-                )
+                try:
+                    config.overlay(
+                        json.dumps({"model": {"decoder": {"session_options": session_options}}})
+                    )
+                except RuntimeError as exc:
+                    raise ValueError(
+                        f"Unable to apply ONNX Runtime GenAI session options "
+                        f"{session_options!r}: {exc}. Values are parsed as JSON; when an option "
+                        "expects a string, quote it explicitly, for example "
+                        "--session-option 'session.enable_moe_expert_statistics=\"1\"'."
+                    ) from exc
             if providers is not None:
                 config.clear_providers()
                 for provider in providers:

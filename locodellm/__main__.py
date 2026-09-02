@@ -399,7 +399,10 @@ def main(args: list[str] | None = None) -> None:
         default=[],
         type=_parse_session_option,
         metavar="NAME=JSON_VALUE",
-        help="ONNX Runtime session option; may be repeated.",
+        help=(
+            "ONNX Runtime session option parsed as JSON; quote string values, for example "
+            "'session.enable_moe_expert_statistics=\"1\"'. May be repeated."
+        ),
     )
     bench_parser.add_argument("--num-fewshot", type=int, default=None)
     bench_parser.add_argument("--limit", type=float, default=None)

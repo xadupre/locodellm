@@ -61,6 +61,11 @@ class _Config:
         self.overlays.append(json.loads(value))
 
 
+class _RejectingConfig(_Config):
+    def overlay(self, value):
+        raise RuntimeError("Expected a string but saw a number")
+
+
 class TestOnnxRuntimeGenAILM(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -155,6 +160,21 @@ class TestSessionProviderOptions(unittest.TestCase):
             session.model.overlays,
             [{"model": {"decoder": {"session_options": {"inter_op_num_threads": 2}}}}],
         )
+
+    def test_invalid_session_option_value_has_actionable_error(self):
+        """Checks that session option type errors explain how to quote string values."""
+        from locodellm.session.session_state import create_session
+
+        runtime = SimpleNamespace(
+            Config=_RejectingConfig, Model=lambda config: config, Tokenizer=lambda model: object()
+        )
+        with (
+            patch.dict(sys.modules, {"onnxruntime_genai": runtime}),
+            self.assertRaisesRegex(
+                ValueError, r"""--session-option 'session\.enable_moe_expert_statistics="1"'"""
+            ),
+        ):
+            create_session("model", session_options={"session.enable_moe_expert_statistics": 1})
 
 
 class TestLmEvalCommand(unittest.TestCase):
