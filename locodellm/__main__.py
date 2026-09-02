@@ -91,11 +91,16 @@ def _cmd_benchmarks(args: argparse.Namespace) -> None:  # noqa: ARG001
     from locodellm.bench import get_available_benchmarks
 
     benchmarks = get_available_benchmarks()
+    benchmarks.setdefault("gsm8k", "LM Evaluation Harness benchmark.")
     for name in _get_lm_eval_benchmarks():
         benchmarks.setdefault(name, "LM Evaluation Harness benchmark.")
     width = max(len(name) for name in benchmarks)
     for name, description in benchmarks.items():
         print(f"{name:<{width}}  {description}")
+    print(
+        "\nFull LM-Eval benchmark list: "
+        "https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks/"
+    )
 
 
 def _cmd_models(args: argparse.Namespace) -> None:  # noqa: ARG001
