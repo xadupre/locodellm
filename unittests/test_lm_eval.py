@@ -2,9 +2,9 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from locodellm.__main__ import main
+from locodellm.__main__ import _cmd_lm_eval, main
 
 
 class _LM:
@@ -40,6 +40,22 @@ class _Session:
         return self
 
 
+class _Config:
+    def __init__(self, model):
+        self.model = model
+        self.providers = []
+        self.provider_options = []
+
+    def clear_providers(self):
+        self.providers.clear()
+
+    def append_provider(self, provider):
+        self.providers.append(provider)
+
+    def set_provider_option(self, provider, name, value):
+        self.provider_options.append((provider, name, value))
+
+
 class TestOnnxRuntimeGenAILM(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,8 +76,14 @@ class TestOnnxRuntimeGenAILM(unittest.TestCase):
     def test_generate_until(self):
         """Checks generation length, search options, and stop sequences."""
         session = _Session()
-        with patch("locodellm.lm_eval.get_session", return_value=session):
-            model = self.model_type("model", max_length=20)
+        with patch("locodellm.lm_eval.get_session", return_value=session) as get_session:
+            model = self.model_type(
+                "model",
+                provider="CUDAExecutionProvider",
+                provider_options={"device_id": "1"},
+                max_length=20,
+            )
+        self.assertEqual(get_session.call_args.kwargs["provider_options"], {"device_id": "1"})
 
         request = SimpleNamespace(
             args=("two token", {"max_gen_toks": 5, "until": ["STOP"], "temperature": 0.5})
@@ -87,15 +109,68 @@ class TestOnnxRuntimeGenAILM(unittest.TestCase):
             model.generate_until([request])
 
 
+class TestSessionProviderOptions(unittest.TestCase):
+    def test_provider_options(self):
+        """Checks that provider options are applied to ONNX Runtime GenAI."""
+        from locodellm.session.session_state import create_session
+
+        runtime = SimpleNamespace(
+            Config=_Config, Model=lambda config: config, Tokenizer=lambda model: object()
+        )
+        with patch.dict(sys.modules, {"onnxruntime_genai": runtime}):
+            session = create_session(
+                "model", providers=["CUDAExecutionProvider"], provider_options={"device_id": "1"}
+            )
+        self.assertEqual(session.model.providers, ["CUDAExecutionProvider"])
+        self.assertEqual(
+            session.model.provider_options, [("CUDAExecutionProvider", "device_id", "1")]
+        )
+
+
 class TestLmEvalCommand(unittest.TestCase):
     def test_arguments(self):
         """Checks that the LM-Eval command parses model and task options."""
         with patch("locodellm.__main__._cmd_lm_eval") as command:
-            main(["lm-eval", "model", "gsm8k", "squad", "--limit", "10"])
+            main(
+                [
+                    "lm-eval",
+                    "model",
+                    "gsm8k",
+                    "squad",
+                    "--provider",
+                    "CUDAExecutionProvider",
+                    "--provider-option",
+                    "device_id=1",
+                    "--limit",
+                    "10",
+                ]
+            )
         args = command.call_args.args[0]
         self.assertEqual(args.model, "model")
         self.assertEqual(args.tasks, ["gsm8k", "squad"])
         self.assertEqual(args.limit, 10)
+        self.assertEqual(args.provider_option, [("device_id", "1")])
+
+    def test_provider_options_forwarded(self):
+        """Checks that CLI provider options reach the LM-Eval adapter."""
+        run_lm_eval = Mock(return_value=None)
+        adapter = SimpleNamespace(run_lm_eval=run_lm_eval)
+        utils = SimpleNamespace(make_table=Mock())
+        args = SimpleNamespace(
+            model="model",
+            tasks=["gsm8k"],
+            precision=None,
+            provider="CUDAExecutionProvider",
+            provider_option=[("device_id", "1")],
+            chat_template=None,
+            max_length=100,
+            num_fewshot=None,
+            limit=10,
+            verbose=0,
+        )
+        with patch.dict(sys.modules, {"locodellm.lm_eval": adapter, "lm_eval.utils": utils}):
+            _cmd_lm_eval(args)
+        self.assertEqual(run_lm_eval.call_args.kwargs["provider_options"], {"device_id": "1"})
 
 
 if __name__ == "__main__":

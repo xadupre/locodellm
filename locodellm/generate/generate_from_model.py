@@ -8,8 +8,10 @@ from typing import Any
 
 from locodellm.session import SessionState, create_session
 
-# Thread-safe cache for loaded sessions keyed by (model_id, precision, provider).
-_session_cache: dict[tuple[str, str | None, str | None], SessionState] = {}
+# Thread-safe cache for loaded sessions keyed by model and runtime configuration.
+_session_cache: dict[
+    tuple[str, str | None, str | None, tuple[tuple[str, str], ...]], SessionState
+] = {}
 _cache_lock = threading.Lock()
 
 # Cache for converted model paths keyed by (model_id, precision).
@@ -138,6 +140,7 @@ def get_session(
     model_id: str,
     precision: str | None = None,
     provider: str | None = None,
+    provider_options: dict[str, str] | None = None,
     cache_dir: str | None = None,
     chat_template: str | None = None,
     verbose: int = 0,
@@ -151,6 +154,7 @@ def get_session(
         model_id: The model identifier (mock id, HuggingFace id, or path).
         precision: Optional precision qualifier (e.g. ``"fp16"``).
         provider: Execution provider name.
+        provider_options: Options applied to the execution provider.
         cache_dir: Directory for storing converted models.
         chat_template: Chat template name (e.g. ``"chatml"``).
         verbose: Verbosity level.
@@ -158,7 +162,9 @@ def get_session(
     Returns:
         A :class:`~locodellm.session.SessionState` ready for generation.
     """
-    key = (model_id, precision, provider)
+    if provider_options and provider is None:
+        raise ValueError("Provider options require an execution provider.")
+    key = (model_id, precision, provider, tuple(sorted((provider_options or {}).items())))
     with _cache_lock:
         if key in _session_cache:
             return _session_cache[key]
@@ -169,7 +175,11 @@ def get_session(
 
     providers = [provider] if provider else None
     session = create_session(
-        model_path, providers=providers, verbose=verbose, chat_template=chat_template
+        model_path,
+        providers=providers,
+        provider_options=provider_options,
+        verbose=verbose,
+        chat_template=chat_template,
     )
 
     with _cache_lock:

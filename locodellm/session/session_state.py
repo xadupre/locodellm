@@ -182,6 +182,7 @@ class SessionState:
 def create_session(
     model: str | Any,
     providers: list[str] | None = None,
+    provider_options: dict[str, str] | None = None,
     verbose: int = 0,
     chat_template: str | None = None,
 ) -> SessionState:
@@ -194,6 +195,7 @@ def create_session(
             ``["CUDAExecutionProvider", "CPUExecutionProvider"]``.
             When *None*, onnxruntime-genai picks its default provider.
             Ignored when *model* is not a path.
+        provider_options: Options applied to the selected execution provider.
         verbose: Verbosity level (0 = silent, 1+ = print progress
             messages during model loading and generation).
         chat_template: Chat template to apply around prompts.
@@ -209,12 +211,17 @@ def create_session(
         if verbose:
             print(f"[create_session] loading model from {model!r}")
         if providers is not None:
+            if provider_options and len(providers) != 1:
+                raise ValueError("Provider options require exactly one execution provider.")
             config = og.Config(model)
             config.clear_providers()
             for provider in providers:
                 if verbose:
                     print(f"[create_session] adding provider {provider}")
                 config.append_provider(provider)
+            if provider_options:
+                for name, value in provider_options.items():
+                    config.set_provider_option(providers[0], name, value)
             loaded = og.Model(config)
         else:
             loaded = og.Model(model)

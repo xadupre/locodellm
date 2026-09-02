@@ -55,6 +55,14 @@ import argparse
 import sys
 
 
+def _parse_provider_option(value: str) -> tuple[str, str]:
+    """Parses an ONNX Runtime provider option written as NAME=VALUE."""
+    name, separator, option_value = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError("provider options must use NAME=VALUE")
+    return name, option_value
+
+
 def _cmd_version(args: argparse.Namespace) -> None:  # noqa: ARG001
     """Prints the package version."""
     from locodellm import __version__
@@ -234,6 +242,7 @@ def _cmd_lm_eval(args: argparse.Namespace) -> None:
         tasks=args.tasks,
         precision=args.precision,
         provider=args.provider,
+        provider_options=dict(args.provider_option),
         chat_template=args.chat_template,
         max_length=args.max_length,
         num_fewshot=args.num_fewshot,
@@ -345,6 +354,14 @@ def main(args: list[str] | None = None) -> None:
     lm_eval_parser.add_argument("tasks", nargs="+", help="LM-Eval task names.")
     lm_eval_parser.add_argument("--precision", default=None, help="Precision qualifier.")
     lm_eval_parser.add_argument("--provider", default=None, help="Execution provider.")
+    lm_eval_parser.add_argument(
+        "--provider-option",
+        action="append",
+        default=[],
+        type=_parse_provider_option,
+        metavar="NAME=VALUE",
+        help="ONNX Runtime option for the selected provider; may be repeated.",
+    )
     lm_eval_parser.add_argument("--chat-template", default=None, help="Chat template.")
     lm_eval_parser.add_argument(
         "--max-length", type=int, default=2048, help="Maximum total token length."
