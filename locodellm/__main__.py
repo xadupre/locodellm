@@ -40,12 +40,37 @@ bench
 
         python -m locodellm bench mock/generate basic --chat-template chatml
         python -m locodellm bench mock/generate basic --chat-template chatml -o results.csv
+
+lm-eval
+    Runs LM Evaluation Harness generation tasks against a model.
+
+    Usage::
+
+        python -m locodellm lm-eval ./model gsm8k --limit 10
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+
+
+def _parse_provider_option(value: str) -> tuple[str, str]:
+    """Parses an ONNX Runtime provider option written as NAME=VALUE."""
+    name, separator, option_value = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError("provider options must use NAME=VALUE")
+    return name, option_value
+
+
+def _parse_session_option(value: str) -> tuple[str, object]:
+    """Parses an ONNX Runtime session option written as NAME=JSON_VALUE."""
+    import json
+
+    name, separator, option_value = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError("session options must use NAME=JSON_VALUE")
+    return name, json.loads(option_value)
 
 
 def _cmd_version(args: argparse.Namespace) -> None:  # noqa: ARG001
@@ -216,6 +241,29 @@ def _cmd_bench(args: argparse.Namespace) -> None:
             print(f"\n[bench] results saved to {output}")
 
 
+def _cmd_lm_eval(args: argparse.Namespace) -> None:
+    """Runs LM Evaluation Harness against a model."""
+    from lm_eval.utils import make_table
+
+    from locodellm.lm_eval import run_lm_eval
+
+    results = run_lm_eval(
+        model=args.model,
+        tasks=args.tasks,
+        precision=args.precision,
+        provider=args.provider,
+        provider_options=dict(args.provider_option),
+        session_options=dict(args.session_option),
+        chat_template=args.chat_template,
+        max_length=args.max_length,
+        num_fewshot=args.num_fewshot,
+        limit=args.limit,
+        verbose=args.verbose,
+    )
+    if results is not None:
+        print(make_table(results))
+
+
 def main(args: list[str] | None = None) -> None:
     """Parses the command line and dispatches to the appropriate subcommand."""
     parser = argparse.ArgumentParser(prog="python -m locodellm", description="locodellm CLI")
@@ -310,6 +358,37 @@ def main(args: list[str] | None = None) -> None:
         "--verbose", "-v", type=int, default=0, help="Verbosity level (default: 0)."
     )
 
+    lm_eval_parser = sub.add_parser(
+        "lm-eval", help="Run LM Evaluation Harness generation tasks against a model."
+    )
+    lm_eval_parser.add_argument("model", help="Model id or local ONNX model directory.")
+    lm_eval_parser.add_argument("tasks", nargs="+", help="LM-Eval task names.")
+    lm_eval_parser.add_argument("--precision", default=None, help="Precision qualifier.")
+    lm_eval_parser.add_argument("--provider", default=None, help="Execution provider.")
+    lm_eval_parser.add_argument(
+        "--provider-option",
+        action="append",
+        default=[],
+        type=_parse_provider_option,
+        metavar="NAME=VALUE",
+        help="ONNX Runtime option for the selected provider; may be repeated.",
+    )
+    lm_eval_parser.add_argument(
+        "--session-option",
+        action="append",
+        default=[],
+        type=_parse_session_option,
+        metavar="NAME=JSON_VALUE",
+        help="ONNX Runtime session option; may be repeated.",
+    )
+    lm_eval_parser.add_argument("--chat-template", default=None, help="Chat template.")
+    lm_eval_parser.add_argument(
+        "--max-length", type=int, default=2048, help="Maximum total token length."
+    )
+    lm_eval_parser.add_argument("--num-fewshot", type=int, default=None)
+    lm_eval_parser.add_argument("--limit", type=float, default=None)
+    lm_eval_parser.add_argument("--verbose", "-v", type=int, default=0)
+
     parsed = parser.parse_args(args)
 
     if parsed.command is None:
@@ -322,6 +401,7 @@ def main(args: list[str] | None = None) -> None:
         "models": _cmd_models,
         "generate": _cmd_generate,
         "bench": _cmd_bench,
+        "lm-eval": _cmd_lm_eval,
     }
     dispatch[parsed.command](parsed)
 
