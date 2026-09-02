@@ -15,6 +15,7 @@ dependencies = [
     "numpy",
     "onnx",
     "onnxruntime-genai",
+    "openpyxl",
     "pandas",
     "tabulate",
     "transformers",
