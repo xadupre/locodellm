@@ -247,9 +247,8 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
             df.to_csv(output, index=False)
         elif output.endswith(".xlsx"):
             with pandas.ExcelWriter(output) as writer:
-                df.to_excel(writer, sheet_name="results", index=False)
-                stats.to_excel(writer, sheet_name="statistics", index=False)
-                summary.to_excel(writer, sheet_name="summary", index=False)
+                stats.to_excel(writer, sheet_name="aggregated", index=False)
+                df.to_excel(writer, sheet_name="raw_data", index=False)
         else:
             df.to_csv(output, index=False)
         if args.verbose:

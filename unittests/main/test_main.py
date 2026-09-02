@@ -109,6 +109,39 @@ class TestMainBench(ExtTestCase):
         self.assertIn("prompt", content)
         self.assertIn("compiled", content)
 
+    @skipif_no_genai()
+    def test_bench_output_xlsx(self):
+        """Checks that Excel output contains aggregated data before raw data."""
+        import os
+        import tempfile
+
+        import pandas
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = os.path.join(tmpdir, "results.xlsx")
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(
+                    [
+                        "bench",
+                        "mock/generate",
+                        "basic",
+                        "--chat-template",
+                        "chatml",
+                        "--output",
+                        xlsx_path,
+                    ]
+                )
+
+            workbook = pandas.ExcelFile(xlsx_path)
+            self.assertEqual(workbook.sheet_names, ["aggregated", "raw_data"])
+            aggregated = pandas.read_excel(workbook, sheet_name="aggregated")
+            raw_data = pandas.read_excel(workbook, sheet_name="raw_data")
+
+        self.assertIn("score", aggregated.columns)
+        self.assertIn("input_index", raw_data.columns)
+        self.assertEqual(len(aggregated), 10)
+        self.assertEqual(len(raw_data), 34)
+
 
 if __name__ == "__main__":
     unittest.main()
