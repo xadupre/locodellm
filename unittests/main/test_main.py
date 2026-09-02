@@ -20,13 +20,16 @@ class TestMain(ExtTestCase):
         """Checks that built-in and LM-Eval benchmarks are listed."""
         buf = io.StringIO()
         with (
-            patch("locodellm.__main__._get_lm_eval_benchmarks", return_value=["gsm8k"]),
+            patch("locodellm.__main__._get_lm_eval_benchmarks", return_value=[]),
             contextlib.redirect_stdout(buf),
         ):
             main(["benchmarks"])
         output = buf.getvalue()
         self.assertIn("basic", output)
         self.assertIn("gsm8k", output)
+        self.assertIn(
+            "https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks/", output
+        )
 
     def test_models(self):
         """Checks that the models subcommand lists available mock models."""
