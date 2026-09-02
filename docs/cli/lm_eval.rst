@@ -34,6 +34,14 @@ repeatable ``--provider-option NAME=VALUE`` options, ``--num-fewshot``, and
         --provider CUDAExecutionProvider --provider-option device_id=1
 
 Provider options are passed to ``onnxruntime_genai.Config.set_provider_option``.
+Repeatable ``--session-option NAME=JSON_VALUE`` options modify ONNX Runtime
+session settings through ``onnxruntime_genai.Config.overlay``:
+
+.. code-block:: bash
+
+    python -m locodellm lm-eval path/to/model gsm8k \
+        --session-option intra_op_num_threads=4
+
 Only tasks using LM-Eval's
 ``generate_until`` request type are supported; likelihood and perplexity tasks
 require model logits, which the ONNX Runtime GenAI generation API does not

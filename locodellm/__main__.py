@@ -63,6 +63,16 @@ def _parse_provider_option(value: str) -> tuple[str, str]:
     return name, option_value
 
 
+def _parse_session_option(value: str) -> tuple[str, object]:
+    """Parses an ONNX Runtime session option written as NAME=JSON_VALUE."""
+    import json
+
+    name, separator, option_value = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError("session options must use NAME=JSON_VALUE")
+    return name, json.loads(option_value)
+
+
 def _cmd_version(args: argparse.Namespace) -> None:  # noqa: ARG001
     """Prints the package version."""
     from locodellm import __version__
@@ -243,6 +253,7 @@ def _cmd_lm_eval(args: argparse.Namespace) -> None:
         precision=args.precision,
         provider=args.provider,
         provider_options=dict(args.provider_option),
+        session_options=dict(args.session_option),
         chat_template=args.chat_template,
         max_length=args.max_length,
         num_fewshot=args.num_fewshot,
@@ -361,6 +372,14 @@ def main(args: list[str] | None = None) -> None:
         type=_parse_provider_option,
         metavar="NAME=VALUE",
         help="ONNX Runtime option for the selected provider; may be repeated.",
+    )
+    lm_eval_parser.add_argument(
+        "--session-option",
+        action="append",
+        default=[],
+        type=_parse_session_option,
+        metavar="NAME=JSON_VALUE",
+        help="ONNX Runtime session option; may be repeated.",
     )
     lm_eval_parser.add_argument("--chat-template", default=None, help="Chat template.")
     lm_eval_parser.add_argument(

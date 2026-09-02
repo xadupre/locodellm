@@ -183,6 +183,7 @@ def create_session(
     model: str | Any,
     providers: list[str] | None = None,
     provider_options: dict[str, str] | None = None,
+    session_options: dict[str, Any] | None = None,
     verbose: int = 0,
     chat_template: str | None = None,
 ) -> SessionState:
@@ -196,6 +197,7 @@ def create_session(
             When *None*, onnxruntime-genai picks its default provider.
             Ignored when *model* is not a path.
         provider_options: Options applied to the selected execution provider.
+        session_options: ONNX Runtime session options.
         verbose: Verbosity level (0 = silent, 1+ = print progress
             messages during model loading and generation).
         chat_template: Chat template to apply around prompts.
@@ -210,18 +212,29 @@ def create_session(
     if isinstance(model, str):
         if verbose:
             print(f"[create_session] loading model from {model!r}")
-        if providers is not None:
-            if provider_options and len(providers) != 1:
-                raise ValueError("Provider options require exactly one execution provider.")
-            config = og.Config(model)
-            config.clear_providers()
-            for provider in providers:
-                if verbose:
-                    print(f"[create_session] adding provider {provider}")
-                config.append_provider(provider)
+        if providers is not None or session_options:
+            provider_for_options = None
             if provider_options:
+                if providers is None or len(providers) != 1:
+                    raise ValueError("Provider options require exactly one execution provider.")
+                provider_for_options = providers[0]
+            config = og.Config(model)
+            if session_options:
+                import json
+
+                config.overlay(
+                    json.dumps({"model": {"decoder": {"session_options": session_options}}})
+                )
+            if providers is not None:
+                config.clear_providers()
+                for provider in providers:
+                    if verbose:
+                        print(f"[create_session] adding provider {provider}")
+                    config.append_provider(provider)
+            if provider_options:
+                assert provider_for_options is not None
                 for name, value in provider_options.items():
-                    config.set_provider_option(providers[0], name, value)
+                    config.set_provider_option(provider_for_options, name, value)
             loaded = og.Model(config)
         else:
             loaded = og.Model(model)

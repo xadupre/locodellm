@@ -50,7 +50,7 @@ class TestGenerateFromModel(ExtTestCase):
         self.assertTrue(os.path.exists(model_path))
 
         # Session cache should also be populated.
-        self.assertIn(("mock/generate", None, None, ()), _session_cache)
+        self.assertIn(("mock/generate", None, None, (), "{}"), _session_cache)
 
     @skipif_no_genai()
     def test_conversion_not_repeated(self):

@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 import unittest
@@ -45,6 +46,7 @@ class _Config:
         self.model = model
         self.providers = []
         self.provider_options = []
+        self.overlays = []
 
     def clear_providers(self):
         self.providers.clear()
@@ -54,6 +56,9 @@ class _Config:
 
     def set_provider_option(self, provider, name, value):
         self.provider_options.append((provider, name, value))
+
+    def overlay(self, value):
+        self.overlays.append(json.loads(value))
 
 
 class TestOnnxRuntimeGenAILM(unittest.TestCase):
@@ -81,9 +86,13 @@ class TestOnnxRuntimeGenAILM(unittest.TestCase):
                 "model",
                 provider="CUDAExecutionProvider",
                 provider_options={"device_id": "1"},
+                session_options={"intra_op_num_threads": 4},
                 max_length=20,
             )
         self.assertEqual(get_session.call_args.kwargs["provider_options"], {"device_id": "1"})
+        self.assertEqual(
+            get_session.call_args.kwargs["session_options"], {"intra_op_num_threads": 4}
+        )
 
         request = SimpleNamespace(
             args=("two token", {"max_gen_toks": 5, "until": ["STOP"], "temperature": 0.5})
@@ -119,11 +128,32 @@ class TestSessionProviderOptions(unittest.TestCase):
         )
         with patch.dict(sys.modules, {"onnxruntime_genai": runtime}):
             session = create_session(
-                "model", providers=["CUDAExecutionProvider"], provider_options={"device_id": "1"}
+                "model",
+                providers=["CUDAExecutionProvider"],
+                provider_options={"device_id": "1"},
+                session_options={"intra_op_num_threads": 4},
             )
         self.assertEqual(session.model.providers, ["CUDAExecutionProvider"])
         self.assertEqual(
             session.model.provider_options, [("CUDAExecutionProvider", "device_id", "1")]
+        )
+        self.assertEqual(
+            session.model.overlays,
+            [{"model": {"decoder": {"session_options": {"intra_op_num_threads": 4}}}}],
+        )
+
+    def test_session_options_without_provider(self):
+        """Checks that session options do not require an execution provider."""
+        from locodellm.session.session_state import create_session
+
+        runtime = SimpleNamespace(
+            Config=_Config, Model=lambda config: config, Tokenizer=lambda model: object()
+        )
+        with patch.dict(sys.modules, {"onnxruntime_genai": runtime}):
+            session = create_session("model", session_options={"inter_op_num_threads": 2})
+        self.assertEqual(
+            session.model.overlays,
+            [{"model": {"decoder": {"session_options": {"inter_op_num_threads": 2}}}}],
         )
 
 
@@ -141,6 +171,8 @@ class TestLmEvalCommand(unittest.TestCase):
                     "CUDAExecutionProvider",
                     "--provider-option",
                     "device_id=1",
+                    "--session-option",
+                    "intra_op_num_threads=4",
                     "--limit",
                     "10",
                 ]
@@ -150,6 +182,7 @@ class TestLmEvalCommand(unittest.TestCase):
         self.assertEqual(args.tasks, ["gsm8k", "squad"])
         self.assertEqual(args.limit, 10)
         self.assertEqual(args.provider_option, [("device_id", "1")])
+        self.assertEqual(args.session_option, [("intra_op_num_threads", 4)])
 
     def test_provider_options_forwarded(self):
         """Checks that CLI provider options reach the LM-Eval adapter."""
@@ -162,6 +195,7 @@ class TestLmEvalCommand(unittest.TestCase):
             precision=None,
             provider="CUDAExecutionProvider",
             provider_option=[("device_id", "1")],
+            session_option=[("intra_op_num_threads", 4)],
             chat_template=None,
             max_length=100,
             num_fewshot=None,
@@ -171,6 +205,9 @@ class TestLmEvalCommand(unittest.TestCase):
         with patch.dict(sys.modules, {"locodellm.lm_eval": adapter, "lm_eval.utils": utils}):
             _cmd_lm_eval(args)
         self.assertEqual(run_lm_eval.call_args.kwargs["provider_options"], {"device_id": "1"})
+        self.assertEqual(
+            run_lm_eval.call_args.kwargs["session_options"], {"intra_op_num_threads": 4}
+        )
 
 
 if __name__ == "__main__":
