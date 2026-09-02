@@ -115,6 +115,20 @@ session = create_session(model_path)
 session.generate("<s>", max_length=10)
 ```
 
+## LM Evaluation Harness
+
+Install the optional dependency and run a generation-based
+[LM Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness)
+task against an ONNX Runtime GenAI model:
+
+```bash
+pip install ".[eval]"
+python -m locodellm lm-eval path/to/model gsm8k --limit 10
+```
+
+The adapter supports LM-Eval tasks that use `generate_until`. Likelihood and
+perplexity tasks are not supported by the ONNX Runtime GenAI generation API.
+
 ## Development
 
 ```bash
@@ -122,4 +136,3 @@ pip install -e ".[dev]"
 pytest unittests
 black . && ruff check .
 ```
-

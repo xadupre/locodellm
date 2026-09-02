@@ -20,6 +20,8 @@ The ``locodellm`` package provides several subcommands accessible via
       - Generates text from a prompt using a local LLM.
     * - :doc:`bench`
       - Runs a benchmark against a model, evaluating generated code.
+    * - :doc:`lm_eval`
+      - Runs LM Evaluation Harness generation tasks against an ONNX model.
 
 .. toctree::
     :maxdepth: 1
@@ -30,3 +32,4 @@ The ``locodellm`` package provides several subcommands accessible via
     models
     generate
     bench
+    lm_eval
