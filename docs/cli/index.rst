@@ -13,15 +13,13 @@ The ``locodellm`` package provides several subcommands accessible via
     * - :doc:`version`
       - Prints the installed package version.
     * - :doc:`benchmarks`
-      - Lists the available built-in benchmarks.
+      - Lists the available built-in and LM-Eval benchmarks.
     * - :doc:`models`
       - Lists the available mock ONNX test models.
     * - :doc:`generate`
       - Generates text from a prompt using a local LLM.
     * - :doc:`bench`
-      - Runs a benchmark against a model, evaluating generated code.
-    * - :doc:`lm_eval`
-      - Runs LM Evaluation Harness generation tasks against an ONNX model.
+      - Runs a built-in or LM-Eval benchmark against a model.
 
 .. toctree::
     :maxdepth: 1
@@ -32,4 +30,3 @@ The ``locodellm`` package provides several subcommands accessible via
     models
     generate
     bench
-    lm_eval

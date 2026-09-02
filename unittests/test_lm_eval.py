@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from locodellm.__main__ import _cmd_lm_eval, main
+from locodellm.__main__ import _cmd_bench, _cmd_lm_eval, main
 
 
 class _LM:
@@ -159,30 +159,45 @@ class TestSessionProviderOptions(unittest.TestCase):
 
 class TestLmEvalCommand(unittest.TestCase):
     def test_arguments(self):
-        """Checks that the LM-Eval command parses model and task options."""
-        with patch("locodellm.__main__._cmd_lm_eval") as command:
+        """Checks that bench retains every LM-Eval model and task option."""
+        with patch("locodellm.__main__._cmd_bench") as command:
             main(
                 [
-                    "lm-eval",
+                    "bench",
                     "model",
                     "gsm8k",
                     "squad",
+                    "--precision",
+                    "int4",
                     "--provider",
                     "CUDAExecutionProvider",
                     "--provider-option",
                     "device_id=1",
                     "--session-option",
                     "intra_op_num_threads=4",
+                    "--chat-template",
+                    "chatml",
+                    "--max-length",
+                    "1024",
+                    "--num-fewshot",
+                    "2",
                     "--limit",
                     "10",
+                    "--verbose",
+                    "1",
                 ]
             )
         args = command.call_args.args[0]
         self.assertEqual(args.model, "model")
-        self.assertEqual(args.tasks, ["gsm8k", "squad"])
+        self.assertEqual(args.benchmark, ["gsm8k", "squad"])
+        self.assertEqual(args.precision, "int4")
         self.assertEqual(args.limit, 10)
         self.assertEqual(args.provider_option, [("device_id", "1")])
         self.assertEqual(args.session_option, [("intra_op_num_threads", 4)])
+        self.assertEqual(args.chat_template, "chatml")
+        self.assertEqual(args.max_length, 1024)
+        self.assertEqual(args.num_fewshot, 2)
+        self.assertEqual(args.verbose, 1)
 
     def test_provider_options_forwarded(self):
         """Checks that CLI provider options reach the LM-Eval adapter."""
@@ -191,7 +206,7 @@ class TestLmEvalCommand(unittest.TestCase):
         utils = SimpleNamespace(make_table=Mock())
         args = SimpleNamespace(
             model="model",
-            tasks=["gsm8k"],
+            benchmark=["gsm8k"],
             precision=None,
             provider="CUDAExecutionProvider",
             provider_option=[("device_id", "1")],
@@ -208,6 +223,16 @@ class TestLmEvalCommand(unittest.TestCase):
         self.assertEqual(
             run_lm_eval.call_args.kwargs["session_options"], {"intra_op_num_threads": 4}
         )
+
+    def test_lm_eval_runs_through_bench(self):
+        """Checks that a non-built-in benchmark runs with LM-Eval."""
+        args = SimpleNamespace(benchmark=["gsm8k"])
+        with (
+            patch("locodellm.bench.get_available_benchmarks", return_value={"basic": "built-in"}),
+            patch("locodellm.__main__._cmd_lm_eval") as command,
+        ):
+            _cmd_bench(args)
+        command.assert_called_once_with(args)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ version
         python -m locodellm version
 
 benchmarks
-    Lists the available built-in benchmarks.
+    Lists the available built-in and LM-Eval benchmarks.
 
     Usage::
 
@@ -41,12 +41,6 @@ bench
         python -m locodellm bench mock/generate basic --chat-template chatml
         python -m locodellm bench mock/generate basic --chat-template chatml -o results.csv
 
-lm-eval
-    Runs LM Evaluation Harness generation tasks against a model.
-
-    Usage::
-
-        python -m locodellm lm-eval ./model gsm8k --limit 10
 """
 
 from __future__ import annotations
@@ -73,6 +67,18 @@ def _parse_session_option(value: str) -> tuple[str, object]:
     return name, json.loads(option_value)
 
 
+def _get_lm_eval_benchmarks() -> list[str]:
+    """Returns the available LM-Eval benchmark names when LM-Eval is installed."""
+    import importlib.util
+
+    if importlib.util.find_spec("lm_eval") is None:
+        return []
+
+    from lm_eval.tasks import TaskManager
+
+    return sorted(TaskManager().all_tasks)
+
+
 def _cmd_version(args: argparse.Namespace) -> None:  # noqa: ARG001
     """Prints the package version."""
     from locodellm import __version__
@@ -85,6 +91,8 @@ def _cmd_benchmarks(args: argparse.Namespace) -> None:  # noqa: ARG001
     from locodellm.bench import get_available_benchmarks
 
     benchmarks = get_available_benchmarks()
+    for name in _get_lm_eval_benchmarks():
+        benchmarks.setdefault(name, "LM Evaluation Harness benchmark.")
     width = max(len(name) for name in benchmarks)
     for name, description in benchmarks.items():
         print(f"{name:<{width}}  {description}")
@@ -147,7 +155,7 @@ def _compute_case_stats(df):  # noqa: ANN001, ANN202
     return pandas.DataFrame(rows)
 
 
-def _cmd_bench(args: argparse.Namespace) -> None:
+def _cmd_builtin_bench(args: argparse.Namespace) -> None:
     """Runs a benchmark against a model and outputs results."""
     from locodellm.bench import load_benchmark
     from locodellm.generate.generate_from_model import get_session
@@ -158,6 +166,8 @@ def _cmd_bench(args: argparse.Namespace) -> None:
         model_id=args.model,
         precision=args.precision,
         provider=args.provider,
+        provider_options=dict(args.provider_option),
+        session_options=dict(args.session_option),
         chat_template=args.chat_template,
         verbose=inner_verbose,
     )
@@ -167,8 +177,8 @@ def _cmd_bench(args: argparse.Namespace) -> None:
     if args.output and args.output.endswith(".json"):
         json_output = args.output
 
-    benchmark = load_benchmark(args.benchmark)
-    benchmark.max_length = args.max_length
+    benchmark = load_benchmark(args.benchmark[0])
+    benchmark.max_length = 200 if args.max_length is None else args.max_length
     result = benchmark.run(session, verbose=args.verbose, json_output=json_output)
     df = result.to_dataframe()
 
@@ -249,13 +259,13 @@ def _cmd_lm_eval(args: argparse.Namespace) -> None:
 
     results = run_lm_eval(
         model=args.model,
-        tasks=args.tasks,
+        tasks=args.benchmark,
         precision=args.precision,
         provider=args.provider,
         provider_options=dict(args.provider_option),
         session_options=dict(args.session_option),
         chat_template=args.chat_template,
-        max_length=args.max_length,
+        max_length=2048 if args.max_length is None else args.max_length,
         num_fewshot=args.num_fewshot,
         limit=args.limit,
         verbose=args.verbose,
@@ -264,13 +274,23 @@ def _cmd_lm_eval(args: argparse.Namespace) -> None:
         print(make_table(results))
 
 
+def _cmd_bench(args: argparse.Namespace) -> None:
+    """Runs a built-in or LM-Eval benchmark against a model."""
+    from locodellm.bench import get_available_benchmarks
+
+    if len(args.benchmark) == 1 and args.benchmark[0] in get_available_benchmarks():
+        _cmd_builtin_bench(args)
+    else:
+        _cmd_lm_eval(args)
+
+
 def main(args: list[str] | None = None) -> None:
     """Parses the command line and dispatches to the appropriate subcommand."""
     parser = argparse.ArgumentParser(prog="python -m locodellm", description="locodellm CLI")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("version", help="Print the package version.")
-    sub.add_parser("benchmarks", help="List available benchmarks.")
+    sub.add_parser("benchmarks", help="List available built-in and LM-Eval benchmarks.")
     sub.add_parser("models", help="List available mock ONNX test models.")
 
     gen_parser = sub.add_parser(
@@ -326,7 +346,8 @@ def main(args: list[str] | None = None) -> None:
             "  python -m locodellm bench Qwen/Qwen2.5-Coder-0.5B-Instruct basic \\\n"
             "      --chat-template chatml --output results.csv\n"
             "  python -m locodellm bench mock/generate basic \\\n"
-            "      --chat-template chatml --output results.xlsx"
+            "      --chat-template chatml --output results.xlsx\n"
+            "  python -m locodellm bench ./model gsm8k --limit 10"
         ),
     )
     bench_parser.add_argument(
@@ -337,7 +358,9 @@ def main(args: list[str] | None = None) -> None:
         ),
     )
     bench_parser.add_argument(
-        "benchmark", help="Benchmark name (use 'python -m locodellm benchmarks' to list)."
+        "benchmark",
+        nargs="+",
+        help="Benchmark name(s) (use 'python -m locodellm benchmarks' to list).",
     )
     bench_parser.add_argument(
         "--precision", default=None, help="Precision qualifier (e.g. fp16, int4)."
@@ -346,7 +369,10 @@ def main(args: list[str] | None = None) -> None:
         "--provider", default=None, help="Execution provider (e.g. CUDAExecutionProvider)."
     )
     bench_parser.add_argument(
-        "--max-length", type=int, default=200, help="Maximum token length (default: 200)."
+        "--max-length",
+        type=int,
+        default=None,
+        help="Maximum token length (default: 200 built-in, 2048 LM-Eval).",
     )
     bench_parser.add_argument(
         "--chat-template", default=None, help="Chat template (e.g. chatml)."
@@ -355,17 +381,6 @@ def main(args: list[str] | None = None) -> None:
         "--output", "-o", default=None, help="Output file path (.csv, .xlsx, or .json)."
     )
     bench_parser.add_argument(
-        "--verbose", "-v", type=int, default=0, help="Verbosity level (default: 0)."
-    )
-
-    lm_eval_parser = sub.add_parser(
-        "lm-eval", help="Run LM Evaluation Harness generation tasks against a model."
-    )
-    lm_eval_parser.add_argument("model", help="Model id or local ONNX model directory.")
-    lm_eval_parser.add_argument("tasks", nargs="+", help="LM-Eval task names.")
-    lm_eval_parser.add_argument("--precision", default=None, help="Precision qualifier.")
-    lm_eval_parser.add_argument("--provider", default=None, help="Execution provider.")
-    lm_eval_parser.add_argument(
         "--provider-option",
         action="append",
         default=[],
@@ -373,7 +388,7 @@ def main(args: list[str] | None = None) -> None:
         metavar="NAME=VALUE",
         help="ONNX Runtime option for the selected provider; may be repeated.",
     )
-    lm_eval_parser.add_argument(
+    bench_parser.add_argument(
         "--session-option",
         action="append",
         default=[],
@@ -381,13 +396,11 @@ def main(args: list[str] | None = None) -> None:
         metavar="NAME=JSON_VALUE",
         help="ONNX Runtime session option; may be repeated.",
     )
-    lm_eval_parser.add_argument("--chat-template", default=None, help="Chat template.")
-    lm_eval_parser.add_argument(
-        "--max-length", type=int, default=2048, help="Maximum total token length."
+    bench_parser.add_argument("--num-fewshot", type=int, default=None)
+    bench_parser.add_argument("--limit", type=float, default=None)
+    bench_parser.add_argument(
+        "--verbose", "-v", type=int, default=0, help="Verbosity level (default: 0)."
     )
-    lm_eval_parser.add_argument("--num-fewshot", type=int, default=None)
-    lm_eval_parser.add_argument("--limit", type=float, default=None)
-    lm_eval_parser.add_argument("--verbose", "-v", type=int, default=0)
 
     parsed = parser.parse_args(args)
 
@@ -401,7 +414,6 @@ def main(args: list[str] | None = None) -> None:
         "models": _cmd_models,
         "generate": _cmd_generate,
         "bench": _cmd_bench,
-        "lm-eval": _cmd_lm_eval,
     }
     dispatch[parsed.command](parsed)
 
