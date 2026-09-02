@@ -1,5 +1,5 @@
 lm-eval
-=======
+*******
 
 Runs generation-based `LM Evaluation Harness
 <https://github.com/EleutherAI/lm-evaluation-harness>`_ tasks against an ONNX
