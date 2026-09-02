@@ -125,7 +125,8 @@ Run the built-in `basic` benchmark against a local ONNX model:
 python -m locodellm bench path/to/model basic --chat-template chatml
 ```
 
-Use `python -m locodellm benchmarks` to list the available built-in benchmarks.
+Use `python -m locodellm benchmarks` to list the available built-in and LM-Eval
+benchmarks.
 
 ### LM Evaluation Harness
 
@@ -135,7 +136,7 @@ task against an ONNX Runtime GenAI model:
 
 ```bash
 pip install ".[eval]"
-python -m locodellm lm-eval path/to/model gsm8k --limit 10
+python -m locodellm bench path/to/model gsm8k --limit 10
 ```
 
 The adapter supports LM-Eval tasks that use `generate_until`. Likelihood and

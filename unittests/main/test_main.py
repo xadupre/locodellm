@@ -1,6 +1,7 @@
 import contextlib
 import io
 import unittest
+from unittest.mock import patch
 
 from locodellm import __version__
 from locodellm.__main__ import main
@@ -16,12 +17,16 @@ class TestMain(ExtTestCase):
         self.assertEqual(buf.getvalue().strip(), __version__)
 
     def test_benchmarks(self):
-        """Checks that the benchmarks subcommand lists available benchmarks."""
+        """Checks that built-in and LM-Eval benchmarks are listed."""
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with (
+            patch("locodellm.__main__._get_lm_eval_benchmarks", return_value=["gsm8k"]),
+            contextlib.redirect_stdout(buf),
+        ):
             main(["benchmarks"])
         output = buf.getvalue()
         self.assertIn("basic", output)
+        self.assertIn("gsm8k", output)
 
     def test_models(self):
         """Checks that the models subcommand lists available mock models."""

@@ -1,10 +1,10 @@
 bench
 =====
 
-Runs a benchmark against a model, evaluating generated code for
-correctness. For each prompt in the benchmark, the model generates code,
-which is then compiled, executed with test inputs, and compared to
-expected results.
+Runs either a built-in benchmark or one or more generation-based `LM
+Evaluation Harness <https://github.com/EleutherAI/lm-evaluation-harness>`_
+tasks against a model. For built-in benchmarks, generated code is compiled,
+executed with test inputs, and compared to expected results.
 
 Results are displayed as a markdown table on standard output, followed by
 per-case statistics and an aggregated summary. Results can optionally be
@@ -19,7 +19,7 @@ Usage
 
 .. code-block:: bash
 
-    python -m locodellm bench MODEL BENCHMARK [OPTIONS]
+    python -m locodellm bench MODEL BENCHMARK [BENCHMARK ...] [OPTIONS]
 
 Options
 -------
@@ -30,8 +30,8 @@ Options
     ``Qwen/Qwen2.5-Coder-0.5B-Instruct``.
 
 ``BENCHMARK``
-    Benchmark name. Use ``python -m locodellm benchmarks`` to list
-    available benchmarks.
+    One built-in benchmark name or one or more LM-Eval task names. Use
+    ``python -m locodellm benchmarks`` to list available benchmarks.
 
 ``--precision``
     Precision qualifier for conversion (e.g. ``fp32``, ``fp16``, ``int4``).
@@ -39,8 +39,15 @@ Options
 ``--provider``
     Execution provider (e.g. ``CUDAExecutionProvider``).
 
+``--provider-option NAME=VALUE``
+    ONNX Runtime option for the selected provider. May be repeated.
+
+``--session-option NAME=JSON_VALUE``
+    ONNX Runtime session option. May be repeated.
+
 ``--max-length``
-    Maximum token length for generation (default: 200).
+    Maximum token length for generation (default: 200 for built-in
+    benchmarks and 2048 for LM-Eval).
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
@@ -49,6 +56,12 @@ Options
     Output file path. Use ``.csv`` for CSV, ``.xlsx`` for Excel (three
     sheets), or ``.json`` for detailed JSON with generated code and
     per-input results. JSON files are written incrementally during the run.
+
+``--num-fewshot``
+    Number of few-shot examples for LM-Eval.
+
+``--limit``
+    Number or fraction of examples to evaluate with LM-Eval.
 
 ``--verbose, -v``
     Verbosity level (default: 0). At level 1, a progress bar is shown and
@@ -82,6 +95,22 @@ Output columns
 
 Examples
 --------
+
+Install the optional dependency before running LM-Eval benchmarks:
+
+.. code-block:: bash
+
+    pip install ".[eval]"
+
+Run ten samples from the LM-Eval ``gsm8k`` task:
+
+.. code-block:: bash
+
+    python -m locodellm bench path/to/model gsm8k --limit 10
+
+Only LM-Eval tasks using ``generate_until`` are supported; likelihood and
+perplexity tasks require model logits, which ONNX Runtime GenAI does not
+expose.
 
 Run with the mock model:
 
