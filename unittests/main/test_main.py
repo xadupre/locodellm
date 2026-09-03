@@ -84,7 +84,7 @@ class TestMainBench(ExtTestCase):
 
     @skipif_no_genai()
     def test_bench_output_csv(self):
-        """Checks that bench subcommand can write a CSV file."""
+        """Checks that CSV output is accompanied by JSON and Excel files."""
         import os
         import tempfile
 
@@ -104,6 +104,8 @@ class TestMainBench(ExtTestCase):
                 ]
             )
         self.assertTrue(os.path.exists(csv_path))
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "results.json")))
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "results.xlsx")))
         with open(csv_path) as f:
             content = f.read()
         self.assertIn("prompt", content)
@@ -111,7 +113,8 @@ class TestMainBench(ExtTestCase):
 
     @skipif_no_genai()
     def test_bench_output_xlsx(self):
-        """Checks that Excel output contains aggregated data before raw data."""
+        """Checks that Excel output is accompanied by detailed JSON."""
+        import json
         import os
         import tempfile
 
@@ -136,11 +139,70 @@ class TestMainBench(ExtTestCase):
             self.assertEqual(workbook.sheet_names, ["aggregated", "raw_data"])
             aggregated = pandas.read_excel(workbook, sheet_name="aggregated")
             raw_data = pandas.read_excel(workbook, sheet_name="raw_data")
+            json_path = os.path.join(tmpdir, "results.json")
+            self.assertTrue(os.path.exists(json_path))
+            with open(json_path, encoding="utf-8") as f:
+                detailed = json.load(f)
 
         self.assertIn("score", aggregated.columns)
         self.assertIn("input_index", raw_data.columns)
         self.assertEqual(len(aggregated), 10)
         self.assertEqual(len(raw_data), 34)
+        self.assertEqual(len(detailed), 10)
+        self.assertIn("generated_code", detailed[0])
+        self.assertIn("results", detailed[0])
+
+    @skipif_no_genai()
+    def test_bench_output_json(self):
+        """Checks that JSON output is accompanied by an Excel workbook."""
+        import os
+        import tempfile
+
+        import pandas
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "results.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(
+                    [
+                        "bench",
+                        "mock/generate",
+                        "basic",
+                        "--chat-template",
+                        "chatml",
+                        "--output",
+                        json_path,
+                    ]
+                )
+
+            self.assertTrue(os.path.exists(json_path))
+            workbook = pandas.ExcelFile(os.path.join(tmpdir, "results.xlsx"))
+
+        self.assertEqual(workbook.sheet_names, ["aggregated", "raw_data"])
+
+    @skipif_no_genai()
+    def test_bench_output_uppercase_xlsx(self):
+        """Checks that the requested path is preserved for uppercase suffixes."""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = os.path.join(tmpdir, "results.XLSX")
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(
+                    [
+                        "bench",
+                        "mock/generate",
+                        "basic",
+                        "--chat-template",
+                        "chatml",
+                        "--output",
+                        xlsx_path,
+                    ]
+                )
+
+            self.assertTrue(os.path.exists(xlsx_path))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "results.json")))
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ tasks against a model. For built-in benchmarks, generated code is compiled,
 executed with test inputs, and compared to expected results.
 
 Results are displayed as a markdown table on standard output, followed by
-per-case statistics and an aggregated summary. Results can optionally be
-exported to CSV, Excel (``.xlsx`` with three sheets: results, statistics,
-summary), or JSON.
+per-case statistics and an aggregated summary. File output includes detailed
+JSON and an Excel workbook with ``aggregated`` and ``raw_data`` sheets, plus
+CSV when requested.
 
 When ``--verbose 1`` is used, a progress bar is shown on stderr during
 generation.
@@ -53,9 +53,12 @@ Options
     Chat template to use (e.g. ``chatml``).
 
 ``--output, -o``
-    Output file path. Use ``.csv`` for CSV, ``.xlsx`` for Excel (three
-    sheets), or ``.json`` for detailed JSON with generated code and
-    per-input results. JSON files are written incrementally during the run.
+    Built-in benchmark output path. Every output writes a detailed ``.json``
+    file with generated code and per-input results plus an ``.xlsx`` workbook
+    with ``aggregated`` and ``raw_data`` sheets. JSON files are written
+    incrementally during the run. A requested ``.csv`` file is written in
+    addition to the JSON and Excel files. LM-Eval currently ignores this
+    option.
 
 ``--num-fewshot``
     Number of few-shot examples for LM-Eval.
@@ -164,14 +167,15 @@ Summary:
     | avg_tokens_per_second | 19.53    |
     | avg_score             |  0.9     |
 
-Export to JSON (written incrementally during the run):
+Export to detailed JSON and aggregated Excel (the JSON is written
+incrementally during the run):
 
 .. code-block:: bash
 
     python -m locodellm bench mock/generate basic \
         --chat-template chatml -o results.json
 
-Export to CSV:
+Export to CSV, detailed JSON, and aggregated Excel:
 
 .. code-block:: bash
 
