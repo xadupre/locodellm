@@ -252,7 +252,9 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         ):
             stats.to_excel(writer, sheet_name="aggregated", index=False)
             df.to_excel(writer, sheet_name="raw_data", index=False)
-        outputs = [json_output, xlsx_output]
+        outputs = [xlsx_output]
+        if json_output:
+            outputs.insert(0, json_output)
         if output_suffix not in {".json", ".xlsx"}:
             df.to_csv(args.output, index=False)
             outputs.append(args.output)
