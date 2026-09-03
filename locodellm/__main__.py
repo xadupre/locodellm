@@ -46,6 +46,7 @@ bench
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -177,10 +178,13 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         verbose=inner_verbose,
     )
 
-    # Determine JSON output path.
+    output_root, output_suffix = os.path.splitext(args.output) if args.output else (None, "")
+    output_suffix = output_suffix.lower()
     json_output = None
-    if args.output and args.output.endswith(".json"):
-        json_output = args.output
+    xlsx_output = None
+    if output_root:
+        json_output = args.output if output_suffix == ".json" else f"{output_root}.json"
+        xlsx_output = args.output if output_suffix == ".xlsx" else f"{output_root}.xlsx"
 
     benchmark = load_benchmark(args.benchmark[0])
     benchmark.max_length = 200 if args.max_length is None else args.max_length
@@ -240,19 +244,22 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
     print("\n\nSummary\n")
     print(summary.to_markdown(index=False))
 
-    # Export to CSV/Excel if requested (JSON is written incrementally above).
-    if args.output and not args.output.endswith(".json"):
-        output = args.output
-        if output.endswith(".csv"):
-            df.to_csv(output, index=False)
-        elif output.endswith(".xlsx"):
-            with pandas.ExcelWriter(output) as writer:
-                stats.to_excel(writer, sheet_name="aggregated", index=False)
-                df.to_excel(writer, sheet_name="raw_data", index=False)
-        else:
-            df.to_csv(output, index=False)
+    # JSON is written incrementally above; always pair it with an Excel summary.
+    if xlsx_output:
+        with (
+            open(xlsx_output, "wb") as stream,
+            pandas.ExcelWriter(stream, engine="openpyxl") as writer,
+        ):
+            stats.to_excel(writer, sheet_name="aggregated", index=False)
+            df.to_excel(writer, sheet_name="raw_data", index=False)
+        outputs = [xlsx_output]
+        if json_output:
+            outputs.insert(0, json_output)
+        if output_suffix not in {".json", ".xlsx"}:
+            df.to_csv(args.output, index=False)
+            outputs.append(args.output)
         if args.verbose:
-            print(f"\n[bench] results saved to {output}")
+            print(f"\n[bench] results saved to {', '.join(outputs)}")
 
 
 def _cmd_lm_eval(args: argparse.Namespace) -> None:
@@ -382,7 +389,13 @@ def main(args: list[str] | None = None) -> None:
         "--chat-template", default=None, help="Chat template (e.g. chatml)."
     )
     bench_parser.add_argument(
-        "--output", "-o", default=None, help="Output file path (.csv, .xlsx, or .json)."
+        "--output",
+        "-o",
+        default=None,
+        help=(
+            "Built-in benchmark output path; writes matching .json and .xlsx files "
+            "(.csv is optional)."
+        ),
     )
     bench_parser.add_argument(
         "--provider-option",
