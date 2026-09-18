@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 
-from locodellm.ext_test_case import ExtTestCase, skipif_no_genai
+from locodellm.ext_test_case import ExtTestCase, requires_onnxruntime_genai
 from locodellm.generate.chat import chat
 
 
@@ -175,7 +175,7 @@ class TestChat(ExtTestCase):
         self.assertIn("--max-length must be positive", result.stderr)
 
 
-@skipif_no_genai()
+@requires_onnxruntime_genai()
 class TestChatGenAI(ExtTestCase):
     def test_real_generator_cache_and_cli(self):
         """Checks cached continuation after EOS and clearing with real GenAI."""
