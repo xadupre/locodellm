@@ -18,6 +18,8 @@ The ``locodellm`` package provides several subcommands accessible via
       - Lists the available mock ONNX test models.
     * - :doc:`generate`
       - Generates text from a prompt using a local LLM.
+    * - :doc:`chat`
+      - Streams a multi-turn conversation with an in-memory KV cache.
     * - :doc:`bench`
       - Runs a built-in or LM-Eval benchmark against a model.
 
@@ -29,4 +31,5 @@ The ``locodellm`` package provides several subcommands accessible via
     benchmarks
     models
     generate
+    chat
     bench

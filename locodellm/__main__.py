@@ -33,6 +33,13 @@ generate
         python -m locodellm generate ./Qwen2.5-Coder-0.5B-onnx \
             'write a python function which returns "hello"' --chat-template chatml
 
+chat
+    Streams an interactive conversation while retaining the model's KV cache.
+
+    Usage::
+
+        python -m locodellm chat mock/generate --chat-template chatml
+
 bench
     Runs a benchmark against a model and outputs results as a markdown table.
 
@@ -128,6 +135,25 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         verbose=args.verbose,
     )
     print(session.text)
+
+
+def _cmd_chat(args: argparse.Namespace) -> None:
+    """Loads a model once and starts a cached, streaming conversation."""
+    import onnxruntime_genai
+
+    from locodellm.generate.chat import chat
+    from locodellm.generate.generate_from_model import get_session
+
+    session = get_session(
+        model_id=args.model,
+        precision=args.precision,
+        provider=args.provider,
+        verbose=args.verbose,
+    )
+    params = onnxruntime_genai.GeneratorParams(session.model)
+    params.set_search_options(max_length=args.max_length)
+    generator = onnxruntime_genai.Generator(session.model, params)
+    chat(generator, session.tokenizer, args.max_length, chat_template=args.chat_template)
 
 
 def _compute_case_stats(df):  # noqa: ANN001, ANN202
@@ -347,6 +373,23 @@ def main(args: list[str] | None = None) -> None:
         "--verbose", "-v", type=int, default=0, help="Verbosity level (default: 0)."
     )
 
+    chat_parser = sub.add_parser(
+        "chat",
+        help="Stream an interactive conversation.",
+        description="Streams answers with cached history. Use /clear to reset, /quit to exit.",
+    )
+    chat_parser.add_argument("model", help="Model id or path, as for generate.")
+    chat_parser.add_argument("--precision", default=None, help="Precision qualifier.")
+    chat_parser.add_argument("--provider", default=None, help="Execution provider.")
+    chat_parser.add_argument(
+        "--max-length",
+        type=int,
+        default=2048,
+        help="Maximum total conversation tokens, including answers (default: 2048).",
+    )
+    chat_parser.add_argument("--chat-template", choices=["chatml"], default=None)
+    chat_parser.add_argument("--verbose", "-v", type=int, default=0)
+
     bench_parser = sub.add_parser(
         "bench",
         help="Run a benchmark against a model.",
@@ -428,11 +471,15 @@ def main(args: list[str] | None = None) -> None:
         parser.print_help()
         sys.exit(1)
 
+    if parsed.command == "chat" and parsed.max_length < 1:
+        chat_parser.error("--max-length must be positive")
+
     dispatch = {
         "version": _cmd_version,
         "benchmarks": _cmd_benchmarks,
         "models": _cmd_models,
         "generate": _cmd_generate,
+        "chat": _cmd_chat,
         "bench": _cmd_bench,
     }
     dispatch[parsed.command](parsed)
