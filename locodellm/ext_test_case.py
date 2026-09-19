@@ -45,7 +45,7 @@ def has_onnxruntime_genai() -> bool:
         return False
 
 
-def skipif_no_genai(msg: str = "onnxruntime-genai not installed") -> Callable:
+def requires_onnxruntime_genai(msg: str = "onnxruntime-genai not installed") -> Callable:
     """Skips the test when ``onnxruntime-genai`` is not available."""
     if not has_onnxruntime_genai():
         return unittest.skip(msg)

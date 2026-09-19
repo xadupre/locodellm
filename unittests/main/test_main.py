@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from locodellm import __version__
 from locodellm.__main__ import main
-from locodellm.ext_test_case import ExtTestCase, skipif_no_genai
+from locodellm.ext_test_case import ExtTestCase, requires_onnxruntime_genai
 
 
 class TestMain(ExtTestCase):
@@ -50,7 +50,7 @@ class TestMain(ExtTestCase):
 class TestMainGenerate(ExtTestCase):
     """Tests for the generate subcommand."""
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_generate_mock_model(self):
         """Checks that generate subcommand produces output."""
         buf = io.StringIO()
@@ -71,7 +71,7 @@ class TestMainGenerate(ExtTestCase):
 class TestMainBench(ExtTestCase):
     """Tests for the bench subcommand."""
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_bench_mock_model(self):
         """Checks that bench subcommand produces a markdown table."""
         buf = io.StringIO()
@@ -82,7 +82,7 @@ class TestMainBench(ExtTestCase):
         self.assertIn("compiled", output)
         self.assertIn("passed", output)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_bench_output_csv(self):
         """Checks that CSV output is accompanied by JSON and Excel files."""
         import os
@@ -111,7 +111,7 @@ class TestMainBench(ExtTestCase):
         self.assertIn("prompt", content)
         self.assertIn("compiled", content)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_bench_output_xlsx(self):
         """Checks that Excel output is accompanied by detailed JSON."""
         import json
@@ -152,7 +152,7 @@ class TestMainBench(ExtTestCase):
         self.assertIn("generated_code", detailed[0])
         self.assertIn("results", detailed[0])
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_bench_output_json(self):
         """Checks that JSON output is accompanied by an Excel workbook."""
         import os
@@ -180,7 +180,7 @@ class TestMainBench(ExtTestCase):
 
         self.assertEqual(workbook.sheet_names, ["aggregated", "raw_data"])
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_bench_output_uppercase_xlsx(self):
         """Checks that the requested path is preserved for uppercase suffixes."""
         import os

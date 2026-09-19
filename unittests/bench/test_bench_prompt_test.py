@@ -2,7 +2,7 @@ import os
 import unittest
 
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
-from locodellm.ext_test_case import ExtTestCase, skipif_no_genai
+from locodellm.ext_test_case import ExtTestCase, requires_onnxruntime_genai
 from locodellm.test_models import create_mock_generate_model
 from locodellm.session import create_session
 
@@ -16,7 +16,7 @@ class TestBenchPromptTest(ExtTestCase):
         folder = cls.get_dump_folder("bench_prompt_test")
         cls.model_path = create_mock_generate_model(os.path.join(folder, "mock-llm"))
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_passing_test(self):
         """Checks that a correct expected result passes."""
         session = create_session(self.model_path, chat_template="chatml")
@@ -35,7 +35,7 @@ class TestBenchPromptTest(ExtTestCase):
         self.assertTrue(result.results[0].run_status.compiled)
         self.assertTrue(result.results[0].run_status.ran)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_failing_test(self):
         """Checks that an incorrect expected result fails."""
         session = create_session(self.model_path, chat_template="chatml")
@@ -52,7 +52,7 @@ class TestBenchPromptTest(ExtTestCase):
         self.assertEqual(result.failed, 1)
         self.assertFalse(result.results[0].all_passed)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_multiple_tests(self):
         """Checks running multiple prompt tests in one bench."""
         session = create_session(self.model_path, chat_template="chatml")
@@ -72,7 +72,7 @@ class TestBenchPromptTest(ExtTestCase):
         self.assertEqual(result.passed, 1)
         self.assertEqual(result.failed, 1)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_session_is_restarted_between_tests(self):
         """Checks that each test gets a fresh session."""
         session = create_session(self.model_path, chat_template="chatml")
@@ -92,7 +92,7 @@ class TestBenchPromptTest(ExtTestCase):
         self.assertEqual(result.results[0].generated_code, result.results[1].generated_code)
         self.assertEqual(result.passed, 2)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_generated_code_is_captured(self):
         """Checks that the generated code is stored in the result."""
         session = create_session(self.model_path, chat_template="chatml")
@@ -106,7 +106,7 @@ class TestBenchPromptTest(ExtTestCase):
         result = bench.run(session)
         self.assertIn("def hello", result.results[0].generated_code)
 
-    @skipif_no_genai()
+    @requires_onnxruntime_genai()
     def test_to_dataframe(self):
         """Checks that to_dataframe returns a correct DataFrame."""
         import pandas

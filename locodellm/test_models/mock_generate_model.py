@@ -463,7 +463,7 @@ def make_decoder_model():
         [logits_out, *kv_outputs],
         initializers,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model = helper.make_model_gen_version(graph, opset_imports=[helper.make_opsetid("", 17)])
     onnx.checker.check_model(model)
     return model
 
