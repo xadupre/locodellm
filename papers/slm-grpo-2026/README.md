@@ -24,7 +24,7 @@ Download models/datasets beforehand. Execution requires POSIX and explicit
 
 ## Installation
 
-From the repository root, install the optional dependencies in a separate environment:
+Installs the experiment dependencies in a dedicated virtual environment:
 
 ```bash
 python -m venv papers/slm-grpo-2026/.venv
@@ -38,10 +38,11 @@ libraries. For `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`, check that
 
 ## Training
 
-From the repository root, inside the isolated environment described above, run:
+Trains Qwen3-0.6B on MBPP with GRPO and the combined unit-test/Ruff reward,
+using CUDA. Saves the LoRA adapter and training results in
+`runs/qwen-grpo-combined` under this directory:
 
 ```bash
-# Train Qwen3 with GRPO and the combined reward.
 python papers/slm-grpo-2026/run.py train \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
@@ -85,8 +86,10 @@ Only the **LoRA adapter** is saved; the frozen base model is loaded separately.
 
 ## Evaluation
 
+Measures the original Qwen3-0.6B model's MBPP pass@1 **before fine-tuning**.
+Saves baseline results in `runs/qwen-baseline`:
+
 ```bash
-# Evaluate the original model, without training.
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
@@ -94,8 +97,11 @@ python papers/slm-grpo-2026/run.py evaluate \
   --allow-code-execution
 ```
 
+Measures MBPP pass@1 **after fine-tuning**, loading the adapter saved by the
+training command. Saves results separately in `runs/qwen-grpo-combined-test`
+for comparison with the baseline:
+
 ```bash
-# Evaluate the trained adapter with its original base model.
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
@@ -206,12 +212,12 @@ By default there is one optimizer step per group; `--updates-per-group` changes 
 
 ## Tests
 
-From the repository root, with pytest and Ruff available:
+Checks rewards, verification, policy objectives, stdout progress, and adapter-only
+updates, including tiny offline training runs:
 
 ```bash
 python -m pytest -q unittests/papers/test_slm_grpo.py
 ```
 
-Tests cover rewards, verification, objectives, stdout progress, and adapter-only
-updates. Tiny local Qwen3 models exercise both algorithms on CPU/CUDA without
-downloads. Tests requiring optional dependencies or unavailable CUDA skip.
+Tiny local Qwen3 models exercise both algorithms on CPU/CUDA without downloads.
+Tests requiring optional dependencies or unavailable CUDA skip.
