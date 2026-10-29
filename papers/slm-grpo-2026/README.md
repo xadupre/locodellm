@@ -41,20 +41,24 @@ This handles `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` caused by an incorrect
 ## Training command
 
 Trains Qwen3-0.6B on MBPP with GRPO and the combined unit-test/Ruff reward,
-using CUDA. Saves the LoRA adapter and training results in
-`runs/qwen-grpo-combined` under this directory:
+using CUDA, **2 epochs and 4 proposals per problem**. Saves the LoRA adapter and
+training results in `runs/qwen-grpo-combined-2ep-4gen` under this directory:
 
 ```bash
 python papers/slm-grpo-2026/run.py train \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
   --algorithm grpo --reward combined \
-  --output papers/slm-grpo-2026/runs/qwen-grpo-combined \
+  --epochs 2 --group-size 4 \
+  --output papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen \
   --allow-code-execution
 ```
 
 For CPU, replace **`--device cuda` with `--device cpu`** (much slower).
-The defaults follow the paper: 8 completions per prompt, 5 epochs, learning rate
+`--epochs` controls complete passes over the training problems; `--group-size`
+controls the number of proposals generated for each problem on each pass.
+The example overrides these two options for a shorter run. Without overrides,
+the defaults follow the paper: 8 completions per prompt, 5 epochs, learning rate
 `1e-5`, temperature `0.9`, 768 new tokens, seed `42`, LoRA rank `32` and alpha `64`.
 There is one prompt per update and no KL regularization.
 
@@ -64,6 +68,8 @@ There is one prompt per update and no KL regularization.
 | `--device` | CUDA if available, otherwise CPU | `cuda` (evaluation: idle GPUs, parallel above 50 problems), `cuda:N` (explicit GPU), `cpu` |
 | `--algorithm` | `grpo` | `gspo` (paper-specific variant described above) |
 | `--reward` | `combined` | `unit`, `ruff`, `ruff-normalized` |
+| `--epochs` | `5` | `2` for two complete passes over the training problems |
+| `--group-size` | `8` | `4` for four proposals per problem on each pass |
 | `--output` | Required; no implicit directory | Any empty or absent run directory |
 
 For a smoke run, add `--limit 2 --epochs 1 --group-size 2 --max-tokens 64`.
@@ -76,7 +82,7 @@ epoch/task/sample counters, rewards, loss, gradient norm, and timing.
 Loading and save paths are also printed. `--output` contains:
 
 ```text
-papers/slm-grpo-2026/runs/qwen-grpo-combined/
+papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen/
   config.json                # Resolved command-line options and hyperparameters
   train.jsonl                # Completions, rewards and verification diagnostics
   adapter/
@@ -101,15 +107,15 @@ python papers/slm-grpo-2026/run.py evaluate \
 ```
 
 Measures MBPP pass@1 **after fine-tuning**, loading the adapter saved by the
-training command. Saves results separately in `runs/qwen-grpo-combined-test`
+training command. Saves results separately in `runs/qwen-grpo-combined-2ep-4gen-test`
 for comparison with the baseline:
 
 ```bash
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
-  --adapter papers/slm-grpo-2026/runs/qwen-grpo-combined/adapter \
-  --output papers/slm-grpo-2026/runs/qwen-grpo-combined-test \
+  --adapter papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen/adapter \
+  --output papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen-test \
   --allow-code-execution
 ```
 
