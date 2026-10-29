@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import ExitStack, closing
+import csv
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import random
 import sys
+import subprocess
 import time
 
 from .rewards import PENALTIES, build_prompt, extract_code, score
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "gate_proj", "down_proj"]
+EVALUATION_STATE = None
 
 
 def load_tasks(dataset: str, split: str, limit: int | None):
@@ -39,6 +46,8 @@ def load_policy(model_name, adapter, *, train, device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, PeftModel, get_peft_model
 
+    if device.startswith("cuda"):
+        torch.cuda.set_device(torch.device(device).index or 0)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.eos_token_id is None:
         raise ValueError("The tokenizer must define an EOS token.")
@@ -209,55 +218,152 @@ def train(model, tokenizer, tasks, args, output):
     print(f"[train] Complete. Results: {output / 'train.jsonl'}", flush=True)
 
 
-def evaluate(model, tokenizer, tasks, args, output):
-    """Reports single-sample pass@1, exception types, lint severities, and lengths."""
+def evaluate_task(model, tokenizer, task, args):
+    """Generates and verifies one program, returning its serializable diagnostics."""
+    prompt = encode_prompt(tokenizer, task, args.device)
+    _, text, length = sample(
+        model, tokenizer, prompt, temperature=args.temperature, max_tokens=args.max_tokens
+    )
+    reward = score(
+        extract_code(text),
+        task["test_list"] + task.get("challenge_test_list", []),
+        "combined",
+        allow_execution=args.allow_code_execution,
+        timeout=args.timeout,
+        setup=task.get("test_setup_code", ""),
+    )
+    return {
+        "task_id": task.get("task_id"),
+        "device": args.device,
+        "completion": text,
+        "generated_tokens": length,
+        **reward.to_dict(),
+    }
+
+
+def initialize_evaluation_worker(args, device):
+    """Loads one model replica on the GPU assigned to this spawned worker."""
+    import torch
+
+    global EVALUATION_STATE
+    torch.set_num_threads(1)
+    args.device = device
+    model, tokenizer = load_policy(args.model, args.adapter, train=False, device=device)
+    EVALUATION_STATE = (model, tokenizer, args)
+
+
+def evaluate_worker(task_index, task):
+    """Evaluates one task with a seed independent of worker scheduling."""
+    from transformers import set_seed
+
+    if EVALUATION_STATE is None:
+        raise RuntimeError("The evaluation worker was not initialized.")
+    model, tokenizer, args = EVALUATION_STATE
+    set_seed(args.seed + task_index)
+    return evaluate_task(model, tokenizer, task, args)
+
+
+def busy_cuda_uuids():
+    """Queries GPUs used by other compute processes without reserving them."""
+    result = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Unable to query GPU availability: {result.stderr.strip()}")
+    return {
+        uuid.strip()
+        for uuid, pid in csv.reader(result.stdout.splitlines())
+        if int(pid.strip()) != os.getpid()
+    }
+
+
+def evaluation_devices(device, task_count, gpu_uuids, busy_uuids):
+    """Selects idle visible GPUs, parallelizing only above 50 problems."""
+    if device != "cuda":
+        return [device]
+    busy = {uuid.removeprefix("GPU-") for uuid in busy_uuids}
+    idle = [
+        f"cuda:{index}"
+        for index, uuid in enumerate(gpu_uuids)
+        if str(uuid).removeprefix("GPU-") not in busy
+    ]
+    if not idle:
+        raise RuntimeError(
+            "No idle CUDA GPU is available. Use --device cpu or explicitly select "
+            "--device cuda:N to share an occupied GPU."
+        )
+    return idle[:task_count] if task_count > 50 else idle[:1]
+
+
+def evaluation_results(model, tokenizer, tasks, args, devices):
+    """Yields indexed results serially or from one persistent process per GPU."""
+    if len(devices) == 1:
+        for index, task in enumerate(tasks):
+            yield index, evaluate_task(model, tokenizer, task, args)
+        return
+    with ExitStack() as stack:
+        executors = [
+            stack.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=initialize_evaluation_worker,
+                    initargs=(args, device),
+                )
+            )
+            for device in devices
+        ]
+        futures = {
+            executors[index % len(executors)].submit(evaluate_worker, index, task): index
+            for index, task in enumerate(tasks)
+        }
+        try:
+            for future in as_completed(futures):
+                yield futures[future], future.result()
+        finally:
+            for future in futures:
+                future.cancel()
+
+
+def evaluate(model, tokenizer, tasks, args, output, *, devices=None):
+    """Aggregates evaluation results with one progress bar across all devices."""
     from tqdm import tqdm
 
+    devices = devices or [args.device]
     failures = Counter()
     severities = Counter(dict.fromkeys(PENALTIES, 0))
     passed = tokens = lines = ruff_failures = 0
+    pending = {}
+    next_index = 0
     with (
         (output / "evaluate.jsonl").open("w") as stream,
+        closing(evaluation_results(model, tokenizer, tasks, args, devices)) as results,
         tqdm(total=len(tasks), desc="[evaluate]", unit="task", file=sys.stdout) as progress,
     ):
-        for task_index, task in enumerate(tasks, start=1):
-            prompt = encode_prompt(tokenizer, task, args.device)
-            _, text, length = sample(
-                model, tokenizer, prompt, temperature=args.temperature, max_tokens=args.max_tokens
-            )
-            # Evaluation always measures BOTH correctness and static analysis.
-            reward = score(
-                extract_code(text),
-                task["test_list"] + task.get("challenge_test_list", []),
-                "combined",
-                allow_execution=args.allow_code_execution,
-                timeout=args.timeout,
-                setup=task.get("test_setup_code", ""),
-            )
-            passed += reward.execution.outcome == "passed"
-            if reward.execution.outcome != "passed":
-                failures[reward.execution.error_type] += 1
-            severities.update(reward.ruff.counts)
-            ruff_failures += reward.ruff.failed
-            tokens += length
-            lines += reward.lines
-            stream.write(
-                json.dumps(
-                    {
-                        "task_id": task.get("task_id"),
-                        "completion": text,
-                        "generated_tokens": length,
-                        **reward.to_dict(),
-                    }
-                )
-                + "\n"
-            )
+        for completed, (task_index, record) in enumerate(results, start=1):
+            execution = record["execution"]
+            passed += execution["outcome"] == "passed"
+            if execution["outcome"] != "passed":
+                failures[execution["error_type"]] += 1
+            severities.update(record["ruff"]["counts"])
+            ruff_failures += record["ruff"]["failed"]
+            tokens += record["generated_tokens"]
+            lines += record["lines"]
+            pending[task_index] = record
+            while next_index in pending:
+                stream.write(json.dumps(pending.pop(next_index)) + "\n")
+                next_index += 1
             stream.flush()
             progress.set_postfix(
                 {
-                    "tokens": length,
-                    "outcome": reward.execution.outcome,
-                    "pass@1": f"{passed / task_index:.4f}",
+                    "device": record["device"],
+                    "tokens": record["generated_tokens"],
+                    "outcome": execution["outcome"],
+                    "pass@1": f"{passed / completed:.4f}",
                 },
                 refresh=False,
             )
@@ -300,7 +406,10 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
-        "--device", help="cpu, cuda or cuda:N. Defaults to CUDA when available, otherwise CPU."
+        "--device",
+        help="cpu, cuda (idle visible GPUs for evaluation; parallel above 50 tasks), "
+        "or cuda:N (explicitly select one GPU, even if occupied). "
+        "Defaults to CUDA when available, otherwise CPU.",
     )
     parser.add_argument("--timeout", type=float, default=3.0)
     parser.add_argument("--updates-per-group", type=int, default=1)
@@ -347,11 +456,33 @@ def main(argv=None):
     )
     print(f"[{args.command}] Loading dataset={args.dataset} split={args.split}", flush=True)
     tasks = load_tasks(args.dataset, args.split, args.limit)
-    print(f"[{args.command}] Loaded {len(tasks)} tasks. Loading model and tokenizer.", flush=True)
-    model, tokenizer = load_policy(
-        args.model, args.adapter, train=args.command == "train", device=args.device
-    )
-    print(f"[{args.command}] Model ready on {args.device}.", flush=True)
+    devices = [args.device]
+    if args.command == "evaluate":
+        if args.device == "cuda":
+            uuids = [
+                torch.cuda.get_device_properties(index).uuid
+                for index in range(torch.cuda.device_count())
+            ]
+            devices = evaluation_devices(args.device, len(tasks), uuids, busy_cuda_uuids())
+            if len(devices) == 1:
+                args.device = devices[0]
+        args.evaluation_devices = devices
+    if len(devices) > 1:
+        print(
+            f"[evaluate] Loaded {len(tasks)} tasks. Using {len(devices)} GPU workers: "
+            f"{', '.join(devices)}",
+            flush=True,
+        )
+        model = tokenizer = None
+    else:
+        print(
+            f"[{args.command}] Loaded {len(tasks)} tasks. Loading model and tokenizer.",
+            flush=True,
+        )
+        model, tokenizer = load_policy(
+            args.model, args.adapter, train=args.command == "train", device=args.device
+        )
+        print(f"[{args.command}] Model ready on {args.device}.", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
     configuration = {
         key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
@@ -360,4 +491,4 @@ def main(argv=None):
     if args.command == "train":
         train(model, tokenizer, tasks, args, args.output)
     else:
-        evaluate(model, tokenizer, tasks, args, args.output)
+        evaluate(model, tokenizer, tasks, args, args.output, devices=devices)

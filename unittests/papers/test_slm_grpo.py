@@ -1,6 +1,7 @@
 """Checks the standalone RLVR paper implementation without model downloads."""
 
 import importlib
+from collections import Counter
 import json
 import math
 import os
@@ -396,6 +397,7 @@ def test_cuda_cli_repairs_cudnn_loader_path(tmp_path):
         pytest.skip("cuDNN is not installed as an NVIDIA Python package.")
     if importlib.util.find_spec("nvidia.cudnn") is None:
         pytest.skip("cuDNN is not installed as an NVIDIA Python package.")
+    idle_uuids = idle_test_gpu_uuids()
     model_path = tmp_path / "model"
     make_tiny_policy(model_path)
     tasks = tmp_path / "tasks.json"
@@ -406,6 +408,7 @@ def test_cuda_cli_repairs_cudnn_loader_path(tmp_path):
     root = Path(__file__).resolve().parents[2]
     environment = os.environ.copy()
     environment["LD_LIBRARY_PATH"] = str(tmp_path / "missing-cudnn")
+    environment["CUDA_VISIBLE_DEVICES"] = idle_uuids[0]
     result = subprocess.run(
         [
             sys.executable,
@@ -433,3 +436,161 @@ def test_cuda_cli_repairs_cudnn_loader_path(tmp_path):
     assert result.stdout.count("[runtime] Using cuDNN libraries from") == 1
     assert "[evaluate] Complete." in result.stdout
     assert json.loads((output / "metrics.json").read_text())["tasks"] == 1
+
+
+@pytest.mark.parametrize(
+    "device,tasks,uuids,busy,expected",
+    [
+        ("cuda", 50, ["a", "b"], [], ["cuda:0"]),
+        ("cuda", 51, ["a", "b"], [], ["cuda:0", "cuda:1"]),
+        ("cuda", 51, ["a"], [], ["cuda:0"]),
+        ("cuda", 51, ["a", "b", "c"], ["GPU-a"], ["cuda:1", "cuda:2"]),
+        ("cuda", 50, ["a", "b", "c"], ["GPU-a"], ["cuda:1"]),
+        ("cuda", 51, ["c", "a", "b"], ["GPU-a"], ["cuda:0", "cuda:2"]),
+        ("cuda:1", 51, ["a", "b"], ["GPU-b"], ["cuda:1"]),
+        ("cpu", 51, ["a", "b"], [], ["cpu"]),
+    ],
+)
+def test_evaluation_device_selection(device, tasks, uuids, busy, expected):
+    assert experiment.evaluation_devices(device, tasks, uuids, busy) == expected
+
+
+def test_evaluation_rejects_all_gpus_occupied():
+    with pytest.raises(RuntimeError, match="No idle CUDA GPU"):
+        experiment.evaluation_devices("cuda", 51, ["a", "b"], ["GPU-a", "GPU-b"])
+
+
+def idle_test_gpu_uuids():
+    """Finds visible GPUs unused even by this test process for subprocess checks."""
+    torch = pytest.importorskip("torch")
+    uuids = [
+        "GPU-" + str(torch.cuda.get_device_properties(index).uuid).removeprefix("GPU-")
+        for index in range(torch.cuda.device_count())
+    ]
+    result = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    busy = set(result.stdout.splitlines())
+    idle = [uuid for uuid in uuids if uuid not in busy]
+    if not idle:
+        pytest.skip("No idle GPU is available for this subprocess check.")
+    return idle
+
+
+def test_multi_gpu_evaluation_combines_results(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("This check requires at least two GPUs.")
+    idle_uuids = idle_test_gpu_uuids()
+    if len(idle_uuids) < 2:
+        pytest.skip("This check requires at least two idle GPUs.")
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    tasks = tmp_path / "tasks.json"
+    tasks.write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": index,
+                    "text": "Returns one.",
+                    "test_list": ["assert solution() == 1"],
+                }
+                for index in range(51)
+            ]
+        )
+    )
+    output = tmp_path / "evaluate"
+    root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(idle_uuids[:2])
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "papers" / "slm-grpo-2026" / "run.py"),
+            "evaluate",
+            "--model",
+            str(model_path),
+            "--dataset",
+            str(tasks),
+            "--device",
+            "cuda",
+            "--max-tokens",
+            "1",
+            "--output",
+            str(output),
+            "--allow-code-execution",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Using 2 GPU workers: cuda:0, cuda:1" in result.stdout
+    assert "51/51" in result.stdout
+    records = [json.loads(line) for line in (output / "evaluate.jsonl").read_text().splitlines()]
+    assert [record["task_id"] for record in records] == list(range(51))
+    assert [record["device"] for record in records] == [
+        f"cuda:{index % 2}" for index in range(51)
+    ]
+    metrics = json.loads((output / "metrics.json").read_text())
+    assert metrics["tasks"] == 51
+    assert (
+        metrics["pass@1"]
+        == sum(record["execution"]["outcome"] == "passed" for record in records) / 51
+    )
+    assert metrics["error_types"] == dict(
+        Counter(
+            record["execution"]["error_type"]
+            for record in records
+            if record["execution"]["outcome"] != "passed"
+        )
+    )
+    assert (
+        metrics["mean_generated_tokens"]
+        == sum(record["generated_tokens"] for record in records) / 51
+    )
+    for level, mean in metrics["mean_ruff_findings"].items():
+        assert mean == sum(record["ruff"]["counts"][level] for record in records) / 51
+    assert json.loads((output / "config.json").read_text())["evaluation_devices"] == [
+        "cuda:0",
+        "cuda:1",
+    ]
+
+
+def test_parallel_worker_errors_do_not_write_success_metrics(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from argparse import Namespace
+
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    output = tmp_path / "evaluate"
+    output.mkdir()
+    tasks = [
+        {
+            "text": "Returns one.",
+            "test_list": ["assert solution() == 1"],
+            "challenge_test_list": None,
+        },
+        {"text": "Returns one.", "test_list": ["assert solution() == 1"]},
+    ]
+    args = Namespace(
+        model=str(model_path),
+        adapter=None,
+        device="cpu",
+        seed=42,
+        temperature=0.6,
+        max_tokens=1,
+        allow_code_execution=True,
+        timeout=3.0,
+    )
+    with pytest.raises(TypeError, match="NoneType"):
+        experiment.evaluate(None, None, tasks, args, output, devices=["cpu", "cpu"])
+    assert not (output / "metrics.json").exists()

@@ -61,7 +61,7 @@ There is one prompt per update and no KL regularization.
 | Option | Default | Other choices |
 |---|---|---|
 | `--model` | `Qwen/Qwen3-0.6B` | `meta-llama/Llama-3.2-1B-Instruct` (gated), or a compatible local Transformers checkpoint |
-| `--device` | CUDA if available, otherwise CPU | `cuda`, `cuda:N`, `cpu` |
+| `--device` | CUDA if available, otherwise CPU | `cuda` (evaluation: idle GPUs, parallel above 50 problems), `cuda:N` (explicit GPU), `cpu` |
 | `--algorithm` | `grpo` | `gspo` (paper-specific variant described above) |
 | `--reward` | `combined` | `unit`, `ruff`, `ruff-normalized` |
 | `--output` | Required; no implicit directory | Any empty or absent run directory |
@@ -117,6 +117,24 @@ Each output directory receives `config.json`, `evaluate.jsonl` (completions and
 diagnostics), and `metrics.json` (pass@1, error types, lengths, Ruff severities).
 A tqdm progress bar on stdout shows completed tasks, timing, the latest token
 count/outcome, and running pass@1. Use `--device cpu` if needed.
+
+With **more than 50 problems**, `--device cuda` evaluates in parallel on the
+**idle GPUs** visible to PyTorch (`CUDA_VISIBLE_DEVICES` is respected).
+`nvidia-smi` identifies GPUs with other compute processes: those are excluded,
+even if they still have free memory. Each selected GPU loads one model/adapter
+replica and receives a share of the tasks. With 50 problems or fewer, evaluation
+uses just the first idle GPU. If none are idle, it fails explicitly.
+
+`--device cuda:N` explicitly selects one GPU, allowing intentional sharing.
+Training is unchanged. Availability is checked at startup, not reserved: another
+process can still start using a selected GPU afterwards.
+
+One global tqdm bar tracks all workers. Results and metrics are combined in the
+same output directory; `evaluate.jsonl` preserves dataset order and records each
+task's device. `config.json` records `evaluation_devices`. Parallel sampling uses
+`seed + task_index`, independent of worker scheduling; samples may differ from
+single-GPU evaluation, which retains its original random-number sequence.
+Worker errors propagate instead of producing successful-looking partial metrics.
 
 ## Learning algorithm
 
@@ -269,4 +287,6 @@ python -m pytest -q unittests/papers/test_slm_grpo.py
 ```
 
 Tiny local Qwen3 models exercise both algorithms on CPU/CUDA without downloads.
-Tests requiring optional dependencies or unavailable CUDA skip.
+Tests also check the 50/51-problem boundary, occupied-GPU filtering, aggregation
+across two idle GPUs, and worker failures. Checks requiring optional dependencies
+or unavailable/occupied GPUs skip.
