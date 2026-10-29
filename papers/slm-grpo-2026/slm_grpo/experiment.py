@@ -14,7 +14,6 @@ from pathlib import Path
 import random
 import sys
 import subprocess
-import time
 
 from .rewards import PENALTIES, build_prompt, extract_code, score
 
@@ -122,6 +121,7 @@ def verify(task, text, args):
 def train(model, tokenizer, tasks, args, output):
     """Optimizes one group per update, saving adapters and per-completion diagnostics."""
     import torch
+    from tqdm import tqdm
 
     from .optimization import completion_log_probs, group_advantages, policy_loss
 
@@ -131,15 +131,25 @@ def train(model, tokenizer, tasks, args, output):
         weight_decay=0.0,
     )
     step = 0
-    started = time.perf_counter()
-    with (output / "train.jsonl").open("w") as stream:
+    with (
+        (output / "train.jsonl").open("w") as stream,
+        tqdm(
+            total=args.epochs * len(tasks) * args.updates_per_group,
+            desc="[train]",
+            unit="update",
+            file=sys.stdout,
+        ) as progress,
+    ):
         for epoch in range(args.epochs):
             random.shuffle(tasks)
             for task_index, task in enumerate(tasks, start=1):
-                progress = (
-                    f"[train] epoch={epoch + 1}/{args.epochs} task={task_index}/{len(tasks)}"
+                counters = {
+                    "epoch": f"{epoch + 1}/{args.epochs}",
+                    "task": f"{task_index}/{len(tasks)}",
+                }
+                progress.set_postfix(
+                    {**counters, "stage": "sampling", "sample": f"0/{args.group_size}"}
                 )
-                print(f"{progress} sampling {args.group_size} completions", flush=True)
                 prompt = encode_prompt(tokenizer, task, args.device)
                 prompt_length = prompt["input_ids"].shape[1]
                 group = []
@@ -154,10 +164,14 @@ def train(model, tokenizer, tasks, args, output):
                     )
                     reward = verify(task, text, args)
                     outcome = reward.execution.outcome if reward.execution else "ruff-only"
-                    print(
-                        f"{progress} sample={member + 1}/{args.group_size} "
-                        f"tokens={length} reward={reward.total:.4f} outcome={outcome}",
-                        flush=True,
+                    progress.set_postfix(
+                        {
+                            **counters,
+                            "sample": f"{member + 1}/{args.group_size}",
+                            "tokens": length,
+                            "reward": f"{reward.total:.4f}",
+                            "outcome": outcome,
+                        }
                     )
                     with torch.no_grad():
                         old = completion_log_probs(
@@ -183,6 +197,13 @@ def train(model, tokenizer, tasks, args, output):
                     torch.tensor(rewards, device=args.device), normalize=args.normalize_advantages
                 )
                 for update in range(args.updates_per_group):
+                    progress.set_postfix(
+                        {
+                            **counters,
+                            "stage": "optimizing",
+                            "update": f"{update + 1}/{args.updates_per_group}",
+                        }
+                    )
                     optimizer.zero_grad()
                     update_loss = 0.0
                     for index, (tokens, old) in enumerate(group):
@@ -202,14 +223,17 @@ def train(model, tokenizer, tasks, args, output):
                         model.parameters(), 1.0, error_if_nonfinite=True
                     )
                     optimizer.step()
-                    print(
-                        f"{progress} step={step + 1}/{args.epochs * len(tasks)} "
-                        f"update={update + 1}/{args.updates_per_group} "
-                        f"loss={update_loss:.6f} grad_norm={grad_norm.item():.4f} "
-                        f"mean_reward={sum(rewards) / len(rewards):.4f} "
-                        f"elapsed={time.perf_counter() - started:.1f}s",
-                        flush=True,
+                    progress.set_postfix(
+                        {
+                            **counters,
+                            "update": f"{update + 1}/{args.updates_per_group}",
+                            "loss": f"{update_loss:.6f}",
+                            "grad_norm": f"{grad_norm.item():.4f}",
+                            "mean_reward": f"{sum(rewards) / len(rewards):.4f}",
+                        },
+                        refresh=False,
                     )
+                    progress.update(1)
                 step += 1
                 stream.flush()
     print(f"[train] Saving LoRA adapter and tokenizer to {output / 'adapter'}", flush=True)

@@ -275,16 +275,25 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsy
             "1",
             "--group-size",
             "2",
+            "--updates-per-group",
+            "2",
         ]
     )
     stdout = capsys.readouterr().out
     assert f"device={device} algorithm={algorithm} reward=ruff" in stdout
     assert "[train] Loaded 1 tasks." in stdout
-    assert "[train] epoch=1/1 task=1/1 sample=1/2" in stdout
+    assert "[train]:" in stdout
+    assert "100%" in stdout
+    assert "epoch=1/1" in stdout
+    assert "task=1/1" in stdout
+    assert "sample=1/2" in stdout
     assert "sample=2/2" in stdout
-    assert "step=1/1 update=1/1 loss=" in stdout
+    assert "2/2" in stdout
+    assert "update=2/2" in stdout
+    assert "loss=" in stdout
     assert "grad_norm=" in stdout
     assert "mean_reward=" in stdout
+    assert "[train] epoch=" not in stdout
     assert f"Results: {train_path / 'train.jsonl'}" in stdout
     assert (train_path / "adapter" / "adapter_config.json").exists()
     records = [json.loads(line) for line in (train_path / "train.jsonl").read_text().splitlines()]

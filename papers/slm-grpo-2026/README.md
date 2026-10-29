@@ -71,8 +71,9 @@ Existing nonempty output directories are never overwritten.
 
 ### Progress and saved model
 
-Progress appears immediately on **stdout**: loading, epoch/task/sample counters,
-rewards, loss, gradient norm, elapsed time, and save paths. `--output` contains:
+A tqdm bar on **stdout** counts completed optimizer updates, with live
+epoch/task/sample counters, rewards, loss, gradient norm, and timing.
+Loading and save paths are also printed. `--output` contains:
 
 ```text
 papers/slm-grpo-2026/runs/qwen-grpo-combined/
