@@ -1,0 +1,6 @@
+# Optional experiment dependencies; the locodellm runtime does not need these.
+torch>=2.6
+transformers>=4.57,<6
+peft>=0.18,<1
+datasets>=4,<6
+ruff==0.14.11

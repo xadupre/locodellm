@@ -1,0 +1,340 @@
+"""Checks the standalone RLVR paper implementation without model downloads."""
+
+import importlib
+import json
+import math
+from pathlib import Path
+
+import pytest
+
+PACKAGE = "papers.slm-grpo-2026.slm_grpo"
+rewards = importlib.import_module(f"{PACKAGE}.rewards")
+experiment = importlib.import_module(f"{PACKAGE}.experiment")
+
+
+def test_prompt_and_extraction():
+    task = {
+        "text": "Returns the square.",
+        "test_list": ["assert square(2) == 4", "assert square(3) == 9"],
+        "challenge_test_list": ["assert square(-4) == 16"],
+        "code": "REFERENCE MUST NOT LEAK",
+    }
+    prompt = rewards.build_prompt(task)
+    assert task["test_list"][0] in prompt
+    assert task["test_list"][1] not in prompt
+    assert task["challenge_test_list"][0] not in prompt
+    assert task["code"] not in prompt
+    assert (
+        rewards.extract_code(
+            "<think>```python\nwrong\n```</think>\n```python\ndef square(x):\n    return x*x\n```"
+        )
+        == "def square(x):\n    return x*x"
+    )
+    assert rewards.extract_code("```python\nimport math\n```\n```py\nx = math.pi\n```") == (
+        "import math\n\nx = math.pi"
+    )
+    assert rewards.extract_code("  def f():\n    pass\n") == "def f():\n    pass"
+
+
+@pytest.mark.parametrize(
+    "source,tests,outcome,error_type",
+    [
+        ("def f(x):\n    return x + 1", ["assert f(1) == 2"], "passed", None),
+        ("def f(x):\n    return x", ["assert f(1) == 2"], "assertion", "AssertionError"),
+        ("def f(:", ["assert f(1) == 2"], "interpreter", "SyntaxError"),
+        ("def f(x):\n    return missing", ["assert f(1) == 2"], "interpreter", "NameError"),
+        ("def f(x):\n    return 1 / 0", ["f(1)"], "runtime", "ZeroDivisionError"),
+        ("raise ValueError('bad')", ["assert True"], "runtime", "ValueError"),
+        ("import sys\nsys.exit(0)", ["assert False"], "other", "ProcessExit(0)"),
+    ],
+)
+def test_execution_categories(source, tests, outcome, error_type):
+    result = rewards.execute_tests(source, tests, allow_execution=True)
+    assert (result.outcome, result.error_type) == (outcome, error_type)
+    assert (
+        rewards.UNIT_REWARDS[outcome]
+        == {"passed": 1, "assertion": -0.3, "interpreter": -1, "runtime": -0.6, "other": -1}[
+            outcome
+        ]
+    )
+
+
+def test_execution_opt_in_timeout_and_setup():
+    with pytest.raises(PermissionError):
+        rewards.execute_tests("pass", ["assert True"], allow_execution=False)
+    with pytest.raises(ValueError, match="at least one test"):
+        rewards.execute_tests("pass", [], allow_execution=True)
+    with pytest.raises(ValueError, match="finite and positive"):
+        rewards.execute_tests("pass", ["assert True"], allow_execution=True, timeout=-1)
+    result = rewards.execute_tests(
+        "def f():\n    return math.sqrt(4)",
+        ["assert f() == 2"],
+        setup="import math",
+        allow_execution=True,
+    )
+    assert result.outcome == "passed"
+    result = rewards.execute_tests(
+        "while True:\n    pass", ["assert True"], allow_execution=True, timeout=0.2
+    )
+    assert result.outcome == "timeout"
+    assert rewards.UNIT_REWARDS[result.outcome] == -0.3
+
+
+def test_ruff_rewards_are_isolated_from_repository_config():
+    source = "import os\n\n\ndef solution(value):\n    return value + 1\n"
+    result = rewards.ruff_reward(source)
+    assert result.counts == {"error": 0, "high": 0, "normal": 0, "low": 1}
+    assert result.raw == -0.2
+    assert result.normalized == pytest.approx(-0.2 / 5)
+    assert not result.failed
+    assert rewards.ruff_reward("result = missing\n").normalized == -1
+    assert rewards.ruff_reward("def broken(:").counts["error"] > 0
+    assert rewards.ruff_reward("").normalized == 0
+    # E501 is enabled by this repository, but not by Ruff's paper/default ruleset.
+    assert rewards.ruff_reward('text = "' + "x" * 150 + '"\n').raw == 0
+    assert rewards.severity({"code": "NEW", "message": "unmapped diagnostic"}) == "normal"
+    assert rewards.severity({"code": None, "message": "diagnostic F821"}) == "error"
+
+
+def test_reward_modes_and_combined_gate():
+    source = "import os\n\n\ndef solution(value):\n    return value + 1\n"
+    tests = ["assert solution(1) == 2"]
+    unit = rewards.score(source, tests, "unit", allow_execution=True)
+    assert unit.total == 1
+    assert unit.ruff is None
+    raw = rewards.score(source, tests, "ruff")
+    assert raw.execution is None
+    assert raw.total == -0.2
+    assert rewards.score(source, tests, "ruff-normalized").total == pytest.approx(-0.04)
+    passed = rewards.score(source, tests, "combined", allow_execution=True)
+    assert passed.total == pytest.approx(1 - 0.3 * 0.04)
+    assert passed.short == 0
+    failed = rewards.score(source, ["assert solution(1) == 7"], "combined", allow_execution=True)
+    assert failed.total == pytest.approx(-0.3 - 0.1 * 0.04)
+    short = rewards.score("pass", ["assert True"], "combined", allow_execution=True)
+    assert short.short == -0.5
+    assert short.total == 0.5
+    assert short.to_dict()["execution"]["outcome"] == "passed"
+    with pytest.raises(ValueError, match="Unknown reward"):
+        rewards.score(source, tests, "unknown")
+
+
+def test_challenge_tests_and_local_dataset(tmp_path):
+    task = {
+        "text": "Adds one.",
+        "test_list": ["assert solution(1) == 2"],
+        "challenge_test_list": ["assert solution(2) == 3"],
+    }
+    dataset = tmp_path / "tasks.json"
+    dataset.write_text(json.dumps([task]))
+    tasks = experiment.load_tasks(str(dataset), "train", None)
+    assert tasks == [task]
+    from argparse import Namespace
+
+    result = experiment.verify(
+        task,
+        "def solution(x):\n    return 2",
+        Namespace(reward="unit", allow_code_execution=True, timeout=3.0),
+    )
+    assert result.execution.outcome == "assertion"
+
+
+def test_group_advantages_and_clipped_objectives():
+    torch = pytest.importorskip("torch")
+    optimization = importlib.import_module(f"{PACKAGE}.optimization")
+    advantages = optimization.group_advantages(torch.tensor([1.0, -0.3, -0.6, -1.0]))
+    assert advantages.mean().item() == pytest.approx(0, abs=1e-7)
+    assert torch.equal(
+        optimization.group_advantages(torch.ones(8), normalize=True), torch.zeros(8)
+    )
+    normalized = optimization.group_advantages(torch.tensor([0.0, 2.0]), normalize=True)
+    assert normalized.tolist() == pytest.approx([-1 / 1.0001, 1 / 1.0001])
+    mask = torch.tensor([[True, True, False]])
+    current = torch.tensor([[math.log(1.05), math.log(1.05), 100.0]], requires_grad=True)
+    old = torch.zeros_like(current, requires_grad=True)
+    advantage = torch.ones(1, requires_grad=True)
+    for algorithm, expected in [("grpo", -1.05), ("gspo", -(1.05**2))]:
+        loss = optimization.policy_loss(current, old, mask, advantage, algorithm=algorithm)
+        assert loss.item() == pytest.approx(expected)
+        loss.backward()
+        assert current.grad[0, 2] == 0
+        assert old.grad is None
+        assert advantage.grad is None
+        current.grad.zero_()
+    for value, adv, expected in [(1.5, 1.0, -1.2), (0.5, -1.0, 0.8)]:
+        loss = optimization.policy_loss(
+            torch.tensor([[math.log(value)]]),
+            torch.zeros(1, 1),
+            torch.ones(1, 1, dtype=torch.bool),
+            torch.tensor([adv]),
+        )
+        assert loss.item() == pytest.approx(expected)
+    with pytest.raises(ValueError, match="at least two"):
+        optimization.group_advantages(torch.ones(1))
+    with pytest.raises(ValueError, match="unmasked"):
+        optimization.policy_loss(
+            torch.zeros(1, 1),
+            torch.zeros(1, 1),
+            torch.zeros(1, 1, dtype=torch.bool),
+            torch.ones(1),
+        )
+
+
+def make_tiny_policy(path):
+    """Creates a genuine tiny Qwen3 checkpoint and local tokenizer for offline tests."""
+    pytest.importorskip("peft")
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+
+    vocabulary = {
+        "[UNK]": 0,
+        "[EOS]": 1,
+        "[PAD]": 2,
+        "pass": 3,
+        "def": 4,
+        "return": 5,
+        "value": 6,
+        "1": 7,
+    }
+    backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", eos_token="[EOS]", pad_token="[PAD]"
+    )
+    tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    tokenizer.save_pretrained(path)
+    model = Qwen3ForCausalLM(
+        Qwen3Config(
+            vocab_size=len(vocabulary),
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=256,
+            eos_token_id=1,
+            pad_token_id=2,
+        )
+    )
+    model.save_pretrained(path)
+    return model, tokenizer
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "gspo"])
+def test_offline_lora_training_and_evaluation(tmp_path, algorithm):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    torch.set_num_threads(1)
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    task_path = tmp_path / "tasks.json"
+    task_path.write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": 1,
+                    "text": "Returns one.",
+                    "test_list": ["assert solution() == 1"],
+                    "challenge_test_list": ["assert solution() != 0"],
+                }
+            ]
+        )
+    )
+    common = [
+        "--model",
+        str(model_path),
+        "--dataset",
+        str(task_path),
+        "--device",
+        "cpu",
+        "--max-tokens",
+        "4",
+    ]
+    train_path = tmp_path / "train"
+    experiment.main(
+        [
+            "train",
+            *common,
+            "--output",
+            str(train_path),
+            "--algorithm",
+            algorithm,
+            "--reward",
+            "ruff",
+            "--epochs",
+            "1",
+            "--group-size",
+            "2",
+        ]
+    )
+    assert (train_path / "adapter" / "adapter_config.json").exists()
+    records = [json.loads(line) for line in (train_path / "train.jsonl").read_text().splitlines()]
+    assert len(records) == 2
+    assert all(record["execution"] is None for record in records)
+    eval_path = tmp_path / "evaluate"
+    experiment.main(
+        [
+            "evaluate",
+            *common,
+            "--adapter",
+            str(train_path / "adapter"),
+            "--output",
+            str(eval_path),
+            "--allow-code-execution",
+        ]
+    )
+    metrics = json.loads((eval_path / "metrics.json").read_text())
+    assert metrics["tasks"] == 1
+    assert metrics["pass@1"] in (0.0, 1.0)
+    assert metrics["mean_generated_tokens"] <= 4
+    assert metrics["ruff_failures"] == 0
+    assert json.loads((eval_path / "config.json").read_text())["split"] == "test"
+
+
+def test_optimizer_updates_only_adapter_parameters(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    optimization = importlib.import_module(f"{PACKAGE}.optimization")
+    torch.set_num_threads(1)
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    model, _ = experiment.load_policy(str(model_path), None, train=True, device="cpu")
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
+    )
+    tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]])
+    log_probs = optimization.completion_log_probs(model, tokens, 2)
+    loss = optimization.policy_loss(
+        log_probs,
+        log_probs.detach(),
+        torch.ones_like(log_probs, dtype=torch.bool),
+        torch.tensor([1.0, -1.0]),
+    )
+    loss.backward()
+    optimizer.step()
+    changed = [
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(before[name], parameter)
+    ]
+    assert changed
+    assert all("lora_" in name for name in changed)
+    assert all(
+        "lora_" in name for name, parameter in model.named_parameters() if parameter.requires_grad
+    )
+
+
+def test_cli_rejects_unsafe_or_invalid_runs(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        experiment.main(["evaluate", "--output", str(tmp_path / "run")])
+    assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc:
+        experiment.main(
+            ["train", "--reward", "ruff", "--group-size", "1", "--output", str(tmp_path / "run")]
+        )
+    assert exc.value.code == 2
+    assert not Path(tmp_path / "run").exists()
