@@ -3,7 +3,10 @@
 import importlib
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -378,3 +381,51 @@ def test_cli_rejects_unavailable_cuda_before_loading(tmp_path, capsys):
     assert exc.value.code == 2
     assert "CUDA was requested but is unavailable; use --device cpu." in capsys.readouterr().err
     assert not (tmp_path / "run").exists()
+
+
+def test_cuda_cli_repairs_cudnn_loader_path(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable.")
+    if importlib.util.find_spec("nvidia") is None:
+        pytest.skip("cuDNN is not installed as an NVIDIA Python package.")
+    if importlib.util.find_spec("nvidia.cudnn") is None:
+        pytest.skip("cuDNN is not installed as an NVIDIA Python package.")
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    tasks = tmp_path / "tasks.json"
+    tasks.write_text(
+        json.dumps([{"text": "Returns one.", "test_list": ["assert solution() == 1"]}])
+    )
+    output = tmp_path / "evaluate"
+    root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    environment["LD_LIBRARY_PATH"] = str(tmp_path / "missing-cudnn")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "papers" / "slm-grpo-2026" / "run.py"),
+            "evaluate",
+            "--model",
+            str(model_path),
+            "--dataset",
+            str(tasks),
+            "--device",
+            "cuda",
+            "--max-tokens",
+            "4",
+            "--output",
+            str(output),
+            "--allow-code-execution",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("[runtime] Using cuDNN libraries from") == 1
+    assert "[evaluate] Complete." in result.stdout
+    assert json.loads((output / "metrics.json").read_text())["tasks"] == 1

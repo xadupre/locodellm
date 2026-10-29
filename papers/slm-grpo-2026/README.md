@@ -33,8 +33,10 @@ python -m pip install -r papers/slm-grpo-2026/requirements.txt
 ```
 
 No project installation is needed. CUDA requires matching PyTorch/CUDA/cuDNN
-libraries. For `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`, check that
-`LD_LIBRARY_PATH` points to the active environment's `nvidia/cudnn/lib`.
+libraries. On Linux, the launcher automatically adds the active environment's
+`nvidia/cudnn/lib` to the loader path and restarts before importing PyTorch.
+This handles `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` caused by an incorrect
+`LD_LIBRARY_PATH`, without requiring an export or changing your shell environment.
 
 ## Training
 
