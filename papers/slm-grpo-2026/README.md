@@ -102,17 +102,39 @@ No editable project installation is needed. A CUDA GPU is recommended for the re
 models; CPU is useful for tiny offline tests. Llama requires access to the gated
 `meta-llama/Llama-3.2-1B-Instruct` checkpoint.
 
+CUDA requires a working PyTorch/CUDA/cuDNN installation. If it reports
+`CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`, check that `LD_LIBRARY_PATH` includes
+`nvidia/cudnn/lib` from the **active Python environment**, not another installation.
+
 ## Training
 
-Inside the isolated environment described above:
+From the repository root, inside the isolated environment described above, run:
 
 ```bash
 python papers/slm-grpo-2026/run.py train \
   --model Qwen/Qwen3-0.6B \
+  --device cuda \
   --algorithm grpo --reward combined \
+  --group-size 8 --epochs 5 --learning-rate 1e-5 \
+  --temperature 0.9 --max-tokens 768 --seed 42 \
   --output papers/slm-grpo-2026/runs/qwen-grpo-combined \
   --allow-code-execution
 ```
+
+This command explicitly selects the paper's training hyperparameters. For CPU
+execution, replace **`--device cuda` with `--device cpu`**; the same training code
+and output layout apply, but full training is much slower. `--device cuda:1`
+selects another GPU. If omitted, the device defaults to CUDA when available,
+otherwise CPU. Explicitly requesting unavailable CUDA fails rather than silently
+switching to CPU.
+
+| Option | Default | Other choices |
+|---|---|---|
+| `--model` | `Qwen/Qwen3-0.6B` | `meta-llama/Llama-3.2-1B-Instruct` (gated), or a compatible local Transformers checkpoint |
+| `--device` | CUDA if available, otherwise CPU | `cuda`, `cuda:N`, `cpu` |
+| `--algorithm` | `grpo` | `gspo` (paper-specific variant described above) |
+| `--reward` | `combined` | `unit`, `ruff`, `ruff-normalized` |
+| `--output` | Required; no implicit directory | Any empty or absent run directory |
 
 Use `--algorithm gspo` for the paper's sequence objective. Use `--reward unit`,
 `--reward ruff`, or `--reward ruff-normalized` for the ablations. To test the other
@@ -126,18 +148,51 @@ step, reducing activation memory. `--updates-per-group` optionally reuses the sa
 group, with its original likelihoods fixed. Existing nonempty output directories
 are rejected rather than overwritten.
 
+### Progress and saved model
+
+Progress is printed to **standard output**, flushed immediately: dataset/model
+loading, each sampled completion, each optimizer update, and final save paths.
+Training logs include epoch/task/sample counters, token count, reward, execution
+outcome, loss, gradient norm before clipping, mean group reward, and elapsed
+seconds. For example (illustrative):
+
+```text
+[train] epoch=1/5 task=1/374 sampling 8 completions
+[train] epoch=1/5 task=1/374 sample=1/8 tokens=120 reward=1.0000 outcome=passed
+[train] epoch=1/5 task=1/374 step=1/1870 update=1/1 loss=0.000000 grad_norm=0.1200 mean_reward=0.2500 elapsed=12.3s
+```
+
+The directory passed to `--output` contains both the trained model adaptation and
+the results:
+
+```text
+papers/slm-grpo-2026/runs/qwen-grpo-combined/
+  config.json                # Resolved command-line options and hyperparameters
+  train.jsonl                # Completions, rewards and verification diagnostics
+  adapter/
+    adapter_config.json      # LoRA configuration and base-model reference
+    adapter_model.safetensors
+    ...                      # Saved tokenizer files
+```
+
+The base model is frozen, so only its **LoRA adapter**, not a second full copy of
+the base weights, is saved. Reload it using `--model` and `--adapter` together,
+as in the evaluation command below.
+
 ## Evaluation
 
 ```bash
 # Untuned baseline: omit --adapter.
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
+  --device cuda \
   --output papers/slm-grpo-2026/runs/qwen-baseline \
   --allow-code-execution
 
 # Trained policy: use the same base checkpoint as training.
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
+  --device cuda \
   --adapter papers/slm-grpo-2026/runs/qwen-grpo-combined/adapter \
   --output papers/slm-grpo-2026/runs/qwen-grpo-combined-test \
   --allow-code-execution
@@ -149,7 +204,10 @@ For repeated evaluation, use separate output directories and `--seed` values.
 Compare baseline and adapters with identical decoding settings and task subsets.
 `metrics.json` contains pass@1 and diagnostics; `evaluate.jsonl` retains every
 completion and its verification results. Evaluation always computes both unit-test
-and Ruff diagnostics, regardless of the training reward.
+and Ruff diagnostics, regardless of the training reward. Both files and the
+evaluation `config.json` are stored in its `--output` directory. Evaluation also
+prints per-task progress and the running pass@1 to standard output. Use
+`--device cpu` here too if CUDA is unavailable.
 
 For offline/custom experiments, `--dataset /path/to/tasks.json` accepts a JSON list
 of MBPP-shaped records: `text`, `test_list`, optional `task_id`,
@@ -170,6 +228,8 @@ tests, prompt leakage, Ruff isolation, reward formulas, clipping and masking,
 gradient behavior, and adapter-only updates. With the optional training dependencies,
 they also train and reload both algorithms using a tiny, randomly initialized
 Qwen3 checkpoint and a tokenizer created locally: **no model or dataset downloads**.
+These integration tests run on CPU and also on CUDA when available, and check
+the progress messages written to standard output.
 PyTorch/PEFT-dependent tests skip when those optional dependencies are absent.
 These checks do not establish the paper's reported benchmark gains; reproducing
 those requires full GPU training and held-out evaluation.

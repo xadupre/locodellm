@@ -7,6 +7,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import random
+import time
 
 from .rewards import PENALTIES, build_prompt, extract_code, score
 
@@ -120,10 +121,15 @@ def train(model, tokenizer, tasks, args, output):
         weight_decay=0.0,
     )
     step = 0
+    started = time.perf_counter()
     with (output / "train.jsonl").open("w") as stream:
         for epoch in range(args.epochs):
             random.shuffle(tasks)
-            for task in tasks:
+            for task_index, task in enumerate(tasks, start=1):
+                progress = (
+                    f"[train] epoch={epoch + 1}/{args.epochs} task={task_index}/{len(tasks)}"
+                )
+                print(f"{progress} sampling {args.group_size} completions", flush=True)
                 prompt = encode_prompt(tokenizer, task, args.device)
                 prompt_length = prompt["input_ids"].shape[1]
                 group = []
@@ -137,6 +143,12 @@ def train(model, tokenizer, tasks, args, output):
                         max_tokens=args.max_tokens,
                     )
                     reward = verify(task, text, args)
+                    outcome = reward.execution.outcome if reward.execution else "ruff-only"
+                    print(
+                        f"{progress} sample={member + 1}/{args.group_size} "
+                        f"tokens={length} reward={reward.total:.4f} outcome={outcome}",
+                        flush=True,
+                    )
                     with torch.no_grad():
                         old = completion_log_probs(
                             model, tokens, prompt_length, temperature=args.temperature
@@ -160,8 +172,9 @@ def train(model, tokenizer, tasks, args, output):
                 advantages = group_advantages(
                     torch.tensor(rewards, device=args.device), normalize=args.normalize_advantages
                 )
-                for _ in range(args.updates_per_group):
+                for update in range(args.updates_per_group):
                     optimizer.zero_grad()
+                    update_loss = 0.0
                     for index, (tokens, old) in enumerate(group):
                         current = completion_log_probs(
                             model, tokens, prompt_length, temperature=args.temperature
@@ -174,14 +187,25 @@ def train(model, tokenizer, tasks, args, output):
                             algorithm=args.algorithm,
                         )
                         (loss / args.group_size).backward()
-                    torch.nn.utils.clip_grad_norm_(
+                        update_loss += loss.detach().item() / args.group_size
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), 1.0, error_if_nonfinite=True
                     )
                     optimizer.step()
+                    print(
+                        f"{progress} step={step + 1}/{args.epochs * len(tasks)} "
+                        f"update={update + 1}/{args.updates_per_group} "
+                        f"loss={update_loss:.6f} grad_norm={grad_norm.item():.4f} "
+                        f"mean_reward={sum(rewards) / len(rewards):.4f} "
+                        f"elapsed={time.perf_counter() - started:.1f}s",
+                        flush=True,
+                    )
                 step += 1
                 stream.flush()
+    print(f"[train] Saving LoRA adapter and tokenizer to {output / 'adapter'}", flush=True)
     model.save_pretrained(output / "adapter")
     tokenizer.save_pretrained(output / "adapter")
+    print(f"[train] Complete. Results: {output / 'train.jsonl'}", flush=True)
 
 
 def evaluate(model, tokenizer, tasks, args, output):
@@ -189,8 +213,10 @@ def evaluate(model, tokenizer, tasks, args, output):
     failures = Counter()
     severities = Counter(dict.fromkeys(PENALTIES, 0))
     passed = tokens = lines = ruff_failures = 0
+    started = time.perf_counter()
     with (output / "evaluate.jsonl").open("w") as stream:
-        for task in tasks:
+        for task_index, task in enumerate(tasks, start=1):
+            print(f"[evaluate] task={task_index}/{len(tasks)} generating completion", flush=True)
             prompt = encode_prompt(tokenizer, task, args.device)
             _, text, length = sample(
                 model, tokenizer, prompt, temperature=args.temperature, max_tokens=args.max_tokens
@@ -222,6 +248,13 @@ def evaluate(model, tokenizer, tasks, args, output):
                 )
                 + "\n"
             )
+            stream.flush()
+            print(
+                f"[evaluate] task={task_index}/{len(tasks)} tokens={length} "
+                f"outcome={reward.execution.outcome} pass@1={passed / task_index:.4f} "
+                f"elapsed={time.perf_counter() - started:.1f}s",
+                flush=True,
+            )
     count = len(tasks)
     summary = {
         "tasks": count,
@@ -233,7 +266,8 @@ def evaluate(model, tokenizer, tasks, args, output):
         "ruff_failures": ruff_failures,
     }
     (output / "metrics.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2), flush=True)
+    print(f"[evaluate] Complete. Results: {output}", flush=True)
 
 
 def main(argv=None):
@@ -258,7 +292,9 @@ def main(argv=None):
     parser.add_argument("--max-tokens", type=int, default=768)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--device", help="Defaults to CUDA when available, otherwise CPU.")
+    parser.add_argument(
+        "--device", help="cpu, cuda or cuda:N. Defaults to CUDA when available, otherwise CPU."
+    )
     parser.add_argument("--timeout", type=float, default=3.0)
     parser.add_argument("--updates-per-group", type=int, default=1)
     parser.add_argument("--normalize-advantages", action="store_true")
@@ -295,10 +331,20 @@ def main(argv=None):
     args.split = args.split or ("train" if args.command == "train" else "test")
     args.temperature = args.temperature or (0.9 if args.command == "train" else 0.6)
     args.device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        parser.error("CUDA was requested but is unavailable; use --device cpu.")
+    print(
+        f"[{args.command}] model={args.model} device={args.device} "
+        f"algorithm={args.algorithm} reward={args.reward} seed={args.seed} output={args.output}",
+        flush=True,
+    )
+    print(f"[{args.command}] Loading dataset={args.dataset} split={args.split}", flush=True)
     tasks = load_tasks(args.dataset, args.split, args.limit)
+    print(f"[{args.command}] Loaded {len(tasks)} tasks. Loading model and tokenizer.", flush=True)
     model, tokenizer = load_policy(
         args.model, args.adapter, train=args.command == "train", device=args.device
     )
+    print(f"[{args.command}] Model ready on {args.device}.", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
     configuration = {
         key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()

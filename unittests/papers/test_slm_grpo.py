@@ -224,9 +224,12 @@ def make_tiny_policy(path):
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "gspo"])
-def test_offline_lora_training_and_evaluation(tmp_path, algorithm):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsys):
     torch = pytest.importorskip("torch")
     pytest.importorskip("peft")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable.")
     torch.set_num_threads(1)
     model_path = tmp_path / "model"
     make_tiny_policy(model_path)
@@ -249,7 +252,7 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm):
         "--dataset",
         str(task_path),
         "--device",
-        "cpu",
+        device,
         "--max-tokens",
         "4",
     ]
@@ -270,6 +273,15 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm):
             "2",
         ]
     )
+    stdout = capsys.readouterr().out
+    assert f"device={device} algorithm={algorithm} reward=ruff" in stdout
+    assert "[train] Loaded 1 tasks." in stdout
+    assert "[train] epoch=1/1 task=1/1 sample=1/2" in stdout
+    assert "sample=2/2" in stdout
+    assert "step=1/1 update=1/1 loss=" in stdout
+    assert "grad_norm=" in stdout
+    assert "mean_reward=" in stdout
+    assert f"Results: {train_path / 'train.jsonl'}" in stdout
     assert (train_path / "adapter" / "adapter_config.json").exists()
     records = [json.loads(line) for line in (train_path / "train.jsonl").read_text().splitlines()]
     assert len(records) == 2
@@ -286,6 +298,11 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm):
             "--allow-code-execution",
         ]
     )
+    stdout = capsys.readouterr().out
+    assert "[evaluate] task=1/1 generating completion" in stdout
+    assert "[evaluate] task=1/1 tokens=" in stdout
+    assert "pass@1=" in stdout
+    assert f"[evaluate] Complete. Results: {eval_path}" in stdout
     metrics = json.loads((eval_path / "metrics.json").read_text())
     assert metrics["tasks"] == 1
     assert metrics["pass@1"] in (0.0, 1.0)
@@ -338,3 +355,26 @@ def test_cli_rejects_unsafe_or_invalid_runs(tmp_path):
         )
     assert exc.value.code == 2
     assert not Path(tmp_path / "run").exists()
+
+
+def test_cli_rejects_unavailable_cuda_before_loading(tmp_path, capsys):
+    torch = pytest.importorskip("torch")
+    if torch.cuda.is_available():
+        pytest.skip("This check requires an environment without CUDA.")
+    with pytest.raises(SystemExit) as exc:
+        experiment.main(
+            [
+                "train",
+                "--reward",
+                "ruff",
+                "--device",
+                "cuda",
+                "--dataset",
+                str(tmp_path / "missing-dataset"),
+                "--output",
+                str(tmp_path / "run"),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "CUDA was requested but is unavailable; use --device cpu." in capsys.readouterr().err
+    assert not (tmp_path / "run").exists()
