@@ -277,6 +277,8 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsy
             "2",
             "--updates-per-group",
             "2",
+            "--checkpoint-minutes",
+            "0.000001",
         ]
     )
     stdout = capsys.readouterr().out
@@ -296,6 +298,22 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsy
     assert "[train] epoch=" not in stdout
     assert f"Results: {train_path / 'train.jsonl'}" in stdout
     assert (train_path / "adapter" / "adapter_config.json").exists()
+    assert sorted(path.name for path in train_path.glob("checkpoint-*")) == [
+        "checkpoint-1",
+        "checkpoint-2",
+    ]
+    for update in (1, 2):
+        checkpoint = train_path / f"checkpoint-{update}"
+        assert (checkpoint / "adapter_model.safetensors").exists()
+        assert (checkpoint / "tokenizer_config.json").exists()
+        assert json.loads((checkpoint / "checkpoint.json").read_text()) == {
+            "optimizer_step": update,
+            "epoch": 1,
+            "task_index": 1,
+            "task_id": 1,
+            "update_within_group": update,
+        }
+        assert f"[train] Saved checkpoint: {checkpoint}" in stdout
     records = [json.loads(line) for line in (train_path / "train.jsonl").read_text().splitlines()]
     assert len(records) == 2
     assert all(record["execution"] is None for record in records)
@@ -305,7 +323,7 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsy
             "evaluate",
             *common,
             "--adapter",
-            str(train_path / "adapter"),
+            str(train_path / "checkpoint-2"),
             "--output",
             str(eval_path),
             "--allow-code-execution",
@@ -326,6 +344,93 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsy
     assert metrics["mean_generated_tokens"] <= 4
     assert metrics["ruff_failures"] == 0
     assert json.loads((eval_path / "config.json").read_text())["split"] == "test"
+
+
+def test_step_checkpoint_boundary(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    torch.set_num_threads(1)
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    tasks = tmp_path / "tasks.json"
+    tasks.write_text(
+        json.dumps([{"text": "Returns one.", "test_list": ["assert solution() == 1"]}])
+    )
+    output = tmp_path / "train"
+    experiment.main(
+        [
+            "train",
+            "--model",
+            str(model_path),
+            "--dataset",
+            str(tasks),
+            "--device",
+            "cpu",
+            "--reward",
+            "ruff",
+            "--epochs",
+            "1",
+            "--group-size",
+            "2",
+            "--max-tokens",
+            "1",
+            "--updates-per-group",
+            "51",
+            "--checkpoint-steps",
+            "50",
+            "--output",
+            str(output),
+        ]
+    )
+    assert [path.name for path in output.glob("checkpoint-*")] == ["checkpoint-50"]
+    state = json.loads((output / "checkpoint-50" / "checkpoint.json").read_text())
+    assert state["optimizer_step"] == 50
+    assert state["update_within_group"] == 50
+    assert (output / "adapter" / "adapter_model.safetensors").exists()
+
+
+def test_incomplete_checkpoint_is_not_published(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    model_path = tmp_path / "model"
+    make_tiny_policy(model_path)
+    model, tokenizer = experiment.load_policy(str(model_path), None, train=True, device="cpu")
+    previous = tmp_path / "checkpoint-1"
+    experiment.save_adapter(model, tokenizer, previous, checkpoint_state={"optimizer_step": 1})
+    original = {file.name: file.read_bytes() for file in previous.iterdir()}
+
+    class FailingTokenizer:
+        def save_pretrained(self, path):
+            raise OSError("Tokenizer write failed.")
+
+    failed = tmp_path / "checkpoint-2"
+    with pytest.raises(OSError, match="Tokenizer write failed"):
+        experiment.save_adapter(
+            model, FailingTokenizer(), failed, checkpoint_state={"optimizer_step": 2}
+        )
+    assert not failed.exists()
+    assert not list(tmp_path.glob(".checkpoint-*"))
+    assert {file.name: file.read_bytes() for file in previous.iterdir()} == original
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        experiment.save_adapter(model, tokenizer, previous)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--checkpoint-minutes", "0"),
+        ("--checkpoint-minutes", "nan"),
+        ("--checkpoint-minutes", "inf"),
+        ("--checkpoint-steps", "0"),
+    ],
+)
+def test_checkpoint_options_reject_invalid_values(tmp_path, option, value):
+    with pytest.raises(SystemExit) as exc:
+        experiment.main(
+            ["train", "--reward", "ruff", "--output", str(tmp_path / "train"), option, value]
+        )
+    assert exc.value.code == 2
+    assert not (tmp_path / "train").exists()
 
 
 def test_optimizer_updates_only_adapter_parameters(tmp_path):

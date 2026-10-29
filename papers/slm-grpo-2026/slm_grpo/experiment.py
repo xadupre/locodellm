@@ -14,6 +14,8 @@ from pathlib import Path
 import random
 import sys
 import subprocess
+import tempfile
+import time
 
 from .rewards import PENALTIES, build_prompt, extract_code, score
 
@@ -118,6 +120,20 @@ def verify(task, text, args):
     )
 
 
+def save_adapter(model, tokenizer, path: Path, *, checkpoint_state=None):
+    """Publishes an adapter snapshot only after all of its files are saved."""
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite an existing adapter: {path}")
+    with tempfile.TemporaryDirectory(prefix=f".{path.name}-", dir=path.parent) as directory:
+        model.save_pretrained(directory)
+        tokenizer.save_pretrained(directory)
+        if checkpoint_state is not None:
+            Path(directory, "checkpoint.json").write_text(
+                json.dumps(checkpoint_state, indent=2) + "\n"
+            )
+        Path(directory).rename(path)
+
+
 def train(model, tokenizer, tasks, args, output):
     """Optimizes one group per update, saving adapters and per-completion diagnostics."""
     import torch
@@ -131,6 +147,8 @@ def train(model, tokenizer, tasks, args, output):
         weight_decay=0.0,
     )
     step = 0
+    optimizer_step = 0
+    last_checkpoint = time.monotonic()
     with (
         (output / "train.jsonl").open("w") as stream,
         tqdm(
@@ -223,6 +241,7 @@ def train(model, tokenizer, tasks, args, output):
                         model.parameters(), 1.0, error_if_nonfinite=True
                     )
                     optimizer.step()
+                    optimizer_step += 1
                     progress.set_postfix(
                         {
                             **counters,
@@ -234,11 +253,32 @@ def train(model, tokenizer, tasks, args, output):
                         refresh=False,
                     )
                     progress.update(1)
+                    steps_due = (
+                        args.checkpoint_steps is not None
+                        and optimizer_step % args.checkpoint_steps == 0
+                    )
+                    time_due = time.monotonic() - last_checkpoint >= args.checkpoint_minutes * 60
+                    if steps_due or time_due:
+                        stream.flush()
+                        checkpoint = output / f"checkpoint-{optimizer_step}"
+                        save_adapter(
+                            model,
+                            tokenizer,
+                            checkpoint,
+                            checkpoint_state={
+                                "optimizer_step": optimizer_step,
+                                "epoch": epoch + 1,
+                                "task_index": task_index,
+                                "task_id": task.get("task_id"),
+                                "update_within_group": update + 1,
+                            },
+                        )
+                        last_checkpoint = time.monotonic()
+                        progress.write(f"[train] Saved checkpoint: {checkpoint}", file=sys.stdout)
                 step += 1
                 stream.flush()
     print(f"[train] Saving LoRA adapter and tokenizer to {output / 'adapter'}", flush=True)
-    model.save_pretrained(output / "adapter")
-    tokenizer.save_pretrained(output / "adapter")
+    save_adapter(model, tokenizer, output / "adapter")
     print(f"[train] Complete. Results: {output / 'train.jsonl'}", flush=True)
 
 
@@ -437,6 +477,18 @@ def main(argv=None):
     )
     parser.add_argument("--timeout", type=float, default=3.0)
     parser.add_argument("--updates-per-group", type=int, default=1)
+    parser.add_argument(
+        "--checkpoint-steps",
+        type=int,
+        help="Also saves an adapter checkpoint every N completed optimizer updates.",
+    )
+    parser.add_argument(
+        "--checkpoint-minutes",
+        type=float,
+        default=10.0,
+        help="Saves an adapter checkpoint after this many minutes, at the next completed "
+        "optimizer update (default: 10).",
+    )
     parser.add_argument("--normalize-advantages", action="store_true")
     parser.add_argument(
         "--allow-code-execution",
@@ -453,7 +505,9 @@ def main(argv=None):
         parser.error("--group-size must be at least two.")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive.")
-    for name in ("learning_rate", "timeout", "temperature"):
+    if args.checkpoint_steps is not None and args.checkpoint_steps < 1:
+        parser.error("--checkpoint-steps must be positive.")
+    for name in ("learning_rate", "timeout", "temperature", "checkpoint_minutes"):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"--{name.replace('_', '-')} must be finite and positive.")

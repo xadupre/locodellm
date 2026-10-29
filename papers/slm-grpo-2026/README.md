@@ -50,6 +50,7 @@ python papers/slm-grpo-2026/run.py train \
   --device cuda \
   --algorithm grpo --reward combined \
   --epochs 2 --group-size 4 \
+  --checkpoint-minutes 10 \
   --output papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen \
   --allow-code-execution
 ```
@@ -70,6 +71,8 @@ There is one prompt per update and no KL regularization.
 | `--reward` | `combined` | `unit`, `ruff`, `ruff-normalized` |
 | `--epochs` | `5` | `2` for two complete passes over the training problems |
 | `--group-size` | `8` | `4` for four proposals per problem on each pass |
+| `--checkpoint-minutes` | `10` | Minutes between adapter checkpoints, checked after completed updates |
+| `--checkpoint-steps` | Disabled | Optionally also saves every N completed optimizer updates, e.g. `50` |
 | `--output` | Required; no implicit directory | Any empty or absent run directory |
 
 For a smoke run, add `--limit 2 --epochs 1 --group-size 2 --max-tokens 64`.
@@ -85,6 +88,7 @@ Loading and save paths are also printed. `--output` contains:
 papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen/
   config.json                # Resolved command-line options and hyperparameters
   train.jsonl                # Completions, rewards and verification diagnostics
+  checkpoint-<update>/       # Periodic adapter, tokenizer and checkpoint.json
   adapter/
     adapter_config.json      # LoRA configuration and base-model reference
     adapter_model.safetensors
@@ -92,6 +96,40 @@ papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen/
 ```
 
 Only the **LoRA adapter** is saved; the frozen base model is loaded separately.
+
+### Continue from a checkpoint
+
+An adapter checkpoint is saved **every 10 minutes**, at the next completed
+optimizer update. `--checkpoint-minutes` changes the interval (e.g. `5` or `0.5`).
+Long-running generation/updates can delay a save beyond the requested interval.
+The timer restarts after each successful save.
+
+`--checkpoint-steps 50` optionally also saves every 50 optimizer updates, not
+proposals; whichever condition is reached first triggers the save. Completed
+checkpoints are named `checkpoint-<optimizer-update>` and retained. Publication
+is atomic: an interrupted save does not expose a partially written checkpoint
+or replace an earlier valid one.
+
+Continues training from a completed `checkpoint-50` for two additional epochs,
+writing a new run without overwriting the interrupted run. Choose the actual
+checkpoint directory from your run:
+
+```bash
+python papers/slm-grpo-2026/run.py train \
+  --model Qwen/Qwen3-0.6B \
+  --device cuda \
+  --algorithm grpo --reward combined \
+  --adapter papers/slm-grpo-2026/runs/qwen-grpo-combined-2ep-4gen/checkpoint-50 \
+  --epochs 2 --group-size 4 \
+  --checkpoint-minutes 10 \
+  --output papers/slm-grpo-2026/runs/qwen-grpo-combined-continued \
+  --allow-code-execution
+```
+
+Checkpoints preserve **learned weights and tokenizer**, plus progress metadata in
+`checkpoint.json`; they do not contain optimizer or RNG state. This is a warm
+start from saved weights, **not an exact resume**: the optimizer, epoch counters
+and data order start afresh. The final adapter is still saved in `adapter/`.
 
 ## Evaluation
 
@@ -295,5 +333,6 @@ python -m pytest -q unittests/papers/test_slm_grpo.py
 
 Tiny local Qwen3 models exercise both algorithms on CPU/CUDA without downloads.
 Tests also check the 50/51-problem boundary, occupied-GPU filtering, aggregation
-across two idle GPUs, and worker failures. Checks requiring optional dependencies
-or unavailable/occupied GPUs skip.
+across two idle GPUs, worker failures, checkpoint intervals/reloading, and
+interrupted checkpoint writes. Checks requiring optional dependencies or
+unavailable/occupied GPUs skip.
