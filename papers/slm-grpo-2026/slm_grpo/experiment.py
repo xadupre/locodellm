@@ -7,6 +7,7 @@ from collections import Counter
 import json
 from pathlib import Path
 import random
+import sys
 import time
 
 from .rewards import PENALTIES, build_prompt, extract_code, score
@@ -210,13 +211,16 @@ def train(model, tokenizer, tasks, args, output):
 
 def evaluate(model, tokenizer, tasks, args, output):
     """Reports single-sample pass@1, exception types, lint severities, and lengths."""
+    from tqdm import tqdm
+
     failures = Counter()
     severities = Counter(dict.fromkeys(PENALTIES, 0))
     passed = tokens = lines = ruff_failures = 0
-    started = time.perf_counter()
-    with (output / "evaluate.jsonl").open("w") as stream:
+    with (
+        (output / "evaluate.jsonl").open("w") as stream,
+        tqdm(total=len(tasks), desc="[evaluate]", unit="task", file=sys.stdout) as progress,
+    ):
         for task_index, task in enumerate(tasks, start=1):
-            print(f"[evaluate] task={task_index}/{len(tasks)} generating completion", flush=True)
             prompt = encode_prompt(tokenizer, task, args.device)
             _, text, length = sample(
                 model, tokenizer, prompt, temperature=args.temperature, max_tokens=args.max_tokens
@@ -249,12 +253,15 @@ def evaluate(model, tokenizer, tasks, args, output):
                 + "\n"
             )
             stream.flush()
-            print(
-                f"[evaluate] task={task_index}/{len(tasks)} tokens={length} "
-                f"outcome={reward.execution.outcome} pass@1={passed / task_index:.4f} "
-                f"elapsed={time.perf_counter() - started:.1f}s",
-                flush=True,
+            progress.set_postfix(
+                {
+                    "tokens": length,
+                    "outcome": reward.execution.outcome,
+                    "pass@1": f"{passed / task_index:.4f}",
+                },
+                refresh=False,
             )
+            progress.update(1)
     count = len(tasks)
     summary = {
         "tasks": count,

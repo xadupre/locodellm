@@ -115,7 +115,8 @@ python papers/slm-grpo-2026/run.py evaluate \
 Evaluation uses MBPP `test`, temperature `0.6`, and one completion per task.
 Each output directory receives `config.json`, `evaluate.jsonl` (completions and
 diagnostics), and `metrics.json` (pass@1, error types, lengths, Ruff severities).
-Per-task progress and running pass@1 appear on stdout. Use `--device cpu` if needed.
+A tqdm progress bar on stdout shows completed tasks, timing, the latest token
+count/outcome, and running pass@1. Use `--device cpu` if needed.
 
 ## Learning algorithm
 

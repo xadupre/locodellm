@@ -302,9 +302,13 @@ def test_offline_lora_training_and_evaluation(tmp_path, algorithm, device, capsy
         ]
     )
     stdout = capsys.readouterr().out
-    assert "[evaluate] task=1/1 generating completion" in stdout
-    assert "[evaluate] task=1/1 tokens=" in stdout
+    assert "[evaluate]:" in stdout
+    assert "100%" in stdout
+    assert "1/1" in stdout
+    assert "tokens=" in stdout
+    assert "outcome=" in stdout
     assert "pass@1=" in stdout
+    assert "[evaluate] task=" not in stdout
     assert f"[evaluate] Complete. Results: {eval_path}" in stdout
     metrics = json.loads((eval_path / "metrics.json").read_text())
     assert metrics["tasks"] == 1
