@@ -8,89 +8,23 @@ Paper: [arXiv:2605.30478](https://arxiv.org/abs/2605.30478)
 
 ## Paper summary
 
-The paper studies reinforcement learning with verifiable rewards (RLVR) for Python
-code generation on MBPP, using Qwen3-0.6B and Llama-3.2-1B-Instruct with frozen base
-weights and LoRA adapters. It compares token-level GRPO with sequence-level GSPO,
-and unit-test, Ruff-only, and combined rewards. Unit-test outcomes provide a graded
-correctness signal; Ruff findings supply severity-weighted penalties.
+The paper trains small Python code-generation models on MBPP using unit-test
+results and Ruff diagnostics as rewards. It compares GRPO and GSPO with LoRA
+adapters on Qwen3-0.6B and Llama-3.2-1B-Instruct. The authors report up to
+**13 percentage points** improvement in pass@1, but Ruff-only rewards can favor
+short, incorrect programs. Neither algorithm consistently wins.
 
-The combined reward normalizes lint penalties by program length, clips them, and
-weights them more strongly for passing solutions. A short-output penalty discourages
-empty completions. The authors report up to **13 percentage points** improvement in
-MBPP pass@1, but no universal winner between GRPO and GSPO. Ruff-only optimization
-can favor short, incorrect programs. EvalPlus evaluation also shows that combined
-rewards do not consistently beat unit-test-only rewards. Generation length,
-execution errors, and lint severity therefore matter alongside pass@1.
+This standalone PyTorch implementation leaves the ONNX inference API unchanged.
 
-## What is implemented
-
-This directory is standalone: it does not change the ONNX inference API.
-
-| Component | Implementation |
-|---|---|
-| Prompts | MBPP description and **only the first** example test; no reference solution |
-| Verification | All standard and challenge tests, plus MBPP setup code |
-| Unit reward | Passed `+1`; assertion failure or timeout `-0.3`; runtime error `-0.6`; interpreter/other error `-1` |
-| Ruff reward | Severity penalties: error `-10`, high `-5`, normal `-1`, low `-0.2`; raw and line-normalized variants |
-| Combined reward | `unit + weight * clip(raw / max(1, lines), -1, 0) + short`; weight `0.3` if passed, otherwise `0.1` |
-| Short penalty | `-0.5` if fewer than 30 characters **or** fewer than 3 lines |
-| Advantages | Per-prompt centered rewards; optional population-SD normalization |
-| Optimization | Clipped token-level GRPO and sequence-level GSPO; frozen old log probabilities; no reference model (`beta=0`) |
-| Training | LoRA rank 32, alpha 64; all seven attention/MLP projections; AdamW |
-| Evaluation | One sample per task, pass@1, original exception types, mean tokens/lines, severity counts, Ruff failures |
-| Artifacts | Saved adapters/tokenizer, configuration JSON, per-completion JSONL diagnostics, evaluation metrics |
-
-Defaults follow section 4.3: eight completions per prompt, one prompt per update,
-one accumulation step, learning rate `1e-5`, five epochs, temperature `0.9`,
-768 new tokens, clipping `0.2`, seed `42`. Evaluation uses temperature `0.6`.
-The code uses PyTorch, Transformers and PEFT directly rather than relying on
-version-sensitive TRL objective defaults.
-
-**Reproducibility caveats:**
-
-- The paper does not publish the exact Ruff rule-to-severity mapping.
-  `slm_grpo/rewards.py` makes an explicit approximation: undefined names and invalid
-  syntax are errors; selected invalid control-flow/comparison rules are high;
-  unused imports/variables are low; other findings default to normal, with a
-  rule-token fallback from diagnostic messages. This is not an exact reproduction.
-- Ruff runs with an isolated default ruleset (`E4,E7,E9,F`), never this repository's
-  broader lint configuration. The optional requirements pin the paper's Ruff
-  version. A failed Ruff invocation/invalid JSON is logged and gives raw `-0.5`
-  before normalization. Missing OS executables and timeouts propagate explicitly.
-- Equation (4) in **this paper** defines GSPO as `exp(sum(new_logp - old_logp))`.
-  This implementation follows that equation, **not** the length-normalized
-  geometric-mean ratio used in canonical GSPO and current TRL. It is intentionally
-  labeled a paper-specific variant.
-- Group advantages are centered by default; `--normalize-advantages` enables the
-  paper's optional normalization. Sampling log probabilities include temperature
-  scaling; top-k and top-p filtering are disabled. The model stays in evaluation
-  mode during optimization to disable dropout while preserving adapter gradients.
-- The paper leaves optimizer details, extraction edge cases and execution timeout
-  underspecified. Here AdamW has zero weight decay, gradients are clipped to norm 1,
-  fenced Python blocks are joined after a closed thinking preamble, Qwen thinking
-  is disabled, and the per-candidate timeout defaults to 3 seconds.
-- Unsloth acceleration, vLLM/EvalPlus, the authors' full multi-seed experiments,
-  plots and statistical significance tests are **not** reproduced here.
-
-## Execution safety
-
-**Generated Python is arbitrary code.** The verification subprocess is **not a
-security sandbox**: isolation mode, a temporary working directory, a reduced
-environment, basic POSIX resource limits, a wall-clock timeout, and process-group
-cleanup only contain ordinary accidental failures. They do not prevent filesystem
-or network access, reward tampering, or adversarial process/resource abuse.
-
-Run training/evaluation **inside a disposable container or VM**, as an unprivileged
-user, with no secrets or sensitive mounts, restricted resources, and no network
-during verification. Download models/datasets beforehand. All commands executing
-generated code require `--allow-code-execution`; Ruff-only training does not.
-Execution requires POSIX (Linux/macOS). Do not use this harness to evaluate
-untrusted submissions on your host.
+**Safety:** generated Python is arbitrary code; the verification subprocess is
+**not a security sandbox**. Run it in a disposable, unprivileged container/VM
+without secrets, sensitive mounts, or network access during verification.
+Download models/datasets beforehand. Execution requires POSIX and explicit
+`--allow-code-execution`; Ruff-only training does not execute generated code.
 
 ## Installation
 
-From the repository root, create a separate environment so the experiment's
-dependencies, especially its older Ruff pin, do not replace development tools:
+From the repository root, install the optional dependencies in a separate environment:
 
 ```bash
 python -m venv papers/slm-grpo-2026/.venv
@@ -98,35 +32,28 @@ source papers/slm-grpo-2026/.venv/bin/activate
 python -m pip install -r papers/slm-grpo-2026/requirements.txt
 ```
 
-No editable project installation is needed. A CUDA GPU is recommended for the real
-models; CPU is useful for tiny offline tests. Llama requires access to the gated
-`meta-llama/Llama-3.2-1B-Instruct` checkpoint.
-
-CUDA requires a working PyTorch/CUDA/cuDNN installation. If it reports
-`CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`, check that `LD_LIBRARY_PATH` includes
-`nvidia/cudnn/lib` from the **active Python environment**, not another installation.
+No project installation is needed. CUDA requires matching PyTorch/CUDA/cuDNN
+libraries. For `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`, check that
+`LD_LIBRARY_PATH` points to the active environment's `nvidia/cudnn/lib`.
 
 ## Training
 
 From the repository root, inside the isolated environment described above, run:
 
 ```bash
+# Train Qwen3 with GRPO and the combined reward.
 python papers/slm-grpo-2026/run.py train \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
   --algorithm grpo --reward combined \
-  --group-size 8 --epochs 5 --learning-rate 1e-5 \
-  --temperature 0.9 --max-tokens 768 --seed 42 \
   --output papers/slm-grpo-2026/runs/qwen-grpo-combined \
   --allow-code-execution
 ```
 
-This command explicitly selects the paper's training hyperparameters. For CPU
-execution, replace **`--device cuda` with `--device cpu`**; the same training code
-and output layout apply, but full training is much slower. `--device cuda:1`
-selects another GPU. If omitted, the device defaults to CUDA when available,
-otherwise CPU. Explicitly requesting unavailable CUDA fails rather than silently
-switching to CPU.
+For CPU, replace **`--device cuda` with `--device cpu`** (much slower).
+The defaults follow the paper: 8 completions per prompt, 5 epochs, learning rate
+`1e-5`, temperature `0.9`, 768 new tokens, seed `42`, LoRA rank `32` and alpha `64`.
+There is one prompt per update and no KL regularization.
 
 | Option | Default | Other choices |
 |---|---|---|
@@ -136,34 +63,13 @@ switching to CPU.
 | `--reward` | `combined` | `unit`, `ruff`, `ruff-normalized` |
 | `--output` | Required; no implicit directory | Any empty or absent run directory |
 
-Use `--algorithm gspo` for the paper's sequence objective. Use `--reward unit`,
-`--reward ruff`, or `--reward ruff-normalized` for the ablations. To test the other
-architecture, set `--model meta-llama/Llama-3.2-1B-Instruct`.
-`--limit 2 --epochs 1 --group-size 2 --max-tokens 64` provides a short smoke run,
-not a meaningful reproduction.
-
-Each group is sampled before any update. Old log probabilities are detached;
-per-completion backward passes accumulate the group mean before one optimizer
-step, reducing activation memory. `--updates-per-group` optionally reuses the same
-group, with its original likelihoods fixed. Existing nonempty output directories
-are rejected rather than overwritten.
+For a smoke run, add `--limit 2 --epochs 1 --group-size 2 --max-tokens 64`.
+Existing nonempty output directories are never overwritten.
 
 ### Progress and saved model
 
-Progress is printed to **standard output**, flushed immediately: dataset/model
-loading, each sampled completion, each optimizer update, and final save paths.
-Training logs include epoch/task/sample counters, token count, reward, execution
-outcome, loss, gradient norm before clipping, mean group reward, and elapsed
-seconds. For example (illustrative):
-
-```text
-[train] epoch=1/5 task=1/374 sampling 8 completions
-[train] epoch=1/5 task=1/374 sample=1/8 tokens=120 reward=1.0000 outcome=passed
-[train] epoch=1/5 task=1/374 step=1/1870 update=1/1 loss=0.000000 grad_norm=0.1200 mean_reward=0.2500 elapsed=12.3s
-```
-
-The directory passed to `--output` contains both the trained model adaptation and
-the results:
+Progress appears immediately on **stdout**: loading, epoch/task/sample counters,
+rewards, loss, gradient norm, elapsed time, and save paths. `--output` contains:
 
 ```text
 papers/slm-grpo-2026/runs/qwen-grpo-combined/
@@ -175,21 +81,21 @@ papers/slm-grpo-2026/runs/qwen-grpo-combined/
     ...                      # Saved tokenizer files
 ```
 
-The base model is frozen, so only its **LoRA adapter**, not a second full copy of
-the base weights, is saved. Reload it using `--model` and `--adapter` together,
-as in the evaluation command below.
+Only the **LoRA adapter** is saved; the frozen base model is loaded separately.
 
 ## Evaluation
 
 ```bash
-# Untuned baseline: omit --adapter.
+# Evaluate the original model, without training.
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
   --output papers/slm-grpo-2026/runs/qwen-baseline \
   --allow-code-execution
+```
 
-# Trained policy: use the same base checkpoint as training.
+```bash
+# Evaluate the trained adapter with its original base model.
 python papers/slm-grpo-2026/run.py evaluate \
   --model Qwen/Qwen3-0.6B \
   --device cuda \
@@ -198,22 +104,105 @@ python papers/slm-grpo-2026/run.py evaluate \
   --allow-code-execution
 ```
 
-Training defaults to MBPP `train`; evaluation defaults to `test`. The full MBPP
-configuration is used, not the sanitized subset. `--split` can override the split.
-For repeated evaluation, use separate output directories and `--seed` values.
-Compare baseline and adapters with identical decoding settings and task subsets.
-`metrics.json` contains pass@1 and diagnostics; `evaluate.jsonl` retains every
-completion and its verification results. Evaluation always computes both unit-test
-and Ruff diagnostics, regardless of the training reward. Both files and the
-evaluation `config.json` are stored in its `--output` directory. Evaluation also
-prints per-task progress and the running pass@1 to standard output. Use
-`--device cpu` here too if CUDA is unavailable.
+Evaluation uses MBPP `test`, temperature `0.6`, and one completion per task.
+Each output directory receives `config.json`, `evaluate.jsonl` (completions and
+diagnostics), and `metrics.json` (pass@1, error types, lengths, Ruff severities).
+Per-task progress and running pass@1 appear on stdout. Use `--device cpu` if needed.
 
-For offline/custom experiments, `--dataset /path/to/tasks.json` accepts a JSON list
-of MBPP-shaped records: `text`, `test_list`, optional `task_id`,
-`challenge_test_list`, and `test_setup_code`. In this mode the file itself defines
-the split: use distinct training and held-out files. `--model` also accepts a local
-Transformers checkpoint. `--help` lists all options.
+## Learning algorithm
+
+For each MBPP task $x$, the prompt exposes only the first test, never the reference
+solution. Sample $G=8$ programs $y_i$ with the current policy, then score them using
+all standard/challenge tests and setup code.
+
+### Reward
+
+The unit-test reward is $R_{\mathrm{unit}}=1$ for success, $-0.3$ for an assertion
+failure or timeout, $-0.6$ for a runtime error, and $-1$ for interpreter/other errors.
+If $N_s(y)$ counts Ruff findings of severity $s$ and $L(y)$ counts lines:
+
+$$
+R_{\mathrm{raw}}(y)=\sum_s w_s N_s(y),
+\qquad (w_{\mathrm{error}},w_{\mathrm{high}},w_{\mathrm{normal}},w_{\mathrm{low}})
+=(-10,-5,-1,-0.2).
+$$
+
+$$
+R_{\mathrm{ruff}}(y)=\operatorname{clip}
+\left(\frac{R_{\mathrm{raw}}(y)}{\max(1,L(y))},-1,0\right),
+\qquad
+R_{\mathrm{short}}(y)=-0.5\,\mathbf{1}
+\left[\operatorname{chars}(y)<30\ \text{or}\ L(y)<3\right].
+$$
+
+The default combined reward prioritizes correctness:
+
+$$
+R_i=R_{\mathrm{unit}}(y_i)+\lambda_i R_{\mathrm{ruff}}(y_i)
++R_{\mathrm{short}}(y_i),
+\qquad
+\lambda_i=
+\begin{cases}
+0.3 & \text{if all tests pass},\\
+0.1 & \text{otherwise}.
+\end{cases}
+$$
+
+### Policy update
+
+Compute each program's advantage relative to its group:
+
+$$
+\bar R=\frac{1}{G}\sum_{j=1}^{G}R_j,\qquad A_i=R_i-\bar R.
+$$
+
+`--normalize-advantages` optionally divides $A_i$ by the group's population
+standard deviation plus $10^{-4}$. Equal rewards give zero learning signal.
+Let $T_i$ be the number of completion tokens and $\pi_{\mathrm{old}}$ the frozen
+sampling policy. With clipping $\epsilon=0.2$, define:
+
+$$
+r_{i,t}=\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
+{\pi_{\mathrm{old}}(y_{i,t}\mid x,y_{i,<t})},
+\qquad
+f(r,A)=\min\left(rA,\operatorname{clip}(r,1-\epsilon,1+\epsilon)A\right).
+$$
+
+**GRPO** averages the clipped objective over tokens, then programs:
+
+$$
+J_{\mathrm{GRPO}}(\theta)=\frac{1}{G}\sum_{i=1}^{G}
+\frac{1}{T_i}\sum_{t=1}^{T_i}f(r_{i,t},A_i).
+$$
+
+**GSPO (this paper's variant)** uses one importance ratio per program:
+
+$$
+r_i=\exp\left(\sum_{t=1}^{T_i}\log r_{i,t}\right),
+\qquad
+J_{\mathrm{GSPO}}(\theta)=\frac{1}{G}\sum_{i=1}^{G}f(r_i,A_i).
+$$
+
+The implementation minimizes $-J$ using AdamW on **LoRA parameters only**.
+The base weights stay frozen; $\beta=0$ means no reference-model KL term.
+Each group is sampled before updating; its old log probabilities remain fixed.
+By default there is one optimizer step per group; `--updates-per-group` changes it.
+
+## Implementation notes
+
+- GSPO follows the paper's **summed** log-ratio equation, not canonical GSPO's
+  length-normalized ratio.
+- The exact Ruff severity mapping is unpublished; `rewards.py` documents the
+  approximation. Ruff uses isolated rules `E4,E7,E9,F`; a failed invocation or
+  invalid JSON is logged and receives raw penalty `-0.5` before normalization.
+- Sampling/log probabilities use the same temperature, without top-k/top-p
+  filtering. Dropout and Qwen thinking are disabled. AdamW uses zero weight decay,
+  gradient clipping at norm 1, and a 3-second execution timeout.
+- `--dataset tasks.json` accepts local MBPP-shaped records (`text`, `test_list`,
+  optional `task_id`, `challenge_test_list`, `test_setup_code`). Use separate
+  training/test files; `--split` applies to the hosted dataset. See `--help`.
+- Full GPU benchmark gains, multi-seed statistics, Unsloth, and EvalPlus/vLLM
+  experiments have **not** been reproduced.
 
 ## Tests
 
@@ -223,13 +212,6 @@ From the repository root, with pytest and Ruff available:
 python -m pytest -q unittests/papers/test_slm_grpo.py
 ```
 
-The tests cover real subprocess outcomes and timeout handling, setup/challenge
-tests, prompt leakage, Ruff isolation, reward formulas, clipping and masking,
-gradient behavior, and adapter-only updates. With the optional training dependencies,
-they also train and reload both algorithms using a tiny, randomly initialized
-Qwen3 checkpoint and a tokenizer created locally: **no model or dataset downloads**.
-These integration tests run on CPU and also on CUDA when available, and check
-the progress messages written to standard output.
-PyTorch/PEFT-dependent tests skip when those optional dependencies are absent.
-These checks do not establish the paper's reported benchmark gains; reproducing
-those requires full GPU training and held-out evaluation.
+Tests cover rewards, verification, objectives, stdout progress, and adapter-only
+updates. Tiny local Qwen3 models exercise both algorithms on CPU/CUDA without
+downloads. Tests requiring optional dependencies or unavailable CUDA skip.
