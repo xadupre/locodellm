@@ -118,8 +118,54 @@ Per-task progress and running pass@1 appear on stdout. Use `--device cpu` if nee
 ## Learning algorithm
 
 For each MBPP task $x$, the prompt exposes only the first test, never the reference
-solution. Sample $G=8$ programs $y_i$ with the current policy, then score them using
+solution. Sample $G=8$ programs $y_i$ from the current model, then score them using
 all standard/challenge tests and setup code.
+
+### Symbols
+
+| Symbol | Meaning |
+|---|---|
+| $x$ | Input prompt: problem description and one example test |
+| $y$, $y_i$ | A generated program; the $i$-th program in the group |
+| $y_{i,t}$, $y_{i,<t}$ | Token at position $t$; preceding tokens of program $i$ |
+| $i$, $j$, $t$ | Program indices within a group; token position |
+| $G$ | Number of programs sampled for one prompt; default 8 |
+| $T_i$ | Number of generated tokens in program $i$ |
+| $M_\theta$ | Language model producing next-token logits: frozen base plus LoRA adapters |
+| $\theta$ | Trainable LoRA parameters; base-model weights are fixed |
+| $p_\theta$, $p_{\mathrm{old}}$ | Next-token probabilities from the current model and the model that sampled the group |
+| $\tau$ | Sampling/log-probability temperature; default 0.9 during training |
+| $s$ | Ruff severity: error, high, normal, or low |
+| $N_s(y)$, $w_s$ | Number of severity-$s$ findings in program $y$; penalty for each finding |
+| $L(y)$, $\operatorname{chars}(y)$ | Number of lines; number of characters in program $y$ |
+| $R_{\mathrm{unit}}$ | Reward from executing the tests |
+| $R_{\mathrm{raw}}$, $R_{\mathrm{ruff}}$ | Raw Ruff penalty; line-normalized and clipped Ruff penalty |
+| $R_{\mathrm{short}}$ | Penalty for a program that is too short |
+| $\lambda_i$ | Ruff weight: 0.3 for a passing program, otherwise 0.1 |
+| $R_i$, $\bar R$ | Combined reward of program $i$; mean reward of its group |
+| $A_i$, $A$ | Group-relative advantage; $A$ is a generic advantage argument to $f$ |
+| $r_{i,t}$, $r_i$, $r$ | Current/old probability ratio for a token, for a whole program, or as an argument to $f$ |
+| $\epsilon$ | Ratio-clipping width; default 0.2 |
+| $f(r,A)$ | Clipped advantage-weighted ratio used in the learning objective; not the model |
+| $J_{\mathrm{GRPO}}$, $J_{\mathrm{GSPO}}$, $J$ | Objectives to maximize; $J$ denotes the selected objective |
+| $\beta$ | Reference-model KL coefficient; fixed at 0 here |
+| $\mathbf{1}[\cdot]$ | Indicator: 1 when the condition holds, otherwise 0 |
+| $\operatorname{clip}$ | Clamps a value between the specified lower and upper bounds |
+| $\operatorname{softmax}$, $\log$, $\exp$ | Converts logits to probabilities; natural logarithm; exponential |
+
+### Model
+
+$M_\theta$ is the actual language model (for example Qwen3 with LoRA). It outputs
+logits; $p_\theta$ denotes the probabilities obtained from those logits:
+
+$$
+p_\theta(y_{i,t}\mid x,y_{i,<t})
+=\operatorname{softmax}\left(\frac{M_\theta(x,y_{i,<t})}{\tau}\right)_{y_{i,t}}.
+$$
+
+$p_{\mathrm{old}}$ is computed with the same model parameters that generated the
+group, before the optimizer update. Its log probabilities are kept fixed while
+$\theta$ is updated.
 
 ### Reward
 
@@ -164,12 +210,12 @@ $$
 
 `--normalize-advantages` optionally divides $A_i$ by the group's population
 standard deviation plus $10^{-4}$. Equal rewards give zero learning signal.
-Let $T_i$ be the number of completion tokens and $\pi_{\mathrm{old}}$ the frozen
-sampling policy. With clipping $\epsilon=0.2$, define:
+With clipping $\epsilon=0.2$, define the probability ratio and clipped objective
+term:
 
 $$
-r_{i,t}=\frac{\pi_\theta(y_{i,t}\mid x,y_{i,<t})}
-{\pi_{\mathrm{old}}(y_{i,t}\mid x,y_{i,<t})},
+r_{i,t}=\frac{p_\theta(y_{i,t}\mid x,y_{i,<t})}
+{p_{\mathrm{old}}(y_{i,t}\mid x,y_{i,<t})},
 \qquad
 f(r,A)=\min\left(rA,\operatorname{clip}(r,1-\epsilon,1+\epsilon)A\right).
 $$
