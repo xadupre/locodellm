@@ -142,29 +142,6 @@ python -m locodellm bench path/to/model gsm8k --limit 10
 The adapter supports LM-Eval tasks that use `generate_until`. Likelihood and
 perplexity tasks are not supported by the ONNX Runtime GenAI generation API.
 
-## Training: SLM GRPO (2026)
-
-Trains Qwen3-0.6B on MBPP with LoRA, GRPO, and the combined unit-test/Ruff reward.
-Saves the learned adapter and results in
-`papers/slm-grpo-2026/runs/qwen-grpo-combined/`.
-
-**This executes generated Python: use a disposable, isolated container or VM.**
-The [experiment README](papers/slm-grpo-2026/README.md) contains its optional
-dependencies, the paper summary, and the learning equations.
-
-```bash
-python papers/slm-grpo-2026/run.py train \
-  --model Qwen/Qwen3-0.6B \
-  --device cuda \
-  --algorithm grpo --reward combined \
-  --output papers/slm-grpo-2026/runs/qwen-grpo-combined \
-  --allow-code-execution
-```
-
-Use `--device cpu` for CPU training or `--algorithm gspo` for the other objective.
-Defaults follow the paper: 8 completions per prompt, 5 epochs, learning rate
-`1e-5`, temperature `0.9`, 768 new tokens, and seed `42`.
-
 ## Development
 
 ```bash

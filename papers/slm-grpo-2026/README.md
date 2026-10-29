@@ -38,7 +38,7 @@ libraries. On Linux, the launcher automatically adds the active environment's
 This handles `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` caused by an incorrect
 `LD_LIBRARY_PATH`, without requiring an export or changing your shell environment.
 
-## Training
+## Training command
 
 Trains Qwen3-0.6B on MBPP with GRPO and the combined unit-test/Ruff reward,
 using CUDA. Saves the LoRA adapter and training results in
