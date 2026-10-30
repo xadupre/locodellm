@@ -295,6 +295,67 @@ def test_calibration_identity_and_duplicate_keys():
         runner.validate_calibration([sample], [])
 
 
+def metric_record(task_id, seconds, *, reward=1.0, correct=True, status="passed"):
+    """Creates an explicit evaluation trace with two optimization-test measurements."""
+    return {
+        "task_id": task_id,
+        "strict_correct": correct,
+        "qp": 0.0 if correct else 1.0,
+        "reward": reward,
+        "optimization_indices": [0, 1],
+        "optimization": [
+            {"status": status, "seconds": seconds[0]},
+            {"status": status, "seconds": seconds[1]},
+        ],
+    }
+
+
+def test_evaluation_reward_and_uncensored_execution_time_metrics():
+    rows = [
+        metric_record("a", [0.1, 0.3]),
+        metric_record("a", [0.2, 0.4], reward=0.5),
+        metric_record("b", [10, 10], reward=-1, status="timeout"),
+        metric_record("b", [10, 10], reward=-1, correct=False, status="failed"),
+        metric_record("b", [0.4, 0.8], reward=0),
+    ]
+    rows[2]["optimization"][0] = {"status": "passed", "seconds": 0.9}
+    metrics = runner.evaluation_metrics(rows, [1])
+    assert metrics["p100/pass@1"] == pytest.approx((1 + 2 / 3) / 2)
+    assert metrics["reward"] == {"mean": -0.1, "positive": 2, "zero": 1, "negative": 2}
+    timing = metrics["optimization_time"]
+    assert timing["eligible_samples"] == 3
+    assert timing["excluded_correct_samples"] == 1
+    assert timing["mean_seconds"] == pytest.approx(2.2 / 6)
+    assert timing["mean_total_seconds"] == pytest.approx(2.2 / 3)
+    assert [test["index"] for test in timing["per_test"]] == [0, 1]
+    assert [test["samples"] for test in timing["per_test"]] == [3, 3]
+    assert [test["mean_seconds"] for test in timing["per_test"]] == pytest.approx([0.7 / 3, 0.5])
+
+
+@pytest.mark.parametrize("correct,status", [(True, "timeout"), (False, "failed")])
+def test_evaluation_execution_time_is_undefined_without_eligible_samples(correct, status):
+    row = metric_record("a", [10, 10], reward=-1, correct=correct, status=status)
+    timing = runner.evaluation_metrics([row], [1])["optimization_time"]
+    assert timing["eligible_samples"] == 0
+    assert timing["excluded_correct_samples"] == int(correct)
+    assert timing["mean_seconds"] is None
+    assert timing["mean_total_seconds"] is None
+    assert all(
+        test["samples"] == 0 and test["mean_seconds"] is None for test in timing["per_test"]
+    )
+
+
+@pytest.mark.parametrize("field", ["time", "reward"])
+def test_evaluation_metrics_reject_nonfinite_measurements(field):
+    row = metric_record("a", [0.1, 0.2])
+    if field == "time":
+        row["optimization"][0]["seconds"] = math.nan
+    else:
+        row["reward"] = math.nan
+    with pytest.raises(ValueError, match="finite"):
+        runner.evaluation_metrics([row], [1])
+
+
 def make_tiny_policy(path):
     """Creates a real offline Qwen3 checkpoint emitting runnable one-token programs."""
     torch = pytest.importorskip("torch")

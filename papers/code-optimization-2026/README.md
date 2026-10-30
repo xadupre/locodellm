@@ -332,6 +332,16 @@ computes QP, independent of the selected training environment. `evaluate.jsonl`
 is ordered by task/sample and retains timings, verdicts and reference keys.
 Only after all workers succeed is `metrics.json` published.
 
+`metrics.json` also includes `reward` (mean and positive/zero/negative counts) and
+`optimization_time` (seconds, per-test means, mean per test and mean summed time
+per response). Timing averages include only strictly correct responses that pass
+**all** optimization tests, excluding crashes and censored timeout values.
+`eligible_samples` and `excluded_correct_samples` expose this selection; undefined
+means are `null`, never zero. Each recorded successful test duration is the median
+of `--repeats` runs; interpreter startup, compilation and model generation are not
+included. Means are response-weighted, not equally weighted across problems.
+For the included dataset, test indices 0 and 1 are the 64-call and 256-call batches.
+
 For each task with `n` samples and `m` qualifying successes, pass@k is
 `1 - choose(n-m,k)/choose(n,k)` (equation 2). p100 checks strict correctness
 only, allowing optimization timeouts but not failures. p50/p30/p10 also require

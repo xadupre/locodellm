@@ -489,6 +489,49 @@ def evaluation_metrics(records, ks):
                 )
                 scores.append(pass_at_k(len(group), passed, k))
             result[f"p{threshold}/pass@{k}"] = statistics.mean(scores)
+    rewards = [row["reward"] for row in records]
+    if any(not math.isfinite(value) for value in rewards):
+        raise ValueError("Evaluation rewards must be finite.")
+    result["reward"] = {
+        "mean": statistics.mean(rewards),
+        "positive": sum(value > 0 for value in rewards),
+        "zero": sum(value == 0 for value in rewards),
+        "negative": sum(value < 0 for value in rewards),
+    }
+    measured = [
+        row
+        for row in records
+        if row["strict_correct"]
+        and row["optimization"]
+        and all(test["status"] == "passed" for test in row["optimization"])
+    ]
+    times = {index: [] for row in records for index in row["optimization_indices"]}
+    totals = []
+    for row in measured:
+        durations = []
+        for index, test in zip(row["optimization_indices"], row["optimization"], strict=True):
+            seconds = test["seconds"]
+            if not math.isfinite(seconds) or seconds <= 0:
+                raise ValueError("Measured execution times must be positive and finite.")
+            times[index].append(seconds)
+            durations.append(seconds)
+        totals.append(sum(durations))
+    all_times = [seconds for values in times.values() for seconds in values]
+    result["optimization_time"] = {
+        "unit": "seconds",
+        "eligible_samples": len(measured),
+        "excluded_correct_samples": sum(row["strict_correct"] for row in records) - len(measured),
+        "mean_seconds": statistics.mean(all_times) if all_times else None,
+        "mean_total_seconds": statistics.mean(totals) if totals else None,
+        "per_test": [
+            {
+                "index": index,
+                "samples": len(values),
+                "mean_seconds": statistics.mean(values) if values else None,
+            }
+            for index, values in sorted(times.items())
+        ],
+    }
     return result
 
 
