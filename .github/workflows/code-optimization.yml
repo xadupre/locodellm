@@ -1,0 +1,38 @@
+name: Code optimization study
+
+on:
+  push:
+    paths:
+      - "papers/code-optimization-2026/**"
+      - "unittests/papers/test_code_optimization.py"
+      - ".github/workflows/code-optimization.yml"
+  pull_request:
+    paths:
+      - "papers/code-optimization-2026/**"
+      - "unittests/papers/test_code_optimization.py"
+      - ".github/workflows/code-optimization.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: >-
+          python -m pip install "torch>=2.6" "transformers>=4.57,<6"
+          "peft>=0.18,<1" "scipy>=1.15,<2" "tqdm>=4.66,<5" "pytest>=7,<10"
+      - run: python papers/code-optimization-2026/run.py --help
+      - run: python -m pytest -q unittests/papers/test_code_optimization.py
+        env:
+          PYTHONPATH: .
+          CUDA_VISIBLE_DEVICES: ""
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
