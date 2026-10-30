@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import queue
 import random
 import statistics
 import sys
@@ -314,9 +315,8 @@ def training(rank, args, tasks, devices, cpu, model, tokenizer, env):
         )
 
 
-def evaluation(rank, args, tasks, devices, cpu, model, tokenizer, env):
+def evaluation(rank, args, tasks, devices, cpu, model, tokenizer, env, report=None):
     """Distributes individual samples across every idle GPU, even for small datasets."""
-    from tqdm import tqdm
     from transformers import set_seed
 
     from .policy import prompt_tokens, sample
@@ -329,11 +329,8 @@ def evaluation(rank, args, tasks, devices, cpu, model, tokenizer, env):
     with (
         Path(args.output, f"evaluate-rank{rank}.jsonl").open("w") as stream,
         Path(args.output, f"calibration-rank{rank}.jsonl").open("w") as calibration,
-        tqdm(
-            work, desc=f"[evaluate cuda-worker {rank}]", file=sys.stdout, disable=rank != 0
-        ) as progress,
     ):
-        for task_index, member in progress:
+        for task_index, member in work:
             task = tasks[task_index]
             set_seed(args.seed + task_index * args.samples + member)
             prompt = prompt_tokens(tokenizer, task, devices[rank])
@@ -361,9 +358,11 @@ def evaluation(rank, args, tasks, devices, cpu, model, tokenizer, env):
                     **record,
                 },
             )
+            if report is not None:
+                report(task_index)
 
 
-def worker(rank, args, tasks, devices, cpus, env):
+def worker(rank, args, tasks, devices, cpus, env, report=None):
     """Loads one replica per selected GPU and tears down distributed resources."""
     import torch
     import torch.distributed as dist
@@ -407,10 +406,69 @@ def worker(rank, args, tasks, devices, cpus, env):
         if args.command == "train":
             training(rank, args, tasks, devices, cpus[rank], model, tokenizer, env)
         else:
-            evaluation(rank, args, tasks, devices, cpus[rank], model, tokenizer, env)
+            evaluation(rank, args, tasks, devices, cpus[rank], model, tokenizer, env, report)
     finally:
         if distributed:
             dist.destroy_process_group()
+
+
+def run_evaluation(args, tasks, devices, cpus, env):
+    """Aggregates all workers into one parent-owned response and problem counter."""
+    import torch.multiprocessing
+    from tqdm import tqdm
+
+    counts = [0] * len(tasks)
+    completed = 0
+    with tqdm(
+        total=len(tasks) * args.samples,
+        desc="[evaluate]",
+        unit="response",
+        postfix={"problems": f"0/{len(tasks)}"},
+        file=sys.stdout,
+    ) as progress:
+
+        def report(task_index):
+            """Counts a response only after its verified record has been flushed."""
+            nonlocal completed
+            counts[task_index] += 1
+            if counts[task_index] == args.samples:
+                completed += 1
+            progress.set_postfix(problems=f"{completed}/{len(tasks)}", refresh=False)
+            progress.update()
+
+        if len(devices) == 1:
+            worker(0, args, tasks, devices, cpus, env, report)
+        else:
+            channel = torch.multiprocessing.get_context("spawn").Queue()
+            processes = None
+            try:
+                processes = torch.multiprocessing.spawn(
+                    worker,
+                    args=(args, tasks, devices, cpus, env, channel.put),
+                    nprocs=len(devices),
+                    join=False,
+                )
+                while not processes.join(timeout=0):
+                    try:
+                        report(channel.get(timeout=0.1))
+                    except queue.Empty:
+                        continue
+                while True:
+                    try:
+                        report(channel.get_nowait())
+                    except queue.Empty:
+                        break
+            finally:
+                if processes is not None:
+                    for process in processes.processes:
+                        if process.is_alive():
+                            process.terminate()
+                    for process in processes.processes:
+                        process.join()
+                channel.close()
+                channel.join_thread()
+        if progress.n != progress.total:
+            raise RuntimeError("Evaluation workers did not report every completed response.")
 
 
 def evaluation_metrics(records, ks):
@@ -626,7 +684,9 @@ def main(argv=None):
     if args.command in ("train", "evaluate"):
         import torch.multiprocessing
 
-        if len(devices) > 1:
+        if args.command == "evaluate":
+            run_evaluation(args, tasks, devices, cpus, env)
+        elif len(devices) > 1:
             torch.multiprocessing.spawn(
                 worker, args=(args, tasks, devices, cpus, env), nprocs=len(devices), join=True
             )

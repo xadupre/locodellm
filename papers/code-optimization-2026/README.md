@@ -321,6 +321,12 @@ silently falls back to the base model.
 Each `--output` must be a **new directory**. Failed run directories are retained
 for diagnosis; choose a different output path when retrying.
 
+One **global** `[evaluate]` progress bar counts completed responses (generation
+and verification) across all GPUs:
+100 problems with `--samples 20` means **2,000 responses**, not 286 per worker.
+The `problems=X/100` counter counts problems whose 20 responses have all finished.
+Model-loading bars (`Loading weights`) count weight tensors, not evaluation work.
+
 Evaluation always runs **all** optimization tests under the 10-second cap and
 computes QP, independent of the selected training environment. `evaluate.jsonl`
 is ordered by task/sample and retains timings, verdicts and reference keys.

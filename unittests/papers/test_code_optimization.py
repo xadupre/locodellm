@@ -427,6 +427,112 @@ def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path, checkpoint_opt
     assert result.returncode == 0 and "simulate" in result.stdout
 
 
+@pytest.mark.parametrize("problem_count", [1, 2])
+def test_global_evaluation_progress_across_uneven_cpu_workers(tmp_path, problem_count):
+    torch = pytest.importorskip("torch")
+    torch.set_num_threads(1)
+    model = tmp_path / "model"
+    make_tiny_policy(model)
+    tasks = [{**task(), "task_id": f"sum-{index}"} for index in range(problem_count)]
+    dataset = tmp_path / "tasks.json"
+    dataset.write_text(json.dumps(tasks))
+    output = tmp_path / "evaluation"
+    script = f"""
+import importlib
+from pathlib import Path
+runner = importlib.import_module("{PACKAGE}.runner")
+args = runner.parser().parse_args()
+Path(args.output).mkdir()
+runner.run_evaluation(
+    args, runner.load_tasks(args.dataset), ["cpu"] * 3, [None] * 3,
+    runner.Environment(),
+)
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            "evaluate",
+            "--model",
+            str(model),
+            "--dataset",
+            str(dataset),
+            "--output",
+            str(output),
+            "--samples",
+            "2",
+            "--pass-k",
+            "1",
+            "--max-tokens",
+            "1",
+            "--repeats",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    total = problem_count * 2
+    assert f"{total}/{total}" in result.stdout
+    assert f"problems={problem_count}/{problem_count}" in result.stdout
+    assert "cuda-worker" not in result.stdout
+    records = [
+        row for path in output.glob("evaluate-rank*.jsonl") for row in runner.read_jsonl(path)
+    ]
+    assert len(records) == total
+    assert {(row["task_index"], row["sample"]) for row in records} == {
+        (index, member) for index in range(problem_count) for member in range(2)
+    }
+
+
+def test_global_evaluation_progress_propagates_worker_failure(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    script = f"""
+import importlib
+from pathlib import Path
+runner = importlib.import_module("{PACKAGE}.runner")
+args = runner.parser().parse_args()
+Path(args.output).mkdir()
+runner.run_evaluation(
+    args, [{{"task_id": "unused"}}], ["cpu"] * 2, [None] * 2,
+    runner.Environment(),
+)
+"""
+    output = tmp_path / "failed"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            "evaluate",
+            "--dataset",
+            "unused.json",
+            "--model",
+            str(tmp_path / "missing-model"),
+            "--output",
+            str(output),
+            "--samples",
+            "2",
+            "--pass-k",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1"},
+    )
+    assert result.returncode != 0
+    assert "ProcessRaisedException" in result.stderr
+    assert "2/2" not in result.stdout
+    assert not (output / "metrics.json").exists()
+
+
 def test_invalid_inputs_and_execution_opt_in(tmp_path):
     dataset = tmp_path / "dataset.json"
     dataset.write_text(json.dumps([task(), task()]))
