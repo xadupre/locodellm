@@ -181,6 +181,64 @@ task's device. `config.json` records `evaluation_devices`. Parallel sampling use
 single-GPU evaluation, which retains its original random-number sequence.
 Worker errors propagate instead of producing successful-looking partial metrics.
 
+## Local experiment results (2026-10-29)
+
+The local `runs/qwen-grpo-combined2` experiment trained **Qwen3-0.6B with
+LoRA, GRPO and the combined unit-test/Ruff reward** on MBPP `train`. Its
+configuration requested 2 epochs and 4 proposals per problem, with learning rate
+`1e-5`, sampling temperature `0.9`, 768 maximum new tokens, seed `42`, and
+10-minute checkpoints. Training started from the base model, not an earlier
+adapter.
+
+The [reward construction](#reward) below explains the three components used
+in this run: test outcome, length-normalized Ruff penalty, and short-code penalty.
+
+Each checkpoint below was evaluated on the **same 500 MBPP test problems**,
+with one sampled completion per problem, temperature `0.6`, 768 maximum new
+tokens, seed `42`, and a 3-second verification timeout. Checkpoint evaluations
+used a single GPU (`cuda:0`); the baseline also used single-GPU evaluation.
+The update number counts optimizer updates, not generated proposals.
+
+| Model / checkpoint | Passed / 500 | pass@1 | Change vs. baseline (percentage points) | Mean generated tokens |
+|---|---|---|---|---|
+| Base model | 109 | 21.8% | -- | 45.9 |
+| 37 | 94 | 18.8% | -3.0 | 202.3 |
+| 59 | 96 | 19.2% | -2.6 | 224.8 |
+| 81 | 106 | 21.2% | -0.6 | 177.8 |
+| 108 | 116 | 23.2% | +1.4 | 156.7 |
+| 132 | 132 | 26.4% | +4.6 | 173.5 |
+| 155 | 135 | 27.0% | +5.2 | 155.8 |
+| 182 | 139 | 27.8% | +6.0 | 191.1 |
+| 206 | 158 | 31.6% | +9.8 | 184.5 |
+| 232 | 147 | 29.4% | +7.6 | 171.5 |
+| 256 | 153 | 30.6% | +8.8 | 155.8 |
+| 287 | 159 | 31.8% | +10.0 | 162.5 |
+| 315 | 163 | 32.6% | +10.8 | 168.2 |
+| 342 | 159 | 31.8% | +10.0 | 151.8 |
+| 370 | 159 | 31.8% | +10.0 | 159.7 |
+| 400 | 158 | 31.6% | +9.8 | 151.4 |
+| **428** | **167** | **33.4%** | **+11.6** | **145.3** |
+
+The latest evaluated checkpoint, **428**, is also the best observed checkpoint:
+58 more problems passed than the baseline, an **11.6-percentage-point gain**.
+Generation is longer than the baseline (145.3 vs. 45.9 tokens on average).
+Early checkpoints performed worse than the base model; improvement was not
+monotonic.
+
+**Status and limitations:** this is a partial training run, not the final
+two-epoch adapter. Checkpoint 428 records epoch 2, task 54; `train.jsonl`
+contains 1,768 proposals through group 442, but no final `adapter/` was saved.
+These are exploratory, single-seed results with repeated evaluation on the
+test split, not an independently validated checkpoint selection or a full
+reproduction of the paper's reported gains.
+
+Sources are the local `runs/qwen-baseline/{config.json,metrics.json,evaluate.jsonl}`
+and `runs/qwen-grpo-combined2/` artifacts: `config.json`, `train.jsonl`,
+`checkpoint-428/checkpoint.json`, and each
+`checkpoint-<update>-evaluation/{config.json,metrics.json,evaluate.jsonl}`.
+The table's task counts, pass@1 and mean token counts were checked against
+the per-task records. These run artifacts are ignored by Git.
+
 ## Learning algorithm
 
 For each MBPP task $x$, the prompt exposes only the first test, never the reference
@@ -235,9 +293,36 @@ $\theta$ is updated.
 
 ### Reward
 
-The unit-test reward is $R_{\mathrm{unit}}=1$ for success, $-0.3$ for an assertion
-failure or timeout, $-0.6$ for a runtime error, and $-1$ for interpreter/other errors.
-If $N_s(y)$ counts Ruff findings of severity $s$ and $L(y)$ counts lines:
+For the reported experiment (`--reward combined`), **each generated program
+receives one scalar reward**, built as follows in `slm_grpo/rewards.py`.
+Scoring uses the extracted Python code, not surrounding Markdown or explanations.
+
+| Component | Condition / calculation | Contribution to combined reward |
+|---|---|---|
+| Tests | All tests pass | +1.0 |
+| Tests | Assertion failure or timeout (default: 3 seconds) | -0.3 |
+| Tests | Runtime error, e.g. `TypeError` or `IndexError` | -0.6 |
+| Tests | Interpreter error (`SyntaxError`, `NameError`) or other execution failure | -1.0 |
+| Ruff | Sum penalties per finding: `error` -10, `high` -5, `normal` -1, `low` -0.2; divide by code lines (at least 1), then clip to `[-1, 0]` | Normalized penalty multiplied by **0.3 if all tests pass**, otherwise **0.1** |
+| Short code | Fewer than 30 characters **or** fewer than 3 lines | -0.5, even if tests pass; otherwise 0 |
+| **Total** | **One test-outcome reward + weighted Ruff penalty + short-code penalty** | **Between -1.6 and +1.0** |
+
+Verification runs the task's setup code, the generated code, then all standard
+and challenge tests, stopping at the first failure. Only the first standard
+test is shown in the prompt. The test reward depends on the overall outcome,
+not the fraction of tests passed. Ruff uses isolated rules `E4,E7,E9,F`;
+clean code contributes zero, and lint cannot turn a failing program into a
+successful one.
+
+| Example | Test reward | Weighted Ruff penalty | Short-code penalty | Total |
+|---|---|---|---|---|
+| All tests pass, no Ruff findings, sufficient length | +1.0 | 0 | 0 | **1.0** |
+| Assertion failure, no Ruff findings, sufficient length | -0.3 | 0 | 0 | **-0.3** |
+| All tests pass, one normal Ruff finding in 5 lines, at least 30 characters | +1.0 | 0.3 * (-1/5) = -0.06 | 0 | **0.94** |
+| Assertion failure, one normal Ruff finding in 5 lines, at least 30 characters | -0.3 | 0.1 * (-1/5) = -0.02 | 0 | **-0.32** |
+| All tests pass, no Ruff findings, fewer than 3 lines | +1.0 | 0 | -0.5 | **0.5** |
+
+Formally, if $N_s(y)$ counts Ruff findings of severity $s$ and $L(y)$ counts lines:
 
 $$
 R_{\mathrm{raw}}(y)=\sum_s w_s N_s(y),
@@ -265,6 +350,15 @@ R_i=R_{\mathrm{unit}}(y_i)+\lambda_i R_{\mathrm{ruff}}(y_i)
 0.1 & \text{otherwise}.
 \end{cases}
 $$
+
+Other `--reward` modes use only the test-outcome reward (`unit`), only the raw
+Ruff penalty (`ruff`), or only its normalized/clipped value (`ruff-normalized`).
+These modes do not apply the short-code penalty; Ruff-only modes do not execute
+the generated code.
+
+The reward is not pass@1: pass@1 counts programs whose tests all pass, regardless
+of Ruff findings or length. During training, GRPO compares each reward to the
+mean of the 4 proposals in its group for this run, as described next.
 
 ### Policy update
 
@@ -319,8 +413,9 @@ By default there is one optimizer step per group; `--updates-per-group` changes 
 - `--dataset tasks.json` accepts local MBPP-shaped records (`text`, `test_list`,
   optional `task_id`, `challenge_test_list`, `test_setup_code`). Use separate
   training/test files; `--split` applies to the hosted dataset. See `--help`.
-- Full GPU benchmark gains, multi-seed statistics, Unsloth, and EvalPlus/vLLM
-  experiments have **not** been reproduced.
+- Partial single-seed GPU results are reported above; a full reproduction of
+  the paper's gains, multi-seed statistics, Unsloth, and EvalPlus/vLLM
+  experiments remain **unverified**.
 
 ## Tests
 
