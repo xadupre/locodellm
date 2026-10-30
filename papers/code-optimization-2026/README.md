@@ -397,6 +397,45 @@ Training uses QAR (mean per-test rank), whereas evaluation uses QP (the addition
 reference-leaderboard ranking). Their numerical thresholds need not select the
 same candidates, even when both are set to 0.3.
 
+### Local checkpoint evaluation (2026-10-30)
+
+The base `Qwen/Qwen2.5-7B-Instruct` model and five LoRA checkpoints were evaluated
+on the **same 100 held-out TheAlgorithms/Python problems**, with **5 responses per
+problem** (500 per model, 2,500 across the five checkpoints). Checkpoint numbers
+count actual optimizer updates, not generated responses or training iterations.
+All evaluations used seed 42, temperature 1, a 16,384-token generation cap,
+3 independent executions per test, and the same 10-second evaluation cap.
+The checkpoint evaluations ran successively on seven GPUs.
+
+| Model / optimizer updates | Correct responses /500 | Correct + p30 gate /500 | Correctness pass@3 | p30 pass@3 |
+|---|---:|---:|---:|---:|
+| Base model, no adapter | 137 | 113 | 48.8% | 41.2% |
+| Checkpoint 11 | 136 | 113 | 49.9% | 41.7% |
+| Checkpoint 23 | 133 | 112 | 48.2% | 41.1% |
+| Checkpoint 34 | 140 | 116 | 50.6% | 43.0% |
+| Checkpoint 46 | 124 | 103 | 46.8% | 38.7% |
+| Checkpoint 57 | 143 | 116 | 50.8% | 43.0% |
+
+Checkpoint 57 has six more correct responses than the base model and gains
+**2.0 percentage points in correctness pass@3**. Checkpoints 34 and 57 tie on
+p30 pass@3, **1.8 percentage points** above the baseline. Improvement is not
+monotonic: checkpoint 46 performs worse than the base model.
+
+These are exploratory, single-seed test-set comparisons, not evidence of a
+statistically established gain or an unbiased estimate after checkpoint selection.
+The p30 gate compares each response against the dataset's **two fixed reference
+programs**, not against the other responses; p10 is identical here. These results
+do not establish a percentage runtime reduction or reproduce DMC-Optim results.
+
+The local run artifacts are `runs/qwen-baseline/` and
+`runs/qwen-qar-p30-test-checkpoint-<update>/`, with a verified combined
+`runs/qwen-qar-p30-test-summary.json`. Each evaluation retains its configuration,
+500 response records, reference timings and metrics; these ignored runtime
+artifacts are not bundled with this README. To reproduce the checkpoint
+evaluation protocol, use the evaluation command above with `--samples 5
+--pass-k 1 3 --seed 42 --temperature 1 --max-tokens 16384 --repeats 3`, an existing
+checkpoint as `--adapter`, and a fresh output directory.
+
 ## CPU calibration, offline screening and trace replay
 
 Measures reference programs without loading a model:
