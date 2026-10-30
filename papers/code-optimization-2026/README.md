@@ -65,7 +65,60 @@ Install the PyTorch build matching the machine's CUDA libraries. The Linux
 launcher reuses the cuDNN loader-path setup from the earlier SLM study.
 All commands below are run from the repository root.
 
-## Dataset and private verification inputs
+## Dataset: 100 training and 100 test problems
+
+The ready-to-use dataset in `data/thealgorithms-python/` derives **200 problems**
+from [TheAlgorithms/Python](https://github.com/TheAlgorithms/Python), pinned to
+commit `6e03a48579ca212a08b36be00378f887dc41a003`:
+
+| File, relative to this study | Problems | Usage |
+|---|---:|---|
+| `data/thealgorithms-python/optimization-train.json` | 100 | Training |
+| `data/thealgorithms-python/optimization-test.json` | 100 | Held-out evaluation |
+
+Each problem comes from a different source file and has at least four distinct
+upstream doctest calls with literal, known expected results. Its stdin is a JSON
+batch of calls, each with `args` and `kwargs`; stdout is the ordered JSON result
+array. Two correctness batches and two larger batches of **64 and 256 calls**
+are included. Both reference programs passed **every** included test.
+
+The references use the same upstream algorithm: one evaluates every call, the
+other memoizes repeated arguments within the batch. Entire top-level source
+categories are assigned to just one split, so source files, function names and
+categories do not cross the train/test boundary. This is a category-held-out
+split, not a stratified random split. `manifest.json` records provenance, split
+counts, exclusions and dataset SHA-256 hashes. MIT notices are preserved in
+`NOTICE.txt` and in each reference.
+
+**Bootstrap dataset, not DMC-Optim:** batching increases workload, not individual
+algorithm input sizes. The two wrappers are not independent correctness oracles;
+both rely on upstream doctest answers. Timing separation, broader input coverage,
+semantic deduplication and pretraining contamination have **not** been qualified.
+Do not interpret results as reproducing the paper's optimization benchmark.
+
+### Regeneration
+
+The committed JSON files need no download or generation before training.
+To rebuild from source into a new directory (Python 3.12, standard library only):
+
+```bash
+git clone https://github.com/TheAlgorithms/Python.git /tmp/thealgorithms-python
+git -C /tmp/thealgorithms-python checkout 6e03a48579ca212a08b36be00378f887dc41a003
+python -m papers.code-optimization-2026.optim_rl.algorithm_data \
+  --source /tmp/thealgorithms-python \
+  --output /tmp/thealgorithms-optimization-200 \
+  --allow-code-execution
+```
+
+The builder checks the revision and rejects modified tracked sources or existing
+output directories. It never imports entire upstream modules, rejects unsupported
+dependencies, and validates references using the same resource-limited subprocess
+backend as training. Execution still requires a disposable environment, not a
+trusted host. Selection is fixed before execution: a reference failure or timeout
+aborts publication rather than silently replacing a problem. The verification cap
+is 10 seconds per reference/test, matching calibration. No GPU is needed.
+
+### Task file format and private verification inputs
 
 `--dataset` accepts a nonempty local JSON list:
 
@@ -124,21 +177,15 @@ update: record GPU count when comparing runs.
 
 ## Training
 
-Trains a top-30% **per-test-percentile (QAR), binary collapsed-reward** policy.
-Replace the dataset path with your independently prepared training split.
-The generation cap below leaves room for the prompt in a 32k context:
+Trains a top-30% **per-test-percentile (QAR), binary collapsed-reward** policy
+on the 100 included training problems, using all idle GPUs. Checkpoints are saved
+**every 20 minutes**, after the next completed distributed update:
 
 ```bash
 python papers/code-optimization-2026/run.py train \
-  --dataset /path/to/optimization-train.json \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --device cuda \
-  --environment qar --threshold 0.3 \
-  --reward collapsed --quality-map binary \
-  --steps 10000 --group-size 16 --prompts-per-step 1 \
-  --learning-rate 1e-7 --temperature 1.0 \
-  --max-tokens 16384 --horizon 32768 \
-  --checkpoint-minutes 10 --checkpoint-steps 50 \
+  --dataset papers/code-optimization-2026/data/thealgorithms-python/optimization-train.json \
+  --model Qwen/Qwen2.5-7B-Instruct --device cuda \
+  --max-tokens 16384 \
   --output papers/code-optimization-2026/runs/qwen-qar-p30 \
   --allow-code-execution
 ```
@@ -241,9 +288,9 @@ and optimizer update count distinguish this from a skipped batch.
 | `training-rank<N>.json`, `training-metrics.json` | Update counts and matching adapter hashes |
 
 Outputs must be absent; existing directories are never overwritten.
-Checkpoints are saved every 10 minutes or 50 completed optimizer updates by
-default, after a whole distributed iteration; long generation can delay a save.
-Use `--checkpoint-steps 0` to disable the step trigger.
+Checkpoints are saved every 20 minutes by default, after a whole distributed
+iteration; long generation can delay a save. `--checkpoint-steps N` optionally
+adds a step-based trigger (disabled by default).
 
 Continues from learned weights using `--adapter <run>/checkpoint-50`, with a
 **new** output directory. This is a warm start: optimizer, RNG and data-order
@@ -251,28 +298,20 @@ state are not restored. Only weights/tokenizer and update metadata are saved.
 
 ## Baseline and trained evaluation
 
-Samples the base model on an independent test split using all idle GPUs:
+Evaluates the saved adapter on the 100 held-out problems using all idle GPUs:
 
 ```bash
 python papers/code-optimization-2026/run.py evaluate \
-  --dataset /path/to/optimization-test.json \
-  --model Qwen/Qwen2.5-7B-Instruct --device cuda \
-  --samples 20 --pass-k 1 10 --max-tokens 16384 \
-  --output papers/code-optimization-2026/runs/qwen-baseline \
-  --allow-code-execution
-```
-
-Repeats the same evaluation with the saved adapter and a separate output:
-
-```bash
-python papers/code-optimization-2026/run.py evaluate \
-  --dataset /path/to/optimization-test.json \
+  --dataset papers/code-optimization-2026/data/thealgorithms-python/optimization-test.json \
   --model Qwen/Qwen2.5-7B-Instruct --device cuda \
   --adapter papers/code-optimization-2026/runs/qwen-qar-p30/adapter \
   --samples 20 --pass-k 1 10 --max-tokens 16384 \
   --output papers/code-optimization-2026/runs/qwen-qar-p30-test \
   --allow-code-execution
 ```
+
+For the base-model comparison, omit `--adapter` and change `--output` to
+`papers/code-optimization-2026/runs/qwen-baseline`.
 
 Evaluation always runs **all** optimization tests under the 10-second cap and
 computes QP, independent of the selected training environment. `evaluate.jsonl`
@@ -319,7 +358,7 @@ rerunning programs:
 
 ```bash
 python papers/code-optimization-2026/run.py replay \
-  --dataset /path/to/optimization-test.json \
+  --dataset papers/code-optimization-2026/data/thealgorithms-python/optimization-test.json \
   --calibration papers/code-optimization-2026/runs/qwen-baseline/calibration.jsonl \
   --records papers/code-optimization-2026/runs/qwen-baseline/evaluate.jsonl \
   --environment qar --threshold 0.5 --reward two-gate --quality-map linear \

@@ -1,5 +1,6 @@
 """Checks real execution, paper equations, reference replay and offline LoRA training."""
 
+import hashlib
 import importlib
 import json
 import math
@@ -17,6 +18,82 @@ execution = importlib.import_module(f"{PACKAGE}.execution")
 runner = importlib.import_module(f"{PACKAGE}.runner")
 devices = importlib.import_module(f"{PACKAGE}.devices")
 simulation = importlib.import_module(f"{PACKAGE}.simulation")
+algorithm_data = importlib.import_module(f"{PACKAGE}.algorithm_data")
+
+
+def test_algorithm_dataset_extraction_and_real_references(tmp_path):
+    source = tmp_path / "maths"
+    source.mkdir()
+    path = source / "total.py"
+    path.write_text('''"""Computes a shifted sum for independent lists of integers."""
+BASE = 3
+
+def helper(values):
+    return sum(values)
+
+def total(values, extra=0):
+    """Computes the sum of values plus three and the optional extra argument.
+
+    >>> total([])
+    3
+    >>> total([1])
+    4
+    >>> total([2, 4])
+    9
+    >>> total([0], extra=2)
+    5
+    """
+    return helper(values) + BASE + extra
+
+raise RuntimeError("The whole module must never be imported.")
+''')
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    (sample,) = algorithm_data.candidates(path, tmp_path, "Test fixture.")
+    assert sample["source"]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert "def total" not in sample["problem"]
+    assert sample["source"]["doctest_cases"] == 4
+    assert algorithm_data.validate_task(sample) is None
+    assert len(json.loads(sample["optimization_tests"][-1]["input"])) == 256
+    path.write_text(path.read_text().replace(">>> total([])\n    3", ">>> total([])\n    999"))
+    selected, rejected = algorithm_data.prepare_file(path, tmp_path, "Test fixture.")
+    assert selected["task_id"] == sample["task_id"]
+    assert not rejected
+    assert "reference 0, correctness_tests" in algorithm_data.validate_task(selected)
+
+
+def test_algorithm_dataset_category_split_and_impossible_partition():
+    tasks = [
+        {"task_id": f"{family}-{index}", "source": {"family": family}}
+        for family, count in (("maths", 2), ("strings", 2), ("sorts", 4))
+        for index in range(count)
+    ]
+    train, test = algorithm_data.split_tasks(tasks, 4)
+    assert len(train) == len(test) == 4
+    assert {t["source"]["family"] for t in train}.isdisjoint(t["source"]["family"] for t in test)
+    with pytest.raises(ValueError, match="category-disjoint"):
+        algorithm_data.split_tasks(tasks[:6], 3)
+
+
+def test_committed_algorithm_dataset_contract_and_reference_calibration():
+    directory = Path(runner.__file__).resolve().parents[1] / "data" / "thealgorithms-python"
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert hashlib.sha256(Path(algorithm_data.__file__).read_bytes()).hexdigest() == (
+        manifest["generator_sha256"]
+    )
+    splits = []
+    for split in ("train", "test"):
+        path = directory / f"optimization-{split}.json"
+        tasks = runner.load_tasks(path)
+        assert len(tasks) == 100
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == (manifest["sha256"][path.name])
+        splits.append(tasks)
+    train, test = splits
+    assert len({task["task_id"] for task in train + test}) == 200
+    for field in ("path", "symbol", "family"):
+        assert {t["source"][field] for t in train}.isdisjoint(t["source"][field] for t in test)
+    matrix = execution.calibrate(train[0], timeout=3, repeats=1, cpu=None)
+    assert len(matrix) == 2 and all(len(row) == 2 for row in matrix)
+    assert algorithm_data.validate_task(test[-1]) is None
 
 
 def task():
@@ -253,7 +330,10 @@ def make_tiny_policy(path):
     return tokenizer
 
 
-def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path):
+@pytest.mark.parametrize(
+    "checkpoint_options", [("--checkpoint-steps", "1"), ("--checkpoint-minutes", "0.000001")]
+)
+def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path, checkpoint_options):
     torch = pytest.importorskip("torch")
     from safetensors.torch import load_file
 
@@ -301,8 +381,7 @@ def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path):
             "two-gate",
             "--quality-map",
             "linear",
-            "--checkpoint-steps",
-            "1",
+            *checkpoint_options,
         ]
     )
     metrics = json.loads((train / "training-metrics.json").read_text())

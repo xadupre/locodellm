@@ -1,0 +1,80 @@
+{
+  "repository": "https://github.com/TheAlgorithms/Python",
+  "revision": "6e03a48579ca212a08b36be00378f887dc41a003",
+  "python_version": "3.12.15",
+  "generator_sha256": "7674cd5f066d4dcfb440fd60e06adb92525a0ab9cfe28066ef31b5b426ecdeb8",
+  "construction": "Literal upstream doctest oracles; independent-call JSON batch tasks.",
+  "selection": "Static eligibility and source ordering before execution; failures abort.",
+  "references": [
+    "upstream algorithm with a loop",
+    "same algorithm with per-batch memoization"
+  ],
+  "optimization_batch_sizes": [
+    64,
+    256
+  ],
+  "validation": "Both references passed every correctness and optimization test.",
+  "validation_timeout_seconds": 10.0,
+  "split_unit": "source category; one problem per file; distinct normalized symbols",
+  "train": {
+    "problems": 100,
+    "families": {
+      "bit_manipulation": 25,
+      "conversions": 23,
+      "data_structures": 8,
+      "sorts": 26,
+      "hashes": 1,
+      "linear_algebra": 2,
+      "matrix": 3,
+      "physics": 9,
+      "ciphers": 3
+    }
+  },
+  "test": {
+    "problems": 100,
+    "families": {
+      "graphics": 1,
+      "greedy_methods": 4,
+      "maths": 20,
+      "other": 4,
+      "searches": 9,
+      "backtracking": 5,
+      "data_compression": 1,
+      "geometry": 1,
+      "strings": 31,
+      "fractals": 2,
+      "divide_and_conquer": 2,
+      "boolean_algebra": 3,
+      "scheduling": 1,
+      "dynamic_programming": 14,
+      "financial": 1,
+      "electronics": 1
+    }
+  },
+  "sha256": {
+    "optimization-train.json": "79d0ace9ec351a1a94b3cf3cb870cc94660eea28ac334f9ab6720f523195b38c",
+    "optimization-test.json": "147262a49f2097103c523b6f86561fe35f4dcb1f0a2c2a332f6f8a617156bf72"
+  },
+  "limitations": [
+    "Not DMC-Optim or a reproduction of the paper's corpus.",
+    "Load increases by batching known cases, not by scaling individual algorithm inputs.",
+    "References share algorithm code; they are not independent correctness oracles.",
+    "No duration-spread qualification or semantic/pretraining decontamination."
+  ],
+  "exclusions": [
+    "sorts/bucket_sort.py: iterable unpacking cannot be used in comprehension (<unknown>, line 105)",
+    "dynamic_programming/catalan_numbers.py: multiple exception types must be parenthesized (<unknown>, line 74)",
+    "data_compression/huffman.py: dict unpacking cannot be used in dict comprehension (<unknown>, line 79)",
+    "web_programming/fetch_well_rx_price.py: multiple exception types must be parenthesized (<unknown>, line 70)",
+    "web_programming/instagram_crawler.py: multiple exception types must be parenthesized (<unknown>, line 54)",
+    "divide_and_conquer/convex_hull.py: multiple exception types must be parenthesized (<unknown>, line 127)",
+    "digital_image_processing/filters/local_binary_pattern.py: multiple exception types must be parenthesized (<unknown>, line 22)",
+    "thealgorithms/divide_and_conquer/heaps_algorithm/heaps: duplicate normalized symbol.",
+    "matrix/median_matrix.py: iterable unpacking cannot be used in comprehension (<unknown>, line 26)",
+    "graphs/hopcroft_karp.py: iterable unpacking cannot be used in comprehension (<unknown>, line 87)",
+    "web_programming/crypto_price_tracker.py: multiple exception types must be parenthesized (<unknown>, line 27)",
+    "dynamic_programming/egg_dropping.py: multiple exception types must be parenthesized (<unknown>, line 69)",
+    "thealgorithms/sorts/shrink_shell_sort/shell_sort: duplicate normalized symbol.",
+    "thealgorithms/sorts/heap_sort/heap_sort: duplicate normalized symbol."
+  ]
+}
