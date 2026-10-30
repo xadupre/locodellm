@@ -436,8 +436,6 @@ def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path, checkpoint_opt
             str(train),
             "--steps",
             "1",
-            "--group-size",
-            "16",
             "--reward",
             "two-gate",
             "--quality-map",
@@ -447,6 +445,9 @@ def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path, checkpoint_opt
     )
     metrics = json.loads((train / "training-metrics.json").read_text())
     assert metrics["optimizer_updates"] == 1
+    records = runner.read_jsonl(train / "train-rank0.jsonl")
+    assert len(records) == 5
+    assert [row["sample"] for row in records] == list(range(5))
     assert (train / "checkpoint-1" / "adapter_config.json").exists()
     adapter = load_file(train / "adapter" / "adapter_model.safetensors")
     assert any(

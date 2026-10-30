@@ -178,13 +178,15 @@ update: record GPU count when comparing runs.
 ## Training
 
 Trains a top-30% **per-test-percentile (QAR), binary collapsed-reward** policy
-on the 100 included training problems, using all idle GPUs. Checkpoints are saved
+on the 100 included training problems, using all idle GPUs and **5 responses per
+problem/group**. Checkpoints are saved
 **every 20 minutes**, after the next completed distributed update:
 
 ```bash
 python papers/code-optimization-2026/run.py train \
   --dataset papers/code-optimization-2026/data/thealgorithms-python/optimization-train.json \
   --model Qwen/Qwen2.5-7B-Instruct --device cuda \
+  --group-size 5 \
   --max-tokens 16384 \
   --output papers/code-optimization-2026/runs/qwen-qar-p30 \
   --allow-code-execution
@@ -192,8 +194,11 @@ python papers/code-optimization-2026/run.py train \
 
 For a tiny functional run, use `--dataset papers/code-optimization-2026/examples/sum.json`
 and `--steps 1 --group-size 2 --max-tokens 32 --repeats 1`.
-Defaults follow the paper where applicable: 16 rollouts, temperature 1, learning
-rate `1e-7`, fixed horizon 32,768 and 10,000 training iterations. The default
+The local default is **5 rollouts per group**, rather than the paper's 16, to
+reduce generation work. With one group per GPU, an iteration generates 35
+responses on 7 GPUs or 40 on 8 GPUs. Other defaults follow the paper where
+applicable: temperature 1, learning rate `1e-7`, fixed horizon 32,768 and 10,000
+training iterations. The default
 generation cap is 32,768; lower it for the model's total context budget.
 `--prompts-per-step` controls groups **per GPU**, not the global batch.
 `--repeats` defaults to 3 independent runs per test.

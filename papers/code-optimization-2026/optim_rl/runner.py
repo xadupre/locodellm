@@ -619,7 +619,9 @@ def parser():
     )
     result.add_argument("--blend", type=float, default=0.5)
     result.add_argument("--steps", type=int, default=10000)
-    result.add_argument("--group-size", type=int, default=16)
+    result.add_argument(
+        "--group-size", type=int, default=5, help="Training responses per problem (default: 5)."
+    )
     result.add_argument(
         "--prompts-per-step", type=int, default=1, help="Groups per GPU per iteration."
     )
