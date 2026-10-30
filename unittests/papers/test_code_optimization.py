@@ -391,6 +391,9 @@ def test_cpu_cli_training_evaluation_and_offline_replay(tmp_path, checkpoint_opt
     assert any(
         "lora_B" in key and tensor.abs().max().item() > 0 for key, tensor in adapter.items()
     )
+    baseline = tmp_path / "baseline"
+    runner.main(["evaluate", *common, "--output", str(baseline)])
+    assert json.loads((baseline / "metrics.json").read_text())["samples"] == 2
     evaluate = tmp_path / "evaluate"
     runner.main(
         ["evaluate", *common, "--output", str(evaluate), "--adapter", str(train / "adapter")]
@@ -434,6 +437,55 @@ def test_invalid_inputs_and_execution_opt_in(tmp_path):
     assert not (tmp_path / "run").exists()
     with pytest.raises(ValueError, match="finite"):
         environment.Environment(timeout=math.nan)
+
+
+@pytest.mark.parametrize("kind", ["relative-missing", "absolute-missing", "incomplete", "empty"])
+def test_local_adapter_rejected_before_dataset_loading(tmp_path, capsys, kind):
+    adapter = tmp_path / "adapter"
+    if kind == "incomplete":
+        adapter.mkdir()
+    value = str(adapter)
+    if kind == "relative-missing":
+        value = f"missing-{tmp_path.name}/run/adapter"
+    elif kind == "empty":
+        value = ""
+    output = tmp_path / "output"
+    with pytest.raises(SystemExit) as error:
+        runner.main(
+            [
+                "evaluate",
+                "--dataset",
+                str(tmp_path / "missing-dataset.json"),
+                "--output",
+                str(output),
+                "--adapter",
+                value,
+                "--allow-code-execution",
+            ]
+        )
+    assert error.value.code == 2
+    message = capsys.readouterr().err
+    assert "adapter" in message
+    assert "missing-dataset" not in message
+    assert not output.exists()
+
+
+def test_remote_adapter_id_is_not_treated_as_a_missing_local_path(tmp_path):
+    output = tmp_path / "output"
+    with pytest.raises(FileNotFoundError, match="missing-dataset"):
+        runner.main(
+            [
+                "evaluate",
+                "--dataset",
+                str(tmp_path / "missing-dataset.json"),
+                "--output",
+                str(output),
+                "--adapter",
+                "organization/adapter",
+                "--allow-code-execution",
+            ]
+        )
+    assert not output.exists()
 
 
 def test_prompt_keeps_private_verification_material_hidden():

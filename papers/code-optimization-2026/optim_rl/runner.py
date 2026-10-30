@@ -478,7 +478,11 @@ def parser():
     )
     result.add_argument("--output", required=True, help="New, absent output directory.")
     result.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    result.add_argument("--adapter")
+    result.add_argument(
+        "--adapter",
+        help="Existing local adapter directory (use ./ for local paths) or Hugging Face ID. "
+        "Omit to evaluate the base model.",
+    )
     result.add_argument(
         "--device", default="cuda", help="cuda: all idle visible GPUs; cpu; cuda:N."
     )
@@ -573,13 +577,38 @@ def main(argv=None):
         cli.error("--calibration is required for offline commands.")
     if args.command == "replay" and not args.records:
         cli.error("--records is required for replay.")
+    if args.command in ("train", "evaluate") and args.adapter is not None:
+        if not args.adapter.strip():
+            cli.error("--adapter must not be empty; omit it to evaluate the base model.")
+        adapter = Path(args.adapter).expanduser()
+        local = (
+            adapter.exists()
+            or adapter.is_absolute()
+            or args.adapter.startswith((".", "~"))
+            or len(adapter.parts) > 2
+        )
+        if local:
+            if not adapter.is_dir():
+                cli.error(
+                    f"Local adapter directory does not exist: {adapter}. "
+                    "Train first, select an existing checkpoint, or omit --adapter "
+                    "to evaluate the base model."
+                )
+            if not (adapter / "adapter_config.json").is_file():
+                cli.error(f"Local adapter directory has no adapter_config.json: {adapter}")
+            args.adapter = str(adapter.resolve())
+    output = Path(args.output)
+    if output.exists():
+        raise FileExistsError(
+            f"--output already exists: {output}. Choose a new directory; "
+            "previous results are never overwritten."
+        )
     tasks = load_tasks(args.dataset, args.limit)
     calibration_records = read_jsonl(args.calibration) if args.calibration else []
     if args.command in ("simulate", "replay"):
         validate_calibration(tasks, calibration_records)
     devices = discover_devices(args.device) if args.command in ("train", "evaluate") else ["cpu"]
     cpus = verification_cpus(len(devices)) if live else []
-    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     config = {
         **vars(args),

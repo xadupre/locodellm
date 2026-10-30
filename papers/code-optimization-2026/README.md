@@ -298,20 +298,28 @@ state are not restored. Only weights/tokenizer and update metadata are saved.
 
 ## Baseline and trained evaluation
 
-Evaluates the saved adapter on the 100 held-out problems using all idle GPUs:
+Evaluates the **base model** on the 100 held-out problems using all idle GPUs.
+This command works **before training**; no adapter is required:
 
 ```bash
 python papers/code-optimization-2026/run.py evaluate \
   --dataset papers/code-optimization-2026/data/thealgorithms-python/optimization-test.json \
   --model Qwen/Qwen2.5-7B-Instruct --device cuda \
-  --adapter papers/code-optimization-2026/runs/qwen-qar-p30/adapter \
   --samples 20 --pass-k 1 10 --max-tokens 16384 \
-  --output papers/code-optimization-2026/runs/qwen-qar-p30-test \
+  --output papers/code-optimization-2026/runs/qwen-baseline \
   --allow-code-execution
 ```
 
-For the base-model comparison, omit `--adapter` and change `--output` to
-`papers/code-optimization-2026/runs/qwen-baseline`.
+**After training**, add
+`--adapter papers/code-optimization-2026/runs/qwen-qar-p30/adapter`
+and change `--output` to `papers/code-optimization-2026/runs/qwen-qar-p30-test`.
+That adapter directory only exists after a completed training run; an interrupted
+run may instead have a usable `checkpoint-<update>/`. Missing local adapters are
+rejected before model loading, GPU selection or output creation: evaluation never
+silently falls back to the base model.
+
+Each `--output` must be a **new directory**. Failed run directories are retained
+for diagnosis; choose a different output path when retrying.
 
 Evaluation always runs **all** optimization tests under the 10-second cap and
 computes QP, independent of the selected training environment. `evaluate.jsonl`
