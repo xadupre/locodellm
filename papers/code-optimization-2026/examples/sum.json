@@ -1,0 +1,19 @@
+[
+  {
+    "task_id": "sum-positive-integers",
+    "problem": "Read one positive integer n from standard input. Print the sum of the integers from 1 through n.",
+    "correctness_tests": [
+      {"input": "1\n", "output": "1\n"},
+      {"input": "10\n", "output": "55\n"}
+    ],
+    "optimization_tests": [
+      {"input": "100000\n", "output": "5000050000\n"},
+      {"input": "1000000\n", "output": "500000500000\n"}
+    ],
+    "references": [
+      "n = int(input())\nprint(n * (n + 1) // 2)\n",
+      "n = int(input())\nprint(sum(range(n + 1)))\n",
+      "n = int(input())\nresult = 0\nfor value in range(n + 1):\n    result += value\nprint(result)\n"
+    ]
+  }
+]
