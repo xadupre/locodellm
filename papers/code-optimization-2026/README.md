@@ -82,8 +82,25 @@ batch of calls, each with `args` and `kwargs`; stdout is the ordered JSON result
 array. Two correctness batches and two larger batches of **64 and 256 calls**
 are included. Both reference programs passed **every** included test.
 
-The references use the same upstream algorithm: one evaluates every call, the
-other memoizes repeated arguments within the batch. Entire top-level source
+**The dataset contains reference programs, not just model responses.** Each
+problem's JSON `references` field contains two complete Python programs:
+
+| Program | Origin and behavior | Role |
+|---|---|---|
+| Reference 0 | Extracted upstream algorithm, executed separately for every call without caching | Fixed timing control |
+| Reference 1 | Same algorithm, memoizing repeated arguments within each input batch | Fixed timing control |
+| Model responses | Newly generated programs, e.g. five per problem with `--samples 5` | Candidates being evaluated |
+
+Both references are executed on the worker's assigned CPU, and their measured
+times are stored in the `calibration*.jsonl` files. Here, "calibration" means
+**measuring reference execution times**, not calibrating the model. Each candidate
+is timed and ranked against these two references, **not against the other sampled
+responses or the initial Qwen model**. The references and private tests are not
+included in the model prompt.
+
+The two references use the same upstream algorithm; the memoized wrapper can
+benefit from the repeated calls in these batches, without improving the
+underlying algorithm. Entire top-level source
 categories are assigned to just one split, so source files, function names and
 categories do not cross the train/test boundary. This is a category-held-out
 split, not a stratified random split. `manifest.json` records provenance, split
@@ -177,7 +194,7 @@ update: record GPU count when comparing runs.
 
 ## Training
 
-Trains a top-30% **per-test-percentile (QAR), binary collapsed-reward** policy
+Trains a **reference-relative QAR policy at threshold 0.3 with binary collapsed reward**
 on the 100 included training problems, using all idle GPUs and **5 responses per
 problem/group**. Checkpoints are saved
 **every 20 minutes**, after the next completed distributed update:
@@ -267,8 +284,9 @@ Correctness tests always retain the separate 10-second cap.
 | `blend` | `blend*(2*c-1) + (1-blend)*(2*m-1)` | Yes |
 | `multitask` | 50/50 correctness or optimization stream, chosen per prompt group | Yes in optimization-only groups |
 
-For the default binary collapsed reward, a strictly correct top-30% candidate
-gets **+1**, a correct but slower candidate **-1**, and an incorrect candidate
+For the default binary collapsed reward, a strictly correct candidate meeting
+the configured ranking threshold gets **+1**, a correct candidate outside that
+threshold **-1**, and an incorrect candidate
 **-1** regardless of speed. For `--reward two-gate --quality-map linear`, a
 strictly correct candidate at `q=0.2` gets **0.8**, while incorrect code gets **-1**.
 The `--blend` weight defaults to 0.5.
@@ -352,6 +370,32 @@ For each task with `n` samples and `m` qualifying successes, pass@k is
 only, allowing optimization timeouts but not failures. p50/p30/p10 also require
 QP <= 0.5/0.3/0.1. The metric is a mean over problems, not a pooled sample rate.
 Use validation data for checkpoint selection; do not select on the final test set.
+
+### What p30 means with this dataset's two references
+
+**p30 is a reference-ranking threshold, not "30% faster".** Evaluation first
+averages each participant's normalized timing ranks across optimization tests,
+then computes QP as the fraction of references with a strictly better average
+rank than the candidate. A smaller QP is better; ties are not counted as better.
+
+With exactly two references, QP can only be **0, 0.5 or 1**:
+
+| References with a strictly better average rank | Candidate QP | Passes the p30 speed gate? |
+|---|---:|---|
+| Neither | 0 | Yes |
+| One | 0.5 | No |
+| Both | 1 | No |
+
+Consequently, **p30 and p10 select exactly the same candidates in this dataset**.
+They are coarse comparisons against two fixed controls, not evidence of ranking
+in the fastest 30% or 10% of a large population of solutions. Correctness is still
+required separately. `p30/pass@3` estimates the probability of at least one
+correct response meeting that reference-relative gate among three sampled
+responses; it does not rank those three against one another.
+
+Training uses QAR (mean per-test rank), whereas evaluation uses QP (the additional
+reference-leaderboard ranking). Their numerical thresholds need not select the
+same candidates, even when both are set to 0.3.
 
 ## CPU calibration, offline screening and trace replay
 
