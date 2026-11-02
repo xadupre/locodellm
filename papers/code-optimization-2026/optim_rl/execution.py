@@ -64,8 +64,18 @@ def extract_code(text):
     return "\n\n".join(block.strip() for block in blocks) if blocks else text.strip()
 
 
-def execute(source, case, *, timeout, cpu=None):
-    """Times execution excluding interpreter startup, with tokenwise output comparison."""
+def normalized_output(text, comparison):
+    """Normalizes output tokens or JSON without changing JSON string contents."""
+    if comparison == "tokens":
+        return text.split()
+    if comparison == "json":
+        return json.dumps(json.loads(text), sort_keys=True, allow_nan=False)
+    raise ValueError(f"Unknown output comparison mode: {comparison}")
+
+
+def execute(source, case, *, timeout, cpu=None, comparison="tokens"):
+    """Times execution excluding interpreter startup, with explicit output comparison."""
+    expected = normalized_output(case["output"], comparison)
     with tempfile.TemporaryDirectory(prefix="code-optim-") as directory:
         path = Path(directory)
         (path / "payload.json").write_text(
@@ -120,11 +130,15 @@ def execute(source, case, *, timeout, cpu=None):
                 "seconds": max(1e-9, result["seconds"]),
                 "error": "Candidate output is not valid UTF-8.",
             }
-        status = (
-            "passed"
-            if (result["exit_code"] in (0, None) and actual.split() == case["output"].split())
-            else "failed"
-        )
+        try:
+            matches = normalized_output(actual, comparison) == expected
+        except (ValueError, RecursionError) as error:
+            return {
+                "status": "failed",
+                "seconds": max(1e-9, result["seconds"]),
+                "error": f"Candidate output is not valid finite JSON: {error}",
+            }
+        status = "passed" if (result["exit_code"] in (0, None) and matches) else "failed"
         return {
             "status": status,
             "seconds": max(1e-9, result["seconds"]),
@@ -132,9 +146,12 @@ def execute(source, case, *, timeout, cpu=None):
         }
 
 
-def measure(source, case, *, timeout, repeats, cpu):
+def measure(source, case, *, timeout, repeats, cpu, comparison="tokens"):
     """Returns median timings only if every independent repetition passes."""
-    records = [execute(source, case, timeout=timeout, cpu=cpu) for _ in range(repeats)]
+    records = [
+        execute(source, case, timeout=timeout, cpu=cpu, comparison=comparison)
+        for _ in range(repeats)
+    ]
     failed = next((record for record in records if record["status"] == "failed"), None)
     timed_out = next((record for record in records if record["status"] == "timeout"), None)
     if failed is not None:
@@ -146,15 +163,20 @@ def measure(source, case, *, timeout, repeats, cpu):
 
 def calibrate(task, *, timeout, repeats, cpu):
     """Remeasures every reference on the same worker CPU as generated candidates."""
+    comparison = task.get("output_comparison", "tokens")
     matrix = []
     for reference_index, source in enumerate(task["references"]):
         for case in task["correctness_tests"]:
-            record = measure(source, case, timeout=timeout, repeats=repeats, cpu=cpu)
+            record = measure(
+                source, case, timeout=timeout, repeats=repeats, cpu=cpu, comparison=comparison
+            )
             if record["status"] != "passed":
                 raise ValueError(f"Reference {reference_index} failed correctness: {record}")
         durations = []
         for case in task["optimization_tests"]:
-            record = measure(source, case, timeout=timeout, repeats=repeats, cpu=cpu)
+            record = measure(
+                source, case, timeout=timeout, repeats=repeats, cpu=cpu, comparison=comparison
+            )
             if record["status"] != "passed":
                 raise ValueError(f"Reference {reference_index} failed optimization: {record}")
             durations.append(record["seconds"])
@@ -164,8 +186,9 @@ def calibrate(task, *, timeout, repeats, cpu):
 
 def verify(source, task, references, env, *, repeats, cpu, optimization_stream=False):
     """Executes selected tests and computes correctness-gated reference-ranked rewards."""
+    comparison = task.get("output_comparison", "tokens")
     correctness = [
-        measure(source, case, timeout=10.0, repeats=repeats, cpu=cpu)
+        measure(source, case, timeout=10.0, repeats=repeats, cpu=cpu, comparison=comparison)
         for case in task["correctness_tests"]
     ]
     keep, deadlines = test_plan(task, references, env)
@@ -176,6 +199,7 @@ def verify(source, task, references, env, *, repeats, cpu, optimization_stream=F
             timeout=deadlines[index],
             repeats=repeats,
             cpu=cpu,
+            comparison=comparison,
         )
         for index in keep
     ]

@@ -260,6 +260,58 @@ def test_execution_deadline_excludes_worker_shutdown():
     assert result["status"] == "timeout"
 
 
+@pytest.mark.parametrize(
+    "actual,status",
+    [
+        ('["Hello  world", {"count": 1}]', "failed"),
+        (' [ "Hello world" , { "count" : 1 } ] ', "passed"),
+        (r'["Hello\u0020world", {"count": 1}]', "passed"),
+        ('["Hello world", {"count": true}]', "failed"),
+        ('["Hello world", {"count": "1"}]', "failed"),
+        ("not JSON", "failed"),
+        ('["Hello world", {"count": NaN}]', "failed"),
+        ("[" * 1100 + "0" + "]" * 1100, "failed"),
+    ],
+)
+def test_json_output_preserves_strings_and_types(actual, status):
+    case = {"input": "", "output": '["Hello world", {"count": 1}]\n'}
+    result = execution.execute(f"print({actual!r})", case, timeout=1, comparison="json")
+    assert result["status"] == status, result
+    if actual == "not JSON" or "NaN" in actual:
+        assert "not valid finite JSON" in result["error"]
+
+
+def test_token_output_comparison_remains_whitespace_insensitive():
+    result = execution.execute(
+        "print('Hello  world')", {"input": "", "output": "Hello world\n"}, timeout=1
+    )
+    assert result["status"] == "passed"
+    with pytest.raises(ValueError, match="comparison mode"):
+        execution.execute("", {"input": "", "output": ""}, timeout=1, comparison="unknown")
+
+
+def test_json_comparison_applies_to_reference_and_candidate_verification():
+    sample = task()
+    sample["output_comparison"] = "json"
+    sample["correctness_tests"] = [{"input": "", "output": '["Hello world"]\n'}]
+    sample["optimization_tests"] = list(sample["correctness_tests"])
+    sample["references"] = [
+        """print('["Hello world"]')""",
+        """value = ["Hello world"]\nimport json\nprint(json.dumps(value))""",
+    ]
+    matrix = execution.calibrate(sample, timeout=1, repeats=1, cpu=None)
+    wrong = """print('["Hello  world"]')"""
+    record = execution.verify(
+        wrong, sample, matrix, environment.Environment(), repeats=1, cpu=None
+    )
+    assert not record["correct"] and not record["strict_correct"]
+    assert record["reward"] == -1
+    sample["references"][0] = wrong
+    with pytest.raises(ValueError, match="failed correctness"):
+        execution.calibrate(sample, timeout=1, repeats=1, cpu=None)
+    assert "reference 0, correctness_tests" in algorithm_data.validate_task(sample)
+
+
 def test_calibration_and_hidden_optimization_failures():
     sample = task()
     matrix = execution.calibrate(sample, timeout=1, repeats=1, cpu=None)
@@ -459,6 +511,7 @@ def make_tiny_policy(path, *, attention_dropout=0.0):
 
 def test_policy_checkpointed_training_and_eval_rollouts(tmp_path):
     torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
     torch.set_num_threads(1)
     policy = importlib.import_module(f"{PACKAGE}.policy")
     objective = importlib.import_module(f"{PACKAGE}.objective")
@@ -500,6 +553,45 @@ def test_policy_checkpointed_training_and_eval_rollouts(tmp_path):
         assert not model.training
     finally:
         hook.remove()
+
+
+def test_rollout_probabilities_match_loss_with_inherited_repetition_penalty(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    torch.set_num_threads(1)
+    policy = importlib.import_module(f"{PACKAGE}.policy")
+    objective = importlib.import_module(f"{PACKAGE}.objective")
+    path = tmp_path / "model"
+    make_tiny_policy(path)
+    model, tokenizer = policy.load_policy(str(path), None, "cpu", train=False)
+    model.generation_config.repetition_penalty = 2.0
+
+    class ScoredPolicy(torch.nn.Module):
+        """Exposes real generation scores without changing sampling behavior."""
+
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+            self.train(model.training)
+
+        def generate(self, **kwargs):
+            """Captures processed logits while returning the usual sequence tensor."""
+            result = self.model.generate(
+                **kwargs, return_dict_in_generate=True, output_scores=True
+            )
+            self.scores = result.scores
+            return result.sequences
+
+    scored = ScoredPolicy(model)
+    prompt = policy.prompt_tokens(tokenizer, task(), "cpu")
+    args = SimpleNamespace(temperature=0.7, max_tokens=4)
+    tokens, _ = policy.sample(scored, tokenizer, prompt, args)
+    length = prompt["input_ids"].shape[1]
+    scores = torch.stack(scored.scores, dim=1)
+    sampled = scores.log_softmax(-1).gather(-1, tokens[:, length:].unsqueeze(-1)).squeeze(-1)
+    with torch.no_grad():
+        recomputed = objective.log_probs(model, tokens, length, args.temperature)
+    torch.testing.assert_close(sampled, recomputed)
 
 
 @pytest.mark.parametrize(
@@ -716,6 +808,9 @@ def test_invalid_inputs_and_execution_opt_in(tmp_path):
     assert not (tmp_path / "run").exists()
     with pytest.raises(ValueError, match="finite"):
         environment.Environment(timeout=math.nan)
+    dataset.write_text(json.dumps([{**task(), "output_comparison": "unknown"}]))
+    with pytest.raises(ValueError, match="output_comparison"):
+        runner.load_tasks(dataset)
 
 
 @pytest.mark.parametrize(

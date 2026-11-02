@@ -157,11 +157,15 @@ is 10 seconds per reference/test, matching calibration. No GPU is needed.
 Provide at least one test of each kind and two known-correct reference programs.
 Each reference must pass every correctness and optimization test within the
 10-second calibration cap; otherwise the run fails explicitly. Output comparison
-is whitespace-token exact, not floating-point tolerant. Only `problem` goes
-into the model prompt: reference code, expected outputs and hidden tests do not.
+defaults to whitespace-token exact, not floating-point tolerant. JSON-batch tasks,
+including the committed corpus, set `"output_comparison": "json"` to compare
+normalized JSON while preserving string contents and value types. Only `problem`
+goes into the model prompt: reference code, expected outputs and hidden tests do not.
 Separate training and evaluation datasets yourself, including related-problem
 decontamination. The input file and per-task content receive SHA-256 identities;
 offline commands reject calibration for changed task content.
+Changing the comparison mode changes the task identity; regenerate calibration
+and response artifacts rather than reusing token-based verdicts as JSON verdicts.
 
 `examples/sum.json` is a runnable, tiny integration example, **not DMC-Optim or a
 valid performance benchmark**. Prepare real large-input optimization workloads
@@ -398,6 +402,10 @@ reference-leaderboard ranking). Their numerical thresholds need not select the
 same candidates, even when both are set to 0.3.
 
 ### Local checkpoint evaluation (2026-10-30)
+
+These historical runs predate JSON-aware output comparison and explicit
+neutralization of inherited repetition penalties. Re-evaluate the base model
+and checkpoints before comparing results with the current implementation.
 
 The base `Qwen/Qwen2.5-7B-Instruct` model and five LoRA checkpoints were evaluated
 on the **same 100 held-out TheAlgorithms/Python problems**, with **5 responses per

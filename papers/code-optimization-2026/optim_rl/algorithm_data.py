@@ -264,6 +264,7 @@ def candidates(path, root, license_text):
         )
         yield {
             "task_id": f"thealgorithms/{relative[:-3]}/{function.name}",
+            "output_comparison": "json",
             "problem": problem,
             "correctness_tests": [
                 batch_case(cases, len(cases)),
@@ -289,7 +290,12 @@ def validate_task(task, timeout=10.0):
     for index, reference in enumerate(task["references"]):
         for kind in ("correctness_tests", "optimization_tests"):
             for case in task[kind]:
-                result = execute(reference, case, timeout=timeout)
+                result = execute(
+                    reference,
+                    case,
+                    timeout=timeout,
+                    comparison=task.get("output_comparison", "tokens"),
+                )
                 if result["status"] != "passed":
                     return f"reference {index}, {kind}: {result}"
     return None

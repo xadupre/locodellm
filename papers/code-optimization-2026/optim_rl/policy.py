@@ -86,6 +86,7 @@ def sample(model, tokenizer, prompt, args):
                 temperature=args.temperature,
                 top_k=0,
                 top_p=1.0,
+                repetition_penalty=1.0,
                 max_new_tokens=args.max_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 use_cache=True,

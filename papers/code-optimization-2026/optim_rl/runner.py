@@ -43,6 +43,8 @@ def load_tasks(path, limit=None):
         ids.add(task_id)
         if not isinstance(task.get("problem"), str) or not task["problem"].strip():
             raise ValueError("Every task needs a nonempty problem statement.")
+        if task.get("output_comparison", "tokens") not in ("tokens", "json"):
+            raise ValueError("output_comparison must be tokens or json.")
         for field in ("correctness_tests", "optimization_tests"):
             tests = task.get(field)
             if (
