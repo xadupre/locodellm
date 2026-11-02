@@ -135,7 +135,11 @@ def prepare_references(rank, args, tasks, devices, cpu, model, tokenizer):
                     None
                     if duplicate
                     else reference_measurements(
-                        source, task, timeout=args.timeout, repeats=args.repeats, cpu=cpu
+                        source,
+                        task,
+                        timeout=min(args.timeout, 10.0),
+                        repeats=args.repeats,
+                        cpu=cpu,
                     )
                 )
                 accepted = measurements is not None and all(
