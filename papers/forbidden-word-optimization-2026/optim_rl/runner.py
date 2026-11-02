@@ -873,7 +873,11 @@ def main(argv=None):
         metrics = simulate(tasks, calibration_records, env, seed=args.seed)
         (output / "simulation.json").write_text(json.dumps(metrics, indent=2) + "\n")
     else:
-        records = replay(tasks, calibration_records, read_jsonl(args.records), env)
+        replay_records = read_jsonl(args.records)
+        if args.limit is not None:
+            selected_ids = {task["task_id"] for task in tasks}
+            replay_records = [row for row in replay_records if row["task_id"] in selected_ids]
+        records = replay(tasks, calibration_records, replay_records, env)
         with (output / "replay.jsonl").open("w") as stream:
             for row in records:
                 write_record(stream, row)
