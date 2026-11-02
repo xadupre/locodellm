@@ -23,6 +23,7 @@ import os
 import resource
 import sys
 import time
+import types
 from pathlib import Path
 
 directory = Path(sys.argv[1])
@@ -39,16 +40,20 @@ sys.stdin = (directory / "input.txt").open()
 sys.stdout = (directory / "stdout.txt").open("w")
 os.dup2(sys.stdin.fileno(), 0)
 os.dup2(sys.stdout.fileno(), 1)
+candidate = types.ModuleType("__main__")
+sys.modules["__main__"] = candidate
 (directory / "ready").touch()
 started = time.perf_counter()
 exit_code = 0
 try:
-    exec(code, {"__name__": "__main__"})
+    exec(code, candidate.__dict__)
 except SystemExit as error:
     exit_code = error.code
 sys.stdout.flush()
 elapsed = time.perf_counter() - started
-(directory / "result.json").write_text(json.dumps({"seconds": elapsed, "exit_code": exit_code}))
+result = directory / "result.tmp"
+result.write_text(json.dumps({"seconds": elapsed, "exit_code": exit_code}))
+result.replace(directory / "result.json")
 """
 
 
@@ -67,6 +72,7 @@ def execute(source, case, *, timeout, cpu=None):
             json.dumps({"source": source, "cpu": cpu, "cpu_seconds": math.ceil(timeout) + 1})
         )
         (path / "input.txt").write_text(case["input"])
+        result_path = path / "result.json"
         with (path / "stderr.txt").open("w") as stderr:
             process = subprocess.Popen(
                 [sys.executable, "-I", "-c", WORKER, directory],
@@ -84,17 +90,19 @@ def execute(source, case, *, timeout, cpu=None):
                     if time.monotonic() >= startup_deadline:
                         raise RuntimeError("Verification worker did not start within 10 seconds.")
                     time.sleep(0.001)
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
+                deadline = time.monotonic() + timeout
+                while not result_path.exists() and process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    time.sleep(0.001)
             finally:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-        if timed_out:
+        if timed_out and not result_path.exists():
             return {"status": "timeout", "seconds": timeout}
-        result_path = path / "result.json"
-        if process.returncode != 0 or not result_path.exists():
+        if not result_path.exists():
             return {
                 "status": "failed",
                 "seconds": timeout,

@@ -461,9 +461,10 @@ python papers/code-optimization-2026/run.py simulate \
 `simulation.json` contains the quality-band activation/reward curves, raw and
 smoothed AUC, clipped-linear steepness, moving-average variance, diagonal
 deviation and Spearman ordering diagnostics (appendix E.2). The sampler moves
-from slower to faster verified references; it does not simulate gradients,
-correctness learning or predict the paper's benchmark gains. Constant curves
-report null, not a fabricated correlation.
+from the slowest to the fastest verified reference, interpolating sampling
+probabilities between adjacent ranks even for two-reference pools; it does not
+simulate gradients, correctness learning or predict the paper's benchmark gains.
+Constant curves report null, not a fabricated correlation.
 
 Replays a full evaluation trace through another environment/reward without
 rerunning programs:
@@ -477,7 +478,10 @@ python papers/code-optimization-2026/run.py replay \
   --output papers/code-optimization-2026/runs/qwen-replay
 ```
 
-Replay requires complete optimization traces and matching task identities.
+Replay requires complete optimization traces and response records bound to both
+the task content and the exact calibration record by SHA-256 identities. Older
+traces without these identities must be regenerated; matching task IDs and
+reference keys alone are not sufficient.
 It preserves observed hard failures, supports tighter deadlines, and rejects
 deadlines above the original 10-second recording cap. It cannot infer what
 happened after a censored timeout. `replay.jsonl` contains the rescored records.

@@ -72,10 +72,11 @@ def simulate(tasks, calibration, env, *, seed=42, bands=20, draws=100):
         returns = []
         for task, matrix, keep, deadlines, order in prepared:
             center = (1 - ability) * (len(order) - 1)
-            low = max(0, math.floor(center - 0.1 * len(order)))
-            high = min(len(order), math.ceil(center + 0.1 * len(order)) + 1)
+            low = math.floor(center)
+            high = math.ceil(center)
             for _ in range(draws):
-                row = matrix[rng.choice(order[low:high])]
+                index = high if rng.random() < center - low else low
+                row = matrix[order[index]]
                 optimization = [
                     {
                         "status": "timeout" if row[index] >= deadlines[index] else "passed",

@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -231,6 +232,13 @@ def test_eight_gpu_selection_and_prompt_scheduling():
         ("raise RuntimeError('candidate failed')", "failed"),
         ("print(1)\nraise SystemExit(0)", "passed"),
         ("print(1)\nraise SystemExit(2)", "failed"),
+        (
+            (
+                "import pickle\nclass Record:\n    pass\n"
+                "print(int(isinstance(pickle.loads(pickle.dumps(Record())), Record)))"
+            ),
+            "passed",
+        ),
         ("while True:\n    pass", "timeout"),
     ],
 )
@@ -238,6 +246,18 @@ def test_real_stdin_stdout_execution(source, status):
     result = execution.execute(source, task()["correctness_tests"][0], timeout=0.1)
     assert result["status"] == status
     assert 0 < result["seconds"] <= 0.1
+
+
+def test_execution_deadline_excludes_worker_shutdown():
+    source = "import atexit, time\natexit.register(time.sleep, 0.5)\nprint(1)"
+    for _ in range(3):
+        result = execution.execute(source, task()["correctness_tests"][0], timeout=0.001)
+        assert result["status"] == "passed", result
+        assert result["seconds"] < 0.001
+    result = execution.execute(
+        "import time\ntime.sleep(0.02)\nprint(1)", task()["correctness_tests"][0], timeout=0.001
+    )
+    assert result["status"] == "timeout"
 
 
 def test_calibration_and_hidden_optimization_failures():
@@ -258,12 +278,13 @@ def test_replay_simulator_and_pass_at_k():
     correct = [{"status": "passed", "seconds": 0.1}]
     optimization = [{"status": "passed", "seconds": 1.5}]
     env = environment.Environment(family="qp", quality_map="binary")
+    calibration = [runner.calibration_record("ref", sample, matrix, None)]
     row = {
         "task_id": sample["task_id"],
         "reference_key": "ref",
+        **runner.response_identity(sample, calibration[0]),
         **environment.summarize(sample, matrix, env, correct, optimization),
     }
-    calibration = [{"key": "ref", "task_id": sample["task_id"], "durations": matrix}]
     assert runner.replay([sample], calibration, [row], env)[0] == row
     record = runner.replay(
         [sample], calibration, [row], replace(env, family="timeout", timeout=1, tolerance=0)
@@ -280,6 +301,50 @@ def test_replay_simulator_and_pass_at_k():
     assert result["activation_curve"][-1] > result["activation_curve"][0]
     assert result["diagnostics"]["steepness"] > 0
     assert simulation.diagnostics([1, 1, 1])["spearman"] is None
+
+
+@pytest.mark.parametrize("change", ["task", "calibration", "task_sha256", "calibration_sha256"])
+def test_replay_rejects_stale_response_identities(change):
+    sample = task()
+    matrix = [[1], [2]]
+    reference = runner.calibration_record("r0-t0", sample, matrix, None)
+    env = environment.Environment(family="qp")
+    row = {
+        "task_id": sample["task_id"],
+        "reference_key": reference["key"],
+        **runner.response_identity(sample, reference),
+        **environment.summarize(
+            sample,
+            matrix,
+            env,
+            [{"status": "passed", "seconds": 0.1}],
+            [{"status": "passed", "seconds": 0.5}],
+        ),
+    }
+    if change == "task":
+        sample["correctness_tests"][0]["output"] = "different answer"
+        reference = runner.calibration_record("r0-t0", sample, matrix, None)
+    elif change == "calibration":
+        reference = runner.calibration_record("r0-t0", sample, [[0.1], [0.2]], None)
+    else:
+        del row[change]
+    with pytest.raises(ValueError, match="Evaluation record does not match"):
+        runner.replay([sample], [reference], [row], env)
+
+
+@pytest.mark.parametrize("matrix", [[[1], [2]], [[2], [1]]])
+def test_simulator_distinguishes_two_reference_quality_bands(matrix):
+    pytest.importorskip("scipy")
+    sample = task()
+    reference = runner.calibration_record("ref", sample, matrix, None)
+    result = simulation.simulate(
+        [sample], [reference], environment.Environment(family="qp"), bands=3, draws=200
+    )
+    curve = result["activation_curve"]
+    assert curve[0] == 0
+    assert curve[1] == pytest.approx(0.5, abs=0.15)
+    assert curve[-1] == 1
+    assert result["mean_reward_curve"][0] < result["mean_reward_curve"][-1]
 
 
 def test_calibration_identity_and_duplicate_keys():
@@ -356,7 +421,7 @@ def test_evaluation_metrics_reject_nonfinite_measurements(field):
         runner.evaluation_metrics([row], [1])
 
 
-def make_tiny_policy(path):
+def make_tiny_policy(path, *, attention_dropout=0.0):
     """Creates a real offline Qwen3 checkpoint emitting runnable one-token programs."""
     torch = pytest.importorskip("torch")
     pytest.importorskip("peft")
@@ -385,10 +450,56 @@ def make_tiny_policy(path):
             max_position_embeddings=512,
             eos_token_id=1,
             pad_token_id=2,
+            attention_dropout=attention_dropout,
         )
     )
     model.save_pretrained(path)
     return tokenizer
+
+
+def test_policy_checkpointed_training_and_eval_rollouts(tmp_path):
+    torch = pytest.importorskip("torch")
+    torch.set_num_threads(1)
+    policy = importlib.import_module(f"{PACKAGE}.policy")
+    objective = importlib.import_module(f"{PACKAGE}.objective")
+    path = tmp_path / "model"
+    make_tiny_policy(path, attention_dropout=0.4)
+    model, tokenizer = policy.load_policy(str(path), None, "cpu", train=True)
+    assert model.training and model.is_gradient_checkpointing
+    assert all(
+        module.p == 0 for module in model.modules() if isinstance(module, torch.nn.Dropout)
+    )
+    assert model.config.attention_dropout == 0
+    layer = model.get_base_model().model.layers[0]
+    calls = []
+
+    def record_mode(module, inputs):
+        """Records real decoder invocations, including checkpoint recomputation."""
+        calls.append((module.training, torch.is_grad_enabled()))
+
+    hook = layer.register_forward_pre_hook(record_mode)
+    try:
+        prompt = policy.prompt_tokens(tokenizer, task(), "cpu")
+        tokens, _ = policy.sample(
+            model, tokenizer, prompt, SimpleNamespace(temperature=1.0, max_tokens=1)
+        )
+        assert calls and all(not training and not gradients for training, gradients in calls)
+        assert model.training
+        calls.clear()
+        length = prompt["input_ids"].shape[1]
+        current = objective.log_probs(model, tokens, length, 1.0)
+        current.sum().backward()
+        assert len(calls) >= 2
+        assert all(training and gradients for training, gradients in calls)
+        assert any(parameter.grad is not None for parameter in model.parameters())
+        model.eval()
+        with torch.no_grad():
+            expected = objective.log_probs(model, tokens, length, 1.0)
+        torch.testing.assert_close(current.detach(), expected)
+        policy.sample(model, tokenizer, prompt, SimpleNamespace(temperature=1.0, max_tokens=1))
+        assert not model.training
+    finally:
+        hook.remove()
 
 
 @pytest.mark.parametrize(
@@ -607,11 +718,15 @@ def test_invalid_inputs_and_execution_opt_in(tmp_path):
         environment.Environment(timeout=math.nan)
 
 
-@pytest.mark.parametrize("kind", ["relative-missing", "absolute-missing", "incomplete", "empty"])
+@pytest.mark.parametrize(
+    "kind", ["relative-missing", "absolute-missing", "incomplete", "config-only", "empty"]
+)
 def test_local_adapter_rejected_before_dataset_loading(tmp_path, capsys, kind):
     adapter = tmp_path / "adapter"
-    if kind == "incomplete":
+    if kind in ("incomplete", "config-only"):
         adapter.mkdir()
+    if kind == "config-only":
+        (adapter / "adapter_config.json").write_text("{}")
     value = str(adapter)
     if kind == "relative-missing":
         value = f"missing-{tmp_path.name}/run/adapter"
@@ -635,6 +750,29 @@ def test_local_adapter_rejected_before_dataset_loading(tmp_path, capsys, kind):
     message = capsys.readouterr().err
     assert "adapter" in message
     assert "missing-dataset" not in message
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("weights", ["adapter_model.safetensors", "adapter_model.bin"])
+def test_complete_local_adapter_passes_preflight(tmp_path, weights):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / weights).write_bytes(b"weights")
+    output = tmp_path / "output"
+    with pytest.raises(FileNotFoundError, match="missing-dataset"):
+        runner.main(
+            [
+                "evaluate",
+                "--dataset",
+                str(tmp_path / "missing-dataset.json"),
+                "--output",
+                str(output),
+                "--adapter",
+                str(adapter),
+                "--allow-code-execution",
+            ]
+        )
     assert not output.exists()
 
 

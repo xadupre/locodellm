@@ -72,9 +72,17 @@ def write_record(stream, record):
     stream.flush()
 
 
-def task_digest(task):
-    """Identifies the complete problem, private tests and reference programs."""
-    return hashlib.sha256(json.dumps(task, sort_keys=True).encode()).hexdigest()
+def artifact_digest(record):
+    """Identifies immutable task or calibration content."""
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+
+
+def response_identity(task, reference):
+    """Binds recorded verdicts to their task and exact measured calibration."""
+    return {
+        "task_sha256": artifact_digest(task),
+        "calibration_sha256": artifact_digest(reference),
+    }
 
 
 def implementation_digest():
@@ -93,7 +101,7 @@ def calibration_record(key, task, matrix, cpu):
         "key": key,
         "task_id": task["task_id"],
         "cpu": cpu,
-        "task_sha256": task_digest(task),
+        "task_sha256": artifact_digest(task),
         "durations": matrix,
     }
 
@@ -110,7 +118,7 @@ def validate_calibration(tasks, records):
         if row["task_id"] not in by_id:
             continue
         task = by_id[row["task_id"]]
-        if row.get("task_sha256") != task_digest(task):
+        if row.get("task_sha256") != artifact_digest(task):
             raise ValueError(f"Calibration does not match task content: {row['task_id']}")
         validate_matrix(row["durations"], len(task["optimization_tests"]))
         covered.add(row["task_id"])
@@ -197,7 +205,8 @@ def training(rank, args, tasks, devices, cpu, model, tokenizer, env):
                 group = model_group(model, tokenizer, task, args, devices[rank])
                 references = calibrate(task, timeout=10.0, repeats=args.repeats, cpu=cpu)
                 key = f"r{rank}-i{iteration}-p{prompt_index}"
-                write_record(calibration, calibration_record(key, task, references, cpu))
+                reference = calibration_record(key, task, references, cpu)
+                write_record(calibration, reference)
                 optimization_stream = random.Random(args.seed + index).random() < 0.5
                 records = []
                 for member, (_, text, _, _) in enumerate(group):
@@ -220,6 +229,7 @@ def training(rank, args, tasks, devices, cpu, model, tokenizer, env):
                             "rank": rank,
                             "device": devices[rank],
                             "reference_key": key,
+                            **response_identity(task, reference),
                             "completion": text,
                             "optimization_stream": optimization_stream,
                             **record,
@@ -336,13 +346,20 @@ def evaluation(rank, args, tasks, devices, cpu, model, tokenizer, env, report=No
             prompt = prompt_tokens(tokenizer, task, devices[rank])
             tokens, text = sample(model, tokenizer, prompt, args)
             if task_index not in cache:
-                cache[task_index] = calibrate(task, timeout=10.0, repeats=args.repeats, cpu=cpu)
-                write_record(
-                    calibration,
-                    calibration_record(f"r{rank}-t{task_index}", task, cache[task_index], cpu),
+                cache[task_index] = calibration_record(
+                    f"r{rank}-t{task_index}",
+                    task,
+                    calibrate(task, timeout=10.0, repeats=args.repeats, cpu=cpu),
+                    cpu,
                 )
+                write_record(calibration, cache[task_index])
             record = verify(
-                extract_code(text), task, cache[task_index], env, repeats=args.repeats, cpu=cpu
+                extract_code(text),
+                task,
+                cache[task_index]["durations"],
+                env,
+                repeats=args.repeats,
+                cpu=cpu,
             )
             write_record(
                 stream,
@@ -353,6 +370,7 @@ def evaluation(rank, args, tasks, devices, cpu, model, tokenizer, env, report=No
                     "device": devices[rank],
                     "rank": rank,
                     "reference_key": f"r{rank}-t{task_index}",
+                    **response_identity(task, cache[task_index]),
                     "completion": text,
                     "generated_tokens": tokens.shape[1] - prompt["input_ids"].shape[1],
                     **record,
@@ -537,6 +555,7 @@ def evaluation_metrics(records, ks):
 
 def replay(tasks, calibration, records, env):
     """Reuses full evaluation traces without regenerating or executing code."""
+    validate_calibration(tasks, calibration)
     by_id = {task["task_id"]: task for task in tasks}
     references = {row["key"]: row for row in calibration}
     result = []
@@ -549,6 +568,11 @@ def replay(tasks, calibration, records, env):
         reference = references[row["reference_key"]]
         if reference["task_id"] != task["task_id"]:
             raise ValueError("Evaluation record points to another task's references.")
+        expected = response_identity(task, reference)
+        if row.get("task_sha256") != expected["task_sha256"]:
+            raise ValueError("Evaluation record does not match task content.")
+        if row.get("calibration_sha256") != expected["calibration_sha256"]:
+            raise ValueError("Evaluation record does not match calibration.")
         matrix = reference["durations"]
         keep, deadlines = test_plan(task, matrix, env)
         optimization = []
@@ -699,6 +723,14 @@ def main(argv=None):
                 )
             if not (adapter / "adapter_config.json").is_file():
                 cli.error(f"Local adapter directory has no adapter_config.json: {adapter}")
+            if not any(
+                (adapter / name).is_file()
+                for name in ("adapter_model.safetensors", "adapter_model.bin")
+            ):
+                cli.error(
+                    "Local adapter directory has no adapter weights "
+                    f"(adapter_model.safetensors or adapter_model.bin): {adapter}"
+                )
             args.adapter = str(adapter.resolve())
     output = Path(args.output)
     if output.exists():

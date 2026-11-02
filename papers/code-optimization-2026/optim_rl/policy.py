@@ -19,7 +19,9 @@ def load_policy(model_name, adapter, device, *, train):
         if (device.startswith("cuda") and torch.cuda.is_bf16_supported())
         else torch.float32
     )
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, attention_dropout=0.0
+    ).to(device)
     if adapter:
         model = PeftModel.from_pretrained(model, adapter, is_trainable=train)
     elif train:
@@ -42,11 +44,14 @@ def load_policy(model_name, adapter, device, *, train):
             ),
         )
     if train:
+        for module in model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.p = 0.0
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         model.enable_input_require_grads()
-    model.eval()
+    model.train(train)
     return model, tokenizer
 
 
@@ -71,16 +76,21 @@ def prompt_tokens(tokenizer, task, device):
 
 def sample(model, tokenizer, prompt, args):
     """Samples without top-k/top-p truncation, using the same temperature as GRPO."""
-    with torch.no_grad():
-        tokens = model.generate(
-            **prompt,
-            do_sample=True,
-            temperature=args.temperature,
-            top_k=0,
-            top_p=1.0,
-            max_new_tokens=args.max_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            use_cache=True,
-        )
+    training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            tokens = model.generate(
+                **prompt,
+                do_sample=True,
+                temperature=args.temperature,
+                top_k=0,
+                top_p=1.0,
+                max_new_tokens=args.max_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+    finally:
+        model.train(training)
     length = prompt["input_ids"].shape[1]
     return tokens, tokenizer.decode(tokens[0, length:], skip_special_tokens=True)
