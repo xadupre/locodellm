@@ -221,6 +221,78 @@ def test_eight_gpu_selection_and_prompt_scheduling():
     assert len(devices.verification_cpus(1)) == 1
 
 
+def run_gpu_query(directory):
+    """Runs the real query helper with only the supplied command directory on PATH."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib, json\n"
+                f"devices = importlib.import_module('{PACKAGE}.devices')\n"
+                "print(json.dumps(sorted(devices.query_busy_gpus())))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={**os.environ, "PATH": str(directory)},
+    )
+
+
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("", []),
+        ("\n   \n", []),
+        ("GPU-self, SELF_PID\nGPU-busy, 999999999\n", ["GPU-busy"]),
+        ("GPU-0\n", None),
+        ("GPU-0, not-a-pid\n", None),
+        ("GPU-0, 1, extra\n", None),
+        (",\n", None),
+        ("GPU-0, -1\n", None),
+        ('"unterminated\n', None),
+    ],
+)
+def test_gpu_query_csv_and_process_ownership(tmp_path, output, expected):
+    command = tmp_path / "nvidia-smi"
+    command.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        f"sys.stdout.write({output!r}.replace('SELF_PID', str(os.getppid())))\n"
+    )
+    command.chmod(0o755)
+    result = run_gpu_query(tmp_path)
+    if expected is None:
+        assert result.returncode != 0
+        assert "Cannot parse GPU availability from nvidia-smi" in result.stderr
+        assert "--device cuda:N" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == expected
+
+
+@pytest.mark.parametrize("kind", ["missing", "driver-error", "timeout"])
+def test_gpu_query_unavailable_reports_actionable_error(tmp_path, kind):
+    if kind != "missing":
+        command = tmp_path / "nvidia-smi"
+        body = (
+            "import time\ntime.sleep(11)\n"
+            if kind == "timeout"
+            else "import sys\nsys.stderr.write('driver unavailable')\nsys.exit(1)\n"
+        )
+        command.write_text(f"#!{sys.executable}\n{body}")
+        command.chmod(0o755)
+    result = run_gpu_query(tmp_path)
+    assert result.returncode != 0
+    assert "Cannot query GPU availability" in result.stderr
+    assert "--device cpu" in result.stderr
+    assert "--device cuda:N" in result.stderr
+    if kind == "driver-error":
+        assert "driver unavailable" in result.stderr
+
+
 @pytest.mark.parametrize(
     "source,status",
     [
@@ -397,6 +469,13 @@ def test_simulator_distinguishes_two_reference_quality_bands(matrix):
     assert curve[1] == pytest.approx(0.5, abs=0.15)
     assert curve[-1] == 1
     assert result["mean_reward_curve"][0] < result["mean_reward_curve"][-1]
+
+
+@pytest.mark.parametrize("curve", [[], [0.5], [-0.1, 0.5], [0.5, 1.1], [0.5, math.nan]])
+def test_simulator_diagnostics_invalid_probabilities(curve):
+    pytest.importorskip("scipy")
+    with pytest.raises(ValueError, match=r"at least two probabilities in \[0, 1\]"):
+        simulation.diagnostics(curve)
 
 
 def test_calibration_identity_and_duplicate_keys():

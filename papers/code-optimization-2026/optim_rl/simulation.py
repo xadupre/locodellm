@@ -14,7 +14,7 @@ def diagnostics(curve, window=5):
     from scipy.stats import spearmanr
 
     if len(curve) < 2 or any(not 0 <= value <= 1 for value in curve):
-        raise ValueError("A simulator curve needs at least two probabilities.")
+        raise ValueError("A simulator curve needs at least two probabilities in [0, 1].")
     window = min(window, len(curve))
     x = numpy.linspace(0, 1, len(curve))
     y = numpy.asarray(curve)
@@ -75,14 +75,16 @@ def simulate(tasks, calibration, env, *, seed=42, bands=20, draws=100):
             low = math.floor(center)
             high = math.ceil(center)
             for _ in range(draws):
-                index = high if rng.random() < center - low else low
-                row = matrix[order[index]]
+                rank_index = high if rng.random() < center - low else low
+                row = matrix[order[rank_index]]
                 optimization = [
                     {
-                        "status": "timeout" if row[index] >= deadlines[index] else "passed",
-                        "seconds": min(row[index], deadlines[index]),
+                        "status": (
+                            "timeout" if row[test_index] >= deadlines[test_index] else "passed"
+                        ),
+                        "seconds": min(row[test_index], deadlines[test_index]),
                     }
-                    for index in keep
+                    for test_index in keep
                 ]
                 record = summarize(
                     task,

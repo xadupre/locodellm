@@ -1,2 +1,2 @@
 [codespell]
-skip = .git,build,dist,optimization-test.json
+skip = .git,build,dist,optimization-train.json,optimization-test.json
