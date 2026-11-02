@@ -3,6 +3,7 @@
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -27,10 +28,12 @@ def load_evaluator(path):
         getattr(module, "reference_from_question", None)
     ):
         raise ValueError("Evaluator must define response_cost and reference_from_question.")
+    if "report_cost" not in inspect.signature(module.response_cost).parameters:
+        raise ValueError("Evaluator response_cost must accept the report_cost keyword.")
     return module
 
 
-def grade_worker(evaluator_path, request_path, result_path):
+def grade_worker(evaluator_path, request_path, result_path, progress_path):
     """Calls the original evaluator on the raw response and supplied case metadata."""
     import resource
 
@@ -41,12 +44,21 @@ def grade_worker(evaluator_path, request_path, result_path):
     request = json.loads(Path(request_path).read_text())
     evaluator = load_evaluator(evaluator_path)
     reference = evaluator.reference_from_question(request["task"])
+
+    def report_cost(cost):
+        """Publishes completed penalties atomically before executing submitted code."""
+        if type(cost) is not int or cost < 0:
+            raise ValueError("Reported cost must be a nonnegative integer.")
+        temporary = Path(progress_path).with_suffix(".tmp")
+        temporary.write_text(json.dumps({"cost": cost}, allow_nan=False))
+        temporary.replace(progress_path)
+
     with (
         open(os.devnull, "w") as sink,
         contextlib.redirect_stdout(sink),
         contextlib.redirect_stderr(sink),
     ):
-        cost = evaluator.response_cost(request["completion"], *reference)
+        cost = evaluator.response_cost(request["completion"], *reference, report_cost=report_cost)
     if type(cost) is not int or cost < 0:
         raise ValueError("Evaluator cost must be a nonnegative integer.")
     temporary = Path(result_path).with_suffix(".tmp")
@@ -55,7 +67,7 @@ def grade_worker(evaluator_path, request_path, result_path):
 
 
 def grade_completion(completion, task, evaluator, timeout):
-    """Returns an explicit grading verdict, never a synthetic cost for worker failures."""
+    """Adds one on execution timeout while retaining all previously recorded penalties."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("Grading timeout must be finite and positive.")
     if not isinstance(completion, str):
@@ -65,6 +77,7 @@ def grade_completion(completion, task, evaluator, timeout):
         root = Path(directory)
         request = root / "request.json"
         result = root / "result.json"
+        progress = root / "progress.json"
         request.write_text(json.dumps({"completion": completion, "task": task}, allow_nan=False))
         with (root / "worker.log").open("w+") as log:
             process = subprocess.Popen(
@@ -75,6 +88,7 @@ def grade_completion(completion, task, evaluator, timeout):
                     str(evaluator),
                     str(request),
                     str(result),
+                    str(progress),
                 ],
                 cwd=root,
                 stdin=subprocess.DEVNULL,
@@ -85,15 +99,31 @@ def grade_completion(completion, task, evaluator, timeout):
             )
             status = "graded"
             error = None
+            expired = False
             try:
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                status, error = "timeout", f"Evaluator exceeded {timeout} seconds."
+                expired = True
             finally:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-            if status == "graded" and process.returncode != 0:
+            if expired and not result.is_file():
+                if progress.is_file():
+                    cost = read_cost(progress) + 1
+                    return {
+                        "status": "graded",
+                        "cost": cost,
+                        "reward": -float(cost),
+                        "success": False,
+                        "timed_out": True,
+                        "timeout_penalty": 1,
+                    }
+                status = "timeout"
+                error = (
+                    f"Evaluator exceeded {timeout} seconds before reporting execution progress."
+                )
+            if status == "graded" and not expired and process.returncode != 0:
                 status = "worker_error"
                 log.seek(0)
                 error = f"Evaluator exited with {process.returncode}: {log.read(8192)}"
@@ -107,11 +137,23 @@ def grade_completion(completion, task, evaluator, timeout):
                 "success": False,
                 "error": error,
             }
-        record = json.loads(result.read_text())
-        cost = record["cost"]
-        if type(cost) is not int or cost < 0:
-            raise ValueError("Evaluator result must contain a nonnegative integer cost.")
-        return {"status": "graded", "cost": cost, "reward": -float(cost), "success": cost == 0}
+        cost = read_cost(result)
+        return {
+            "status": "graded",
+            "cost": cost,
+            "reward": -float(cost),
+            "success": cost == 0,
+            "timed_out": False,
+            "timeout_penalty": 0,
+        }
+
+
+def read_cost(path):
+    """Validates a completed result or an atomic execution-progress record."""
+    cost = json.loads(Path(path).read_text())["cost"]
+    if type(cost) is not int or cost < 0:
+        raise ValueError("Evaluator result must contain a nonnegative integer cost.")
+    return cost
 
 
 if __name__ == "__main__":

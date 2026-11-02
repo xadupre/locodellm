@@ -65,6 +65,27 @@ def require_score(record):
         raise RuntimeError(f"Grading failed for {record['task_id']}: {record['error']}")
 
 
+def synchronize_scores(records, world):
+    """Propagates genuine grading failures to every rank before any backward collective."""
+    import torch.distributed as dist
+
+    errors = [
+        f"Grading failed for {record['task_id']}: {record['error']}"
+        for record in records
+        if record["status"] != "graded"
+    ]
+    if world > 1:
+        gathered = [None] * world
+        dist.all_gather_object(gathered, errors)
+        errors = [
+            f"rank {rank}: {message}"
+            for rank, messages in enumerate(gathered)
+            for message in messages
+        ]
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 def write_record(stream, record):
     """Persists one finite JSON record and flushes progress immediately."""
     stream.write(json.dumps(record, allow_nan=False) + "\n")
@@ -134,7 +155,12 @@ def training(rank, args, tasks, devices, model, tokenizer):
     output = Path(args.output)
     world = len(devices)
     policy = (
-        DistributedDataParallel(model, device_ids=[int(devices[rank].split(":")[1])])
+        DistributedDataParallel(
+            model,
+            device_ids=(
+                [int(devices[rank].split(":")[1])] if devices[rank].startswith("cuda:") else None
+            ),
+        )
         if (world > 1)
         else model
     )
@@ -176,7 +202,14 @@ def training(rank, args, tasks, devices, model, tokenizer):
                             **record,
                         },
                     )
-                    require_score(record)
+                    if record.get("timed_out"):
+                        progress.write(
+                            f"[train] rank {rank} task {task['task_id']} sample {member}: "
+                            f"execution timeout, +1 penalty, cost={record['cost']}"
+                        )
+                    if record["status"] != "graded":
+                        break
+                synchronize_scores(records, world)
                 rewards = torch.tensor(
                     [record["reward"] for record in records],
                     device=devices[rank],

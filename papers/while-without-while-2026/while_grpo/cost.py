@@ -6,7 +6,7 @@ This executes submitted code in-process without a timeout or security sandbox.
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import inspect
 import json
 import sys
@@ -65,12 +65,15 @@ def response_cost(
     code: str,
     function_name: str | None = None,
     cases: Sequence[tuple[Sequence[object], object]] = (),
+    *,
+    report_cost: Callable[[int], None] | None = None,
 ) -> int:
     """Sums lexical, syntax, work and executable-test penalties for one response.
 
     Optional function/cases add the original expected-output checks. Without
     references, no target correctness is claimed. No catalog, prompt or model
     dependency is needed. Markdown fences remain part of the raw response.
+    The optional callback reports accumulated penalties before submitted code runs.
     """
     if function_name is not None and (
         not isinstance(function_name, str) or not function_name.isidentifier()
@@ -93,6 +96,8 @@ def response_cost(
     ]
     cost += int(not _has_work(tree)) + int(not tests)
     namespace: dict[str, object] = {"__name__": "__main__"}
+    if report_cost is not None:
+        report_cost(cost)
     try:
         exec(program, namespace)
     except _execution_errors():
@@ -100,6 +105,8 @@ def response_cost(
 
     execution_failed = False
     for name in tests:
+        if report_cost is not None:
+            report_cost(cost + int(execution_failed))
         try:
             test = namespace.get(name)
             if (
@@ -121,6 +128,8 @@ def response_cost(
         return cost + 1
     cost += int(execution_failed)
     for arguments, expected in cases:
+        if report_cost is not None:
+            report_cost(cost)
         try:
             actual = function(*arguments)
             matches = json.loads(json.dumps(actual, allow_nan=False)) == expected

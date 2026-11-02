@@ -20,7 +20,9 @@ dataset remains an explicit local input.
 Each run saves the evaluator as `evaluator.py` and records its SHA-256, local
 source path, dataset hash and study implementation hash. An optional
 `--evaluator` override can select a different trusted local cost module, but is
-not needed for this experiment.
+not needed for this experiment. Overrides must support the `report_cost`
+keyword callback to publish accumulated penalties before executing submitted
+code, self-tests and target cases.
 
 ## What is graded
 
@@ -38,6 +40,10 @@ For the bundled original evaluator:
   are passed through to the original target-function checks.
 - Return values retain the evaluator's JSON round-trip and Python equality
   semantics, including its treatment of booleans versus integers.
+- An execution timeout adds **one** to the penalties already accumulated.
+  Earlier failed tests/cases are retained; unfinished cases are not assigned
+  invented results. The timed-out response receives its negative cost reward,
+  and training continues.
 
 A cost of zero therefore means all of **that evaluator's** checks passed. It is
 not proof of correctness beyond the supplied cases, or proof that self-tests are
@@ -127,10 +133,23 @@ bound ordinary execution but **do not contain malicious Python** or prevent
 processes from deliberately escaping a process group. Restrictive limits may
 also make otherwise valid code fail.
 
-Grading timeout, crash, missing output and invalid grader results are
-**infrastructure failures**, not numeric costs. A failed verdict is flushed to
-the rank trace, then the run aborts without publishing completed metrics. Such
-failures are never replaced with a made-up negative reward.
+Before each submitted-code execution, self-test and target case, the evaluator
+atomically publishes the cost accumulated so far. If it exceeds the deadline,
+the worker is killed and that cost is increased by one. The response is recorded
+as `status: "graded"`, `timed_out: true`, `timeout_penalty: 1`; this is an explicit
+penalty, not an infrastructure failure. Training logs the penalty and continues
+using `reward = -cost`, just as for other completed scores.
+
+For example, the lexical penalty (1), an earlier failed self-test (1), then an
+infinite self-test produce cost 3. Merely extending the deadline would not fix
+an infinite loop.
+
+A timeout before the evaluator publishes execution progress, worker crash,
+missing output or invalid grader result remains an **infrastructure failure**:
+there is no reliable accumulated cost to penalize. Such a failure is flushed to
+the rank trace, and all training ranks exchange grading errors **before any
+backward collective**. Every rank then raises the same actionable error instead
+of leaving peers waiting until the NCCL watchdog timeout.
 
 Training saves raw completions/costs in `train-rank*.jsonl`, complete adapters in
 `adapter/` and optional `checkpoint-N/`, and completed update counts in
@@ -154,8 +173,11 @@ FORBIDDEN_WORD_DATASET="$DATA" \
 
 CI directly checks the bundled original cost: raw fences, substring/case
 sensitivity, self-tests, expected outputs, JSON equality, pytest failures and
-timeouts. The offline training/checkpoint/base-and-adapter evaluation cycle also
-uses the bundled scorer with no evaluator argument. An explicit small known-cost
+timeouts with accumulated-penalty preservation. Two real CPU/Gloo DDP workers
+also verify that training continues after a timeout and that genuine grading
+failures reach every rank before backward. The offline training/checkpoint/
+base-and-adapter evaluation cycle also uses the bundled scorer with no evaluator
+argument. An explicit small known-cost
 fixture separately checks the caller contract and worker failures. Only the
 optional external-dataset validation skips when no dataset path is supplied.
 Tiny Qwen3 and attention-only Qwen3.5 checkpoints exercise policy loading,

@@ -1,10 +1,12 @@
 """Checks real grading processes, the bundled original cost and offline GRPO training."""
 
+import contextlib
 import hashlib
 import importlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -36,13 +38,15 @@ def evaluator(tmp_path):
         "def reference_from_question(question):\n"
         "    cases = [(c['args'], c['expected']) for c in question['cases']]\n"
         "    return question['function'], cases\n"
-        "def response_cost(code, function, cases):\n"
+        "def response_cost(code, function, cases, *, report_cost=None):\n"
         "    assert function == 'solve'\n"
         "    assert cases == [([1], 2), ([2], 3)]\n"
+        f"    if report_cost is not None: report_cost(0 if code == {GOOD!r} else 2)\n"
         "    if code == 'WAIT': time.sleep(60)\n"
         "    if code == 'CRASH': raise RuntimeError('evaluator failure')\n"
         "    if code == 'EXIT': os._exit(0)\n"
         "    if code == 'BOOLEAN': return True\n"
+        "    if code == 'PROGRESS_BOOLEAN': report_cost(True)\n"
         f"    return 0 if code == {GOOD!r} else 2\n"
     )
     return path
@@ -62,26 +66,49 @@ def test_raw_completion_and_references_reach_existing_protocol(evaluator):
             "cost": cost,
             "reward": -float(cost),
             "success": cost == 0,
+            "timed_out": False,
+            "timeout_penalty": 0,
         }
 
 
 @pytest.mark.parametrize(
     "source,status,message",
     [
-        ("WAIT", "timeout", "exceeded"),
         ("CRASH", "worker_error", "evaluator failure"),
         ("EXIT", "worker_error", "without publishing"),
         ("BOOLEAN", "worker_error", "nonnegative integer"),
+        ("PROGRESS_BOOLEAN", "worker_error", "nonnegative integer"),
     ],
 )
 def test_worker_failures_never_become_numeric_rewards(evaluator, source, status, message):
-    result = grading.grade_completion(source, task(), evaluator, 0.2 if source == "WAIT" else 5)
+    result = grading.grade_completion(source, task(), evaluator, 5)
     assert result["status"] == status
     assert result["cost"] is result["reward"] is None
     assert result["success"] is False
     assert message in result["error"]
     with pytest.raises(RuntimeError, match="Grading failed"):
         runner.require_score({"task_id": "test", **result})
+
+
+def test_execution_timeout_adds_one_to_the_reported_cost(evaluator):
+    result = grading.grade_completion("WAIT", task(), evaluator, 1)
+    assert result == {
+        "status": "graded",
+        "cost": 3,
+        "reward": -3.0,
+        "success": False,
+        "timed_out": True,
+        "timeout_penalty": 1,
+    }
+    runner.require_score({"task_id": "test", **result})
+
+
+def test_timeout_before_execution_progress_remains_an_infrastructure_error(evaluator):
+    evaluator.write_text("import time\ntime.sleep(60)\n" + evaluator.read_text())
+    result = grading.grade_completion("WAIT", task(), evaluator, 1)
+    assert result["status"] == "timeout"
+    assert result["cost"] is result["reward"] is None
+    assert "before reporting execution progress" in result["error"]
 
 
 @pytest.mark.parametrize(
@@ -118,11 +145,34 @@ def test_original_json_equality_and_pytest_failure_are_preserved(original_evalua
     assert result["cost"] == 1
 
 
-def test_original_infinite_response_is_an_explicit_timeout(original_evaluator):
-    source = "while True:\n    pass\n"
-    result = grading.grade_completion(source, task(), original_evaluator, 0.2)
-    assert result["status"] == "timeout"
-    assert result["cost"] is result["reward"] is None
+@pytest.mark.parametrize(
+    "source,cost",
+    [
+        ("while True:\n    pass\n", 4),
+        (
+            GOOD
+            + "def test_failed():\n    assert False\n"
+            + "def test_infinite():\n    while True:\n        pass\n",
+            3,
+        ),
+        (
+            (
+                "def solve(value):\n"
+                "    if value == 2:\n        while True:\n            pass\n"
+                "    return 99\n"
+                "def test_solve():\n    assert True\n"
+            ),
+            3,
+        ),
+    ],
+)
+def test_original_timeout_preserves_static_and_completed_checks(original_evaluator, source, cost):
+    result = grading.grade_completion(source, task(), original_evaluator, 1)
+    assert result["status"] == "graded"
+    assert result["timed_out"] is True
+    assert result["timeout_penalty"] == 1
+    assert result["cost"] == cost
+    assert result["reward"] == -float(cost)
 
 
 def test_loader_preserves_prompts_and_distinguishes_prefix_variants(tmp_path, evaluator):
@@ -213,7 +263,8 @@ def test_equal_cost_groups_skip_optimizer_updates(tmp_path, evaluator):
 
     torch.set_num_threads(1)
     evaluator.write_text(
-        evaluator.read_text() + "\ndef response_cost(code, function, cases):\n    return 2\n"
+        evaluator.read_text()
+        + "\ndef response_cost(code, function, cases, *, report_cost=None):\n    return 2\n"
     )
     model = tmp_path / "model"
     make_tiny_policy(model)
@@ -449,6 +500,141 @@ def test_original_dataset_dry_run(tmp_path, original_evaluator):
         assert len({row["task_id"] for row in tasks}) == count
 
 
+def distributed_training_worker(rank, directory, scenario):
+    """Runs actual CPU DDP training with one rank receiving a failing grading task."""
+    from datetime import timedelta
+    import torch
+    import torch.distributed as dist
+    from transformers import set_seed
+
+    policy = importlib.import_module(f"{PACKAGE}.policy")
+    root = Path(directory)
+    output = root / "distributed"
+    torch.set_num_threads(1)
+    set_seed(42 + rank)
+    dist.init_process_group(
+        "gloo",
+        store=dist.FileStore(str(output / ".rendezvous"), 2),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        args = runner.parser().parse_args(
+            [
+                "train",
+                "--dataset",
+                str(root / "tasks.json"),
+                "--evaluator",
+                str(root / "cost.py"),
+                "--output",
+                str(output),
+                "--model",
+                str(root / "model"),
+                "--device",
+                "cpu",
+                "--steps",
+                "2",
+                "--group-size",
+                "2",
+                "--max-tokens",
+                "1",
+                "--horizon",
+                "8",
+                "--timeout",
+                "1",
+                "--allow-code-execution",
+            ]
+        )
+        args.evaluator_sha256 = hashlib.sha256(Path(args.evaluator).read_bytes()).hexdigest()
+        tasks = runner.load_tasks(args.dataset, grading.load_evaluator(args.evaluator))
+        model, tokenizer = policy.load_policy(args.model, None, "cpu", train=True)
+        try:
+            runner.training(rank, args, tasks, ["cpu", "cpu"], model, tokenizer)
+        except RuntimeError as error:
+            if scenario != "error":
+                raise
+            result = {"error": str(error)}
+        else:
+            if scenario == "error":
+                raise AssertionError("Expected the distributed grading failure.")
+            result = {"completed": True}
+        (output / f"outcome-rank{rank}.json").write_text(json.dumps(result))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("scenario", ["timeout", "error"])
+def test_real_ddp_continues_on_timeout_and_propagates_true_errors(tmp_path, scenario):
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    make_tiny_policy(tmp_path / "model")
+    questions = [task(), {**task(), "id": "slow", "cases": [{"args": [999], "expected": 0}]}]
+    (tmp_path / "tasks.json").write_text("".join(json.dumps(row) + "\n" for row in questions))
+    (tmp_path / "cost.py").write_text(
+        "import time\n"
+        "def reference_from_question(question):\n"
+        "    cases = [(c['args'], c['expected']) for c in question['cases']]\n"
+        "    return question['function'], cases\n"
+        "def response_cost(code, function, cases, *, report_cost=None):\n"
+        f"    cost = int(code != {GOOD!r})\n"
+        "    if report_cost is not None: report_cost(cost)\n"
+        "    if cases[0][0] == [999]:\n"
+        + (
+            "        time.sleep(60)\n"
+            if scenario == "timeout"
+            else "        raise RuntimeError('distributed grading failure')\n"
+        )
+        + "    return cost\n"
+    )
+    output = tmp_path / "distributed"
+    output.mkdir()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--distributed-check",
+            str(tmp_path),
+            scenario,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+    try:
+        log, _ = process.communicate(timeout=90)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    assert process.returncode == 0, log
+    outcomes = [
+        json.loads((output / f"outcome-rank{rank}.json").read_text()) for rank in range(2)
+    ]
+    if scenario == "error":
+        assert all("rank 0:" in row["error"] for row in outcomes)
+        assert all("distributed grading failure" in row["error"] for row in outcomes)
+        assert not (output / "adapter").exists()
+    else:
+        assert all(row["completed"] for row in outcomes)
+        summaries = [
+            json.loads((output / f"training-rank{rank}.json").read_text()) for rank in range(2)
+        ]
+        assert all(row["iterations"] == 2 for row in summaries)
+        assert len({row["adapter_sha256"] for row in summaries}) == 1
+        records = [
+            row
+            for rank in range(2)
+            for row in runner.read_jsonl(output / f"train-rank{rank}.jsonl")
+        ]
+        assert len(records) == 8
+        assert {row["iteration"] for row in records} == {0, 1}
+        assert all(row["status"] == "graded" for row in records)
+        assert any(row["timed_out"] for row in records)
+
+
 def test_cli_help_needs_no_model_or_evaluator():
     cli = Path(__file__).resolve().parents[2] / "papers" / "while-without-while-2026" / "run.py"
     result = subprocess.run(
@@ -461,3 +647,12 @@ def test_cli_help_needs_no_model_or_evaluator():
     )
     assert result.returncode == 0
     assert "--evaluator" in result.stdout
+
+
+if __name__ == "__main__":
+    import torch.multiprocessing
+
+    assert sys.argv[1] == "--distributed-check"
+    torch.multiprocessing.spawn(
+        distributed_training_worker, args=(sys.argv[2], sys.argv[3]), nprocs=2, join=True
+    )
