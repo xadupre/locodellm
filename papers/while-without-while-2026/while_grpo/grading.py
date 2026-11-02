@@ -1,4 +1,4 @@
-"""Runs the supplied, unmodified evaluator in bounded disposable processes."""
+"""Runs the original evaluator in bounded disposable processes."""
 
 import contextlib
 import hashlib

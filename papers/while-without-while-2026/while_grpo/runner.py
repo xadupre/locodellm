@@ -440,11 +440,15 @@ def evaluation_metrics(records, ks):
 
 
 def parser():
-    """Defines independent training and evaluation against a supplied cost.py."""
+    """Defines independent training and evaluation with the bundled cost.py."""
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("command", choices=["train", "evaluate"])
     result.add_argument("--dataset", required=True, help="Local JSONL train.json or test.json.")
-    result.add_argument("--evaluator", required=True, help="Trusted original standalone cost.py.")
+    result.add_argument(
+        "--evaluator",
+        default=str(Path(__file__).with_name("cost.py")),
+        help="Optional trusted cost module override; defaults to the bundled cost.py.",
+    )
     result.add_argument("--output", required=True, help="New, absent output directory.")
     result.add_argument("--model", default="Qwen/Qwen3.5-4B")
     result.add_argument("--adapter", help="Local LoRA adapter directory or Hugging Face ID.")

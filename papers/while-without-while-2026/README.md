@@ -12,13 +12,15 @@ The evaluator already exists. This study **does not implement another cost**:
 reward = -float(response_cost(raw_completion, *reference_from_question(question)))
 ```
 
-`--evaluator` selects the trusted standalone
-`codeclimb/datasets/forbidden-word-avoidance/cost.py`. Its
-`response_cost` and `reference_from_question` functions are called unchanged.
-Neither that external source nor the dataset is vendored into this repository.
-Each run saves the exact supplied evaluator as `evaluator.py` and records its
-SHA-256, original path, dataset hash and study implementation hash. This also
-captures local evaluator changes without modifying the original checkout.
+The original standalone evaluator is included in **`while_grpo/cost.py`** and
+used automatically. Its `response_cost` and `reference_from_question` behavior
+is preserved. **No other repository or evaluator path is required.** Only the
+dataset remains an explicit local input.
+
+Each run saves the evaluator as `evaluator.py` and records its SHA-256, local
+source path, dataset hash and study implementation hash. An optional
+`--evaluator` override can select a different trusted local cost module, but is
+not needed for this experiment.
 
 ## What is graded
 
@@ -26,7 +28,7 @@ The existing evaluator receives the **raw decoded completion**. There is no
 code-block extraction, reasoning removal, AST-based replacement of the lexical
 rule, additional occurrence penalty or new correctness comparator.
 
-For the supplied original evaluator:
+For the bundled original evaluator:
 
 - The case-sensitive substring `"while"` anywhere in the response adds one:
   comments, strings and `meanwhile` count; multiple occurrences still add one.
@@ -90,23 +92,22 @@ From the repository root:
 
 ```bash
 DATA=/path/to/forbidden-word-avoidance
-EVALUATOR=/path/to/codeclimb/datasets/forbidden-word-avoidance/cost.py
 STUDY=papers/while-without-while-2026
 
 # Validates dataset/evaluator/provenance, without loading a model or creating output.
 python "$STUDY/run.py" train \
-  --dataset "$DATA/train.json" --evaluator "$EVALUATOR" \
+  --dataset "$DATA/train.json" \
   --output "$STUDY/runs/input-check" --dry-run
 
 # After entering the disposable execution environment:
 python "$STUDY/run.py" train \
-  --dataset "$DATA/train.json" --evaluator "$EVALUATOR" \
+  --dataset "$DATA/train.json" \
   --output "$STUDY/runs/train" --device cuda \
   --steps 100 --group-size 5 --max-tokens 1024 --horizon 1024 \
   --allow-code-execution
 
 python "$STUDY/run.py" evaluate \
-  --dataset "$DATA/test.json" --evaluator "$EVALUATOR" \
+  --dataset "$DATA/test.json" \
   --output "$STUDY/runs/evaluate" --device cuda \
   --adapter "$STUDY/runs/train/adapter" \
   --samples 20 --pass-k 1 10 --max-tokens 1024 --horizon 1024 \
@@ -141,26 +142,26 @@ resume states; `--adapter` starts a new optimizer. Evaluation produces
 ## Validation and limitations
 
 ```bash
-# Repository-local protocol/process/real tiny-model checks, without downloads.
+# Checks the bundled original cost, subprocesses and real tiny models, without downloads.
 PYTHONPATH=. CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 \
   python -m pytest -q unittests/papers/test_while_without_while.py
 
-# Also checks exact scoring against the existing external evaluator and data.
-FORBIDDEN_WORD_EVALUATOR="$EVALUATOR" FORBIDDEN_WORD_DATASET="$DATA" \
+# Also validates the supplied local data.
+FORBIDDEN_WORD_DATASET="$DATA" \
   PYTHONPATH=. CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 \
   python -m pytest -q unittests/papers/test_while_without_while.py
 ```
 
-CI uses an explicit small known-cost evaluator fixture to check the caller
-contract; it does not pretend this fixture is the original lexical evaluator.
-Original-cost parity checks skip unless its path is explicitly supplied. They
-cover raw fences, substring/case sensitivity, self-tests, expected outputs,
-JSON equality, pytest failures and timeouts. The offline training/checkpoint/
-base-and-adapter evaluation cycle also runs against the original evaluator when
-provided. Tiny Qwen3 and attention-only Qwen3.5 checkpoints exercise policy
-loading, sampling, probability recomputation and backward passes. The latter
+CI directly checks the bundled original cost: raw fences, substring/case
+sensitivity, self-tests, expected outputs, JSON equality, pytest failures and
+timeouts. The offline training/checkpoint/base-and-adapter evaluation cycle also
+uses the bundled scorer with no evaluator argument. An explicit small known-cost
+fixture separately checks the caller contract and worker failures. Only the
+optional external-dataset validation skips when no dataset path is supplied.
+Tiny Qwen3 and attention-only Qwen3.5 checkpoints exercise policy loading,
+sampling, probability recomputation and backward passes. The latter
 does not validate hybrid linear-attention kernels; CUDA-only optional kernel
 packages can prevent running an actual hybrid Qwen3.5 model on CPU.
 
 No full-size Qwen3.5 training, multi-GPU run or benchmark result is claimed.
-The original external evaluator/data remain authoritative and unchanged.
+The original grading semantics and supplied data remain unchanged.

@@ -1,4 +1,4 @@
-"""Checks real grading processes, unchanged external costs and offline GRPO training."""
+"""Checks real grading processes, the bundled original cost and offline GRPO training."""
 
 import hashlib
 import importlib
@@ -50,11 +50,8 @@ def evaluator(tmp_path):
 
 @pytest.fixture
 def original_evaluator():
-    """Uses the explicitly supplied existing scorer without copying or changing it."""
-    path = os.environ.get("FORBIDDEN_WORD_EVALUATOR")
-    if not path:
-        pytest.skip("Set FORBIDDEN_WORD_EVALUATOR to run original-cost parity checks.")
-    return Path(path).resolve(strict=True)
+    """Uses the actual scorer bundled with the experiment."""
+    return Path(grading.__file__).with_name("cost.py")
 
 
 def test_raw_completion_and_references_reach_existing_protocol(evaluator):
@@ -145,7 +142,9 @@ def test_loader_preserves_prompts_and_distinguishes_prefix_variants(tmp_path, ev
         runner.load_tasks(path, scorer, limit=1)
 
 
-def test_dry_run_validates_without_model_or_output(tmp_path, evaluator, capsys):
+def test_dry_run_validates_without_model_or_external_evaluator(
+    tmp_path, original_evaluator, capsys
+):
     dataset = tmp_path / "train.json"
     dataset.write_text(json.dumps(task()) + "\n")
     output = tmp_path / "run"
@@ -153,8 +152,6 @@ def test_dry_run_validates_without_model_or_output(tmp_path, evaluator, capsys):
         "train",
         "--dataset",
         str(dataset),
-        "--evaluator",
-        str(evaluator),
         "--output",
         str(output),
         "--model",
@@ -163,7 +160,9 @@ def test_dry_run_validates_without_model_or_output(tmp_path, evaluator, capsys):
     runner.main([*common, "--dry-run"])
     config = json.loads(capsys.readouterr().out)
     assert config["tasks"] == 1
-    assert config["evaluator_sha256"] == hashlib.sha256(evaluator.read_bytes()).hexdigest()
+    assert (
+        config["evaluator_sha256"] == hashlib.sha256(original_evaluator.read_bytes()).hexdigest()
+    )
     assert not output.exists()
     with pytest.raises(SystemExit):
         runner.main(common)
@@ -337,8 +336,6 @@ def test_offline_training_checkpoint_and_base_adapter_evaluation(tmp_path, reque
     common = [
         "--dataset",
         str(dataset),
-        "--evaluator",
-        str(evaluator),
         "--model",
         str(model),
         "--device",
@@ -353,6 +350,8 @@ def test_offline_training_checkpoint_and_base_adapter_evaluation(tmp_path, reque
         "1",
         "--allow-code-execution",
     ]
+    if grader_name == "evaluator":
+        common.extend(["--evaluator", str(evaluator)])
     train = tmp_path / "train"
     runner.main(
         ["train", *common, "--output", str(train), "--steps", "1", "--checkpoint-steps", "1"]
