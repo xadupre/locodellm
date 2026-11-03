@@ -63,8 +63,8 @@ Options
 
 ``--output, -o``
     Built-in benchmark output path. Every output writes a detailed ``.json``
-    file with generated code and per-input results plus an ``.xlsx`` workbook
-    with ``aggregated`` and ``raw_data`` sheets. JSON files are written
+    file with interaction traces, generated code, and per-input results plus
+    an ``.xlsx`` workbook with ``aggregated`` and ``raw_data`` sheets. JSON files are written
     incrementally during the run. A requested ``.csv`` file is written in
     addition to the JSON and Excel files. LM-Eval currently ignores this
     option.
@@ -139,6 +139,23 @@ limited to 16,000 bytes, with an explicit truncation marker. Detailed JSON
 also records the scripts and their execution results in ``tool_calls``.
 Generation token counts sum all model turns; duration includes the complete
 conversation and tool execution, so tokens/s is an end-to-end rate in this mode.
+
+The JSON ``interactions`` array records events in order: ``prompt``,
+``response``, ``tool_call``, ``tool_result``, and finally ``evaluation``.
+Prompts include the harness instructions and every tool-feedback message;
+generation options and generated token counts are recorded as well.
+Responses are preserved before code extraction, including any ``<think>``
+sections or other reasoning text actually emitted by the model. Internal
+reasoning that the model does not expose cannot be recorded. Tool outputs
+are the same bounded stdout/stderr returned to the model, including any
+truncation marker.
+
+The final evaluation includes compilation/execution errors and the per-input
+results, solely for inspection in the JSON file. It is **never sent to the
+model** and does not trigger a retry or tool call. Neither the benchmark
+problems nor the model's prompts or tool-selection behavior are changed by
+tracing. The same trace format is written without a harness, with no tool
+events. JSON is saved after each completed problem.
 
 **This is not a sandbox:** generated scripts run with your user's permissions,
 can access files and the network, and can start other processes. Run only in

@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +42,25 @@ class HarnessResult:
     text: str = ""
     token_count: int = 0
     tool_calls: list[PythonToolResult] = field(default_factory=list)
+    interactions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+
+
+def generate_with_trace(
+    session: Any, prompt: str, interactions: list[dict[str, Any]], **search_options: Any
+) -> None:
+    """Records the submitted prompt and the complete generated response."""
+    interactions.append(
+        {"type": "prompt", "content": prompt, "generation_options": search_options}
+    )
+    session.generate(prompt, **search_options)
+    interactions.append(
+        {
+            "type": "response",
+            "content": session.text,
+            "generated_token_count": session.generated_token_count,
+        }
+    )
 
 
 class PythonHarness:
@@ -101,7 +119,13 @@ class PythonHarness:
         message = _INSTRUCTIONS + prompt
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as directory:
             for _ in range(self.max_tool_calls + 1):
-                session.generate(message, max_new_tokens=max_length, **search_options)
+                generate_with_trace(
+                    session,
+                    message,
+                    result.interactions,
+                    max_new_tokens=max_length,
+                    **search_options,
+                )
                 result.token_count += session.generated_token_count
                 response = session.text.strip()
                 call = _PYTHON_CALL.fullmatch(response)
@@ -119,8 +143,15 @@ class PythonHarness:
                     result.error = "Python tool budget exhausted (10 executions per problem)."
                     return result
 
-                execution = self.execute(call.group(1), directory)
+                code = call.group(1)
+                result.interactions.append(
+                    {"type": "tool_call", "name": "python", "code": code, "timeout": self.timeout}
+                )
+                execution = self.execute(code, directory)
                 result.tool_calls.append(execution)
+                result.interactions.append(
+                    {"type": "tool_result", "name": "python", **asdict(execution)}
+                )
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 message = (
                     f"Python tool result:\n"

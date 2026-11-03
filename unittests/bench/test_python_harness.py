@@ -38,7 +38,10 @@ class TestPythonHarness(unittest.TestCase):
             [
                 "<python>print(6 * 7)</python>",
                 "<python>import sys\nprint('diagnostic', file=sys.stderr)\nsys.exit(3)</python>",
-                "```python\ndef answer():\n    return 42\n```",
+                (
+                    "<think>The tool confirmed the value.</think>\n"
+                    "```python\ndef answer():\n    return 42\n```"
+                ),
             ]
         )
         test = PromptTest("Returns the answer.", [ExpectedResult((), 42), ExpectedResult((), 42)])
@@ -64,6 +67,32 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(turns[0][1], {"max_new_tokens": 200, "temperature": 0.1})
         self.assertEqual(exported[0]["tool_call_count"], 2)
         self.assertEqual(len(exported[0]["tool_calls"]), 2)
+        interactions = exported[0]["interactions"]
+        self.assertEqual(
+            [event["type"] for event in interactions],
+            [
+                "prompt",
+                "response",
+                "tool_call",
+                "tool_result",
+                "prompt",
+                "response",
+                "tool_call",
+                "tool_result",
+                "prompt",
+                "response",
+                "evaluation",
+            ],
+        )
+        self.assertEqual(interactions[0]["content"], turns[0][0])
+        self.assertEqual(interactions[0]["generation_options"], turns[0][1])
+        self.assertEqual(interactions[1]["content"], session.responses[0])
+        self.assertEqual(interactions[2]["code"], "print(6 * 7)")
+        self.assertEqual(interactions[3]["stdout"], "42\n")
+        self.assertEqual(interactions[4]["content"], turns[1][0])
+        self.assertEqual(interactions[7]["returncode"], 3)
+        self.assertEqual(interactions[9]["content"], session.responses[-1])
+        self.assertEqual(interactions[-1]["results"], exported[0]["results"])
         frame = result.to_dataframe()
         self.assertEqual(frame["tool_call_count"].tolist(), [2, 2])
         stats = _compute_case_stats(frame)
@@ -161,6 +190,33 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(result.passed, 1)
         self.assertEqual(result.results[0].tool_call_count, 0)
         self.assertEqual(session.children[0].turns, [("Problem.", {"max_length": 200})])
+        interactions = result.to_json()[0]["interactions"]
+        self.assertEqual(
+            [event["type"] for event in interactions], ["prompt", "response", "evaluation"]
+        )
+        self.assertEqual(interactions[0]["content"], "Problem.")
+        self.assertEqual(interactions[1]["content"], session.responses[0])
+
+    def test_failed_evaluation_is_logged_without_feedback(self):
+        """Records errors without revealing test outcomes to the model."""
+        for response, error in [
+            ("```python\ndef answer(:\n```", "SyntaxError"),
+            ("```python\ndef answer():\n    raise ValueError('failure')\n```", "ValueError"),
+        ]:
+            with self.subTest(error=error):
+                session = ScriptedSession([response])
+                result = BenchPromptTest(
+                    [PromptTest("Problem.", [ExpectedResult((), "hidden-value")])]
+                ).run(session, harness=PythonHarness())
+                entry = result.to_json()[0]
+                json.dumps(entry)
+                self.assertEqual(result.failed, 1)
+                self.assertEqual(len(session.children[0].turns), 1)
+                self.assertNotIn("hidden-value", session.children[0].turns[0][0])
+                self.assertEqual(entry["interactions"][1]["content"], response)
+                evaluation = entry["interactions"][-1]
+                self.assertEqual(evaluation["type"], "evaluation")
+                self.assertIn(error, evaluation["compile_error"] or evaluation["run_error"])
 
 
 if __name__ == "__main__":

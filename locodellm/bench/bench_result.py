@@ -26,6 +26,7 @@ class PromptTestResult:
         duration: Time in seconds spent generating the answer, including
             tool execution when using a harness.
         tool_calls: Python tool executions, excluding final benchmark scoring.
+        interactions: Ordered prompts, unmodified model responses, and tool events.
         harness_error: Failure to obtain a final answer through the harness.
     """
 
@@ -36,6 +37,7 @@ class PromptTestResult:
     duration: float = 0.0
     token_count: int = 0
     tool_calls: list[PythonToolResult] = field(default_factory=list)
+    interactions: list[dict[str, Any]] = field(default_factory=list)
     harness_error: str | None = None
 
     @property
@@ -119,7 +121,9 @@ class BenchResult:
         """Exports the results as a JSON-serializable list.
 
         Each entry contains the prompt, the generated code, and the
-        detailed results for each input set.
+        detailed results for each input set. The interaction trace preserves
+        raw model responses, including any emitted reasoning text, followed
+        by the final evaluation, which is not sent to the model.
 
         Returns:
             A list of dictionaries, one per prompt test.
@@ -135,7 +139,19 @@ class BenchResult:
                 "tool_calls": [asdict(call) for call in result.tool_calls],
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
+                "compile_error": (
+                    f"{type(result.run_status.compile_error).__name__}: "
+                    f"{result.run_status.compile_error}"
+                    if result.run_status.compile_error is not None
+                    else None
+                ),
                 "ran": result.run_status.ran,
+                "run_error": (
+                    f"{type(result.run_status.run_error).__name__}: "
+                    f"{result.run_status.run_error}"
+                    if result.run_status.run_error is not None
+                    else None
+                ),
                 "generated_code": result.generated_code,
                 "results": [],
             }
@@ -148,5 +164,16 @@ class BenchResult:
                         "passed": passed,
                     }
                 )
+            entry["interactions"] = [
+                *result.interactions,
+                {
+                    "type": "evaluation",
+                    "compiled": entry["compiled"],
+                    "compile_error": entry["compile_error"],
+                    "ran": entry["ran"],
+                    "run_error": entry["run_error"],
+                    "results": entry["results"],
+                },
+            ]
             entries.append(entry)
         return entries

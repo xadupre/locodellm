@@ -9,7 +9,7 @@ from typing import Any
 
 from locodellm.bench.bench_result import BenchResult, PromptTestResult
 from locodellm.bench.prompt_test import ExpectedResult, PromptTest
-from locodellm.bench.python_harness import PythonHarness
+from locodellm.bench.python_harness import PythonHarness, generate_with_trace
 from locodellm.bench.run_code import RunStatus, run_function
 
 
@@ -73,9 +73,16 @@ class BenchPromptTest:
             current = session.new_session()
             t0 = time.perf_counter()
             tool_calls = []
+            interactions: list[dict[str, Any]] = []
             harness_error = None
             if harness is None:
-                current.generate(prompt_test.prompt, max_length=self.max_length, **search_options)
+                generate_with_trace(
+                    current,
+                    prompt_test.prompt,
+                    interactions,
+                    max_length=self.max_length,
+                    **search_options,
+                )
                 answer = current.text
                 token_count = current.generated_token_count
             else:
@@ -85,6 +92,7 @@ class BenchPromptTest:
                 answer = interaction.text
                 token_count = interaction.token_count
                 tool_calls = interaction.tool_calls
+                interactions = interaction.interactions
                 harness_error = interaction.error
             duration = time.perf_counter() - t0
 
@@ -120,6 +128,7 @@ class BenchPromptTest:
                     duration=duration,
                     token_count=token_count,
                     tool_calls=tool_calls,
+                    interactions=interactions,
                     harness_error=harness_error,
                 )
             )
