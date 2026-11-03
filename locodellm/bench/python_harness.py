@@ -13,7 +13,7 @@ from typing import Any
 from locodellm.utils import strip_thinking
 
 _PYTHON_CALL = re.compile(r"```.*?```|<python>\s*(.*?)\s*</python>", re.DOTALL)
-_INSTRUCTIONS = """Use the Python tool to check your solution before answering.
+_INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
 You may execute up to 10 scripts to solve this problem.
 To call it, reply ONLY with <python> followed by a complete Python script and
 </python>. Print the values you want to inspect. You will receive stdout,
@@ -165,9 +165,8 @@ class PythonHarness:
         """
         result = HarnessResult()
         message = _INSTRUCTIONS + prompt
-        verification_requested = False
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as directory:
-            for _ in range(self.max_tool_calls + 2):
+            for _ in range(self.max_tool_calls + 1):
                 generate_with_trace(
                     session,
                     message,
@@ -192,23 +191,8 @@ class PythonHarness:
                         result.error = (
                             "Malformed Python tool call; expected <python>...</python>."
                         )
-                    elif any(call.function_call_count for call in result.tool_calls):
-                        result.text = response
-                    elif verification_requested:
-                        result.error = (
-                            "The model answered without executing a function through "
-                            "the Python tool."
-                        )
                     else:
-                        verification_requested = True
-                        message = (
-                            "Before answering, check your solution with the Python tool. "
-                            "Reply with <python> followed by a complete script and </python>. "
-                            "Define and call the function with your own examples and "
-                            "print or assert the results. A definition alone does not "
-                            "execute the function. Hidden benchmark tests are not available."
-                        )
-                        continue
+                        result.text = response
                     return result
                 code = calls[0]
                 if len(result.tool_calls) == self.max_tool_calls:
@@ -246,18 +230,9 @@ class PythonHarness:
                     "The preceding <python> block was executed, not accepted as a final "
                     "answer. An empty stdout means the script printed nothing; defining "
                     "a function does not call it.\n"
+                    "To finish, return your final function in a ```python markdown "
+                    "code block, WITHOUT <python> or </python> tags. Otherwise make "
+                    "another allowed tool call with your own checks."
                 )
-                if any(call.function_call_count for call in result.tool_calls):
-                    message += (
-                        "To finish, return your final function in a ```python markdown "
-                        "code block, WITHOUT <python> or </python> tags. Otherwise make "
-                        "another allowed tool call with your own checks."
-                    )
-                else:
-                    message += (
-                        "No function has been called yet. Before answering, send another "
-                        "<python> script that defines and calls your function with your own "
-                        "examples, and prints or asserts the results."
-                    )
         result.error = "The model did not return a final answer within the conversation budget."
         return result

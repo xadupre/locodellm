@@ -154,10 +154,9 @@ even if it only defines functions or accompanies a proposed final answer.
 The model always receives stdout, stderr, and execution status before another
 generation. Defining a function alone produces no output; the model must include
 its own calls, ``print``, or ``assert`` statements to check its behavior.
-Final functions use Markdown fences without tool tags. A final answer is accepted
-only after a function defined in a tool script has actually been called.
-An answer without this execution receives a verification reminder, and repeating
-that omission is an explicit error. Merely defining a function does not count.
+Final functions use Markdown fences without tool tags. Tool use is optional:
+a final answer is accepted without requiring any script or function execution.
+Only the explicit message format distinguishes tool requests from published code.
 
 The summary reports ``success_rate`` over benchmark test inputs,
 ``avg_generated_tokens`` and ``avg_prompts`` per problem, and

@@ -177,15 +177,15 @@ class TestPyTorchSession(unittest.TestCase):
             self.assertIn("Statistics", stdout.getvalue())
 
     def test_python_harness(self):
-        """Rejects answers without tool execution using per-turn generation limits."""
+        """Accepts direct answers while preserving per-turn generation limits."""
         from locodellm.bench.python_harness import PythonHarness
 
         session = get_session(self.model_path, backend="pytorch")
         result = PythonHarness().run(session, "hello", max_length=2)
-        self.assertEqual(result.text, "")
-        self.assertEqual(result.token_count, 4)
+        self.assertEqual(result.text, "answer answer")
+        self.assertEqual(result.token_count, 2)
         self.assertEqual(result.tool_calls, [])
-        self.assertIn("without executing", result.error)
+        self.assertIsNone(result.error)
 
     def test_qwen35_text_generation(self):
         """Loads a tiny multimodal Qwen3.5 checkpoint and generates text offline."""

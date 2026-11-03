@@ -230,20 +230,15 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIn("stdout:\n42\n", session.turns[1][0])
         self.assertEqual(result.token_count, 10)
 
-    def test_final_answer_requires_tool_execution(self):
-        """Requests verification before accepting a direct answer without tool use."""
+    def test_publication_does_not_require_tool_execution(self):
+        """Distinguishes published code from tool requests solely by message format."""
         final = '```python\ndef answer():\n    return "<python>literal</python>"\n```'
-        session = ScriptedSession(
-            [final, "<python>def answer():\n    return 42\nprint(answer())</python>", final]
-        )
+        session = ScriptedSession([final])
         result = PythonHarness().run(session, "Problem.", max_length=100)
         self.assertIsNone(result.error)
         self.assertEqual(result.text, final)
-        self.assertEqual(len(result.tool_calls), 1)
-        self.assertIn("Before answering, check your solution", session.turns[1][0])
-        self.assertIn("stdout:\n42\n", session.turns[2][0])
-        omitted = PythonHarness().run(ScriptedSession([final, final]), "Problem.", max_length=100)
-        self.assertIn("without executing", omitted.error)
+        self.assertEqual(result.tool_calls, [])
+        self.assertEqual(len(session.turns), 1)
         multiple = PythonHarness().run(
             ScriptedSession(["<python>print(1)</python><python>print(2)</python>"]),
             "Problem.",
@@ -253,9 +248,10 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(multiple.tool_calls, [])
         definitions = "<python>def answer():\n    return 42</python>"
         unchecked = PythonHarness().run(
-            ScriptedSession([definitions, final, final]), "Problem.", max_length=100
+            ScriptedSession([definitions, final]), "Problem.", max_length=100
         )
-        self.assertIn("without executing a function", unchecked.error)
+        self.assertIsNone(unchecked.error)
+        self.assertEqual(unchecked.text, final)
         self.assertEqual(len(unchecked.tool_calls), 1)
         self.assertEqual(unchecked.tool_calls[0].function_call_count, 0)
 
