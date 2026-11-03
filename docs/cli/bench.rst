@@ -134,7 +134,7 @@ final benchmark scoring does not. Without the harness these counts are zero.
 Python tool harness
 -------------------
 
-Runs the same built-in problems with optional tool use:
+Runs the same built-in problems with Python execution and feedback:
 
 .. code-block:: bash
 
@@ -149,10 +149,23 @@ After the tenth execution the model can still provide its final function,
 but an eleventh request is refused and the problem is marked failed.
 Hidden test inputs and expected results are not supplied to the tool.
 
-Final functions also accept ``<python>...</python>`` instead of Markdown fences.
-A tagged block containing only function definitions and imports is a final
-answer, not a tool request. Scripts containing top-level calls, ``print``, or
-``assert`` statements still request execution and receive tool feedback.
+Every ``<python>...</python>`` block outside Markdown fences requests execution,
+even if it only defines functions or accompanies a proposed final answer.
+The model always receives stdout, stderr, and execution status before another
+generation. Defining a function alone produces no output; the model must include
+its own calls, ``print``, or ``assert`` statements to check its behavior.
+Final functions use Markdown fences without tool tags. A final answer is accepted
+only after a function defined in a tool script has actually been called.
+An answer without this execution receives a verification reminder, and repeating
+that omission is an explicit error. Merely defining a function does not count.
+
+The summary reports ``success_rate`` over benchmark test inputs,
+``avg_generated_tokens`` and ``avg_prompts`` per problem, and
+``total_function_calls``. Token totals include thinking and all model responses;
+prompt counts include the initial prompt and every subsequent model turn.
+``function_call_count`` counts actual invocations of Python functions defined in
+tool scripts, including recursive and helper calls, not definitions or hidden-test
+evaluation. ``tool_call_count`` separately counts executed scripts.
 
 Each script runs in a fresh Python process, with the current interpreter,
 in a temporary working directory shared only across that problem's calls.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import re
 import subprocess
 import sys
@@ -13,32 +12,49 @@ from typing import Any
 
 from locodellm.utils import strip_thinking
 
-_PYTHON_CALL = re.compile(r"\s*<python>\s*(.*?)\s*</python>\s*", re.DOTALL)
-_INSTRUCTIONS = """You may use a Python tool up to 10 times to solve this problem.
+_PYTHON_CALL = re.compile(r"```.*?```|<python>\s*(.*?)\s*</python>", re.DOTALL)
+_INSTRUCTIONS = """Use the Python tool to check your solution before answering.
+You may execute up to 10 scripts to solve this problem.
 To call it, reply ONLY with <python> followed by a complete Python script and
 </python>. Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
 Each script runs in a fresh Python process in the same temporary directory.
 When finished, return your final function in a Python markdown code block,
-without a tool call. Tool calls are optional. The hidden benchmark tests are
+without a tool call. The hidden benchmark tests are
 not available to the tool.
-Final functions may also use <python>...</python> if the block contains only
-function definitions and imports. Include print or assert statements when
-requesting execution to check a function.
+Every <python>...</python> block is an execution request, never a final answer.
+A function definition alone does not call the function or print anything.
+Include calls and print or assert statements to check your solution.
 
 Problem:
 """
+# Shared memory preserves completed function calls even when the script times out.
+_TOOL_RUNNER = """
+import mmap
+import runpy
+import struct
+import sys
 
+counter_path, script = sys.argv[1:]
+sys.argv = [script]
+with open(counter_path, "r+b") as counter_file:
+    with mmap.mmap(counter_file.fileno(), 8) as counter:
+        def record_call(frame, event, argument):
+            name = frame.f_code.co_name
+            if (
+                event == "call"
+                and frame.f_code.co_filename == script
+                and (not name.startswith("<") or name == "<lambda>")
+            ):
+                count = struct.unpack_from("Q", counter)[0]
+                struct.pack_into("Q", counter, 0, count + 1)
 
-def _is_final_function(code: str) -> bool:
-    """Recognizes definition-only answers without executing candidate code."""
-    try:
-        body = ast.parse(code).body
-    except SyntaxError:
-        return False
-    return any(isinstance(node, ast.FunctionDef) for node in body) and all(
-        isinstance(node, (ast.FunctionDef, ast.Import, ast.ImportFrom)) for node in body
-    )
+        sys.setprofile(record_call)
+        try:
+            runpy.run_path(script, run_name="__main__")
+        finally:
+            sys.setprofile(None)
+"""
 
 
 @dataclass
@@ -52,6 +68,7 @@ class PythonToolResult:
     timed_out: bool
     command: list[str]
     cwd: str
+    function_call_count: int = 0
 
 
 @dataclass
@@ -99,7 +116,9 @@ class PythonHarness:
         """Executes a script and captures bounded output and execution status."""
         script = Path(directory) / "tool_script.py"
         script.write_text(code, encoding="utf-8")
-        command = [sys.executable, "-u", str(script)]
+        counter = Path(directory) / "tool_function_calls.bin"
+        counter.write_bytes(b"\0" * 8)
+        command = [sys.executable, "-u", "-c", _TOOL_RUNNER, str(counter), str(script)]
         timed_out = False
         returncode = None
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -127,7 +146,14 @@ class PythonHarness:
                 outputs.append(text)
 
         return PythonToolResult(
-            code, outputs[0], outputs[1], returncode, timed_out, command, directory
+            code,
+            outputs[0],
+            outputs[1],
+            returncode,
+            timed_out,
+            command,
+            directory,
+            int.from_bytes(counter.read_bytes(), sys.byteorder),
         )
 
     def run(
@@ -139,8 +165,9 @@ class PythonHarness:
         """
         result = HarnessResult()
         message = _INSTRUCTIONS + prompt
+        verification_requested = False
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as directory:
-            for _ in range(self.max_tool_calls + 1):
+            for _ in range(self.max_tool_calls + 2):
                 generate_with_trace(
                     session,
                     message,
@@ -150,21 +177,40 @@ class PythonHarness:
                 )
                 result.token_count += session.generated_token_count
                 response = strip_thinking(session.text)
-                call = _PYTHON_CALL.fullmatch(response)
-                if call is None:
+                calls = [
+                    match.group(1)
+                    for match in _PYTHON_CALL.finditer(response)
+                    if match.group(1) is not None
+                ]
+                if len(calls) > 1:
+                    result.error = "Multiple Python tool calls; expected one script per turn."
+                    return result
+                if not calls:
                     if not response:
                         result.error = "The model returned an empty answer."
                     elif response.startswith("<python") or response.endswith("</python>"):
                         result.error = (
                             "Malformed Python tool call; expected <python>...</python>."
                         )
-                    else:
+                    elif any(call.function_call_count for call in result.tool_calls):
                         result.text = response
+                    elif verification_requested:
+                        result.error = (
+                            "The model answered without executing a function through "
+                            "the Python tool."
+                        )
+                    else:
+                        verification_requested = True
+                        message = (
+                            "Before answering, check your solution with the Python tool. "
+                            "Reply with <python> followed by a complete script and </python>. "
+                            "Define and call the function with your own examples and "
+                            "print or assert the results. A definition alone does not "
+                            "execute the function. Hidden benchmark tests are not available."
+                        )
+                        continue
                     return result
-                code = call.group(1)
-                if _is_final_function(code):
-                    result.text = response
-                    return result
+                code = calls[0]
                 if len(result.tool_calls) == self.max_tool_calls:
                     result.error = "Python tool budget exhausted (10 executions per problem)."
                     return result
@@ -195,7 +241,23 @@ class PythonHarness:
                     f"stderr:\n{execution.stderr}\n"
                     f"exit code: {execution.returncode}\n"
                     f"timed out: {execution.timed_out}\n"
+                    f"Function calls executed: {execution.function_call_count}.\n"
                     f"Remaining Python tool calls: {remaining}.\n"
-                    "Return your final function or make another allowed tool call."
+                    "The preceding <python> block was executed, not accepted as a final "
+                    "answer. An empty stdout means the script printed nothing; defining "
+                    "a function does not call it.\n"
                 )
+                if any(call.function_call_count for call in result.tool_calls):
+                    message += (
+                        "To finish, return your final function in a ```python markdown "
+                        "code block, WITHOUT <python> or </python> tags. Otherwise make "
+                        "another allowed tool call with your own checks."
+                    )
+                else:
+                    message += (
+                        "No function has been called yet. Before answering, send another "
+                        "<python> script that defines and calls your function with your own "
+                        "examples, and prints or asserts the results."
+                    )
+        result.error = "The model did not return a final answer within the conversation budget."
         return result

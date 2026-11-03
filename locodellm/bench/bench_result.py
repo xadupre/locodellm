@@ -46,6 +46,16 @@ class PromptTestResult:
         return len(self.tool_calls)
 
     @property
+    def function_call_count(self) -> int:
+        """Returns actual calls to functions defined in the Python tool scripts."""
+        return sum(call.function_call_count for call in self.tool_calls)
+
+    @property
+    def prompt_count(self) -> int:
+        """Returns all model prompts, including initial and tool-feedback turns."""
+        return sum(event["type"] == "prompt" for event in self.interactions)
+
+    @property
     def tokens_per_second(self) -> float:
         """Returns the token generation speed."""
         if self.duration > 0:
@@ -106,6 +116,8 @@ class BenchResult:
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
                 "tool_call_count": result.tool_call_count,
+                "function_call_count": result.function_call_count,
+                "prompt_count": result.prompt_count,
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
@@ -137,6 +149,8 @@ class BenchResult:
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
                 "tool_call_count": result.tool_call_count,
+                "function_call_count": result.function_call_count,
+                "prompt_count": result.prompt_count,
                 "tool_calls": [asdict(call) for call in result.tool_calls],
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,

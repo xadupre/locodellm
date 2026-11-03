@@ -40,7 +40,7 @@ class TestPythonHarness(unittest.TestCase):
             [
                 (
                     "<think><python>raise AssertionError('not a tool call')</python></think>\n"
-                    "<python>print(6 * 7)</python>"
+                    "<python>def checked():\n    return 6 * 7\nprint(checked())</python>"
                 ),
                 (
                     "I should test the error path.\n"
@@ -68,6 +68,8 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(case.tool_call_count, 2)
         self.assertEqual(case.token_count, 15)
         self.assertEqual(case.tool_calls[0].stdout, "42\n")
+        self.assertEqual(case.function_call_count, 1)
+        self.assertEqual(case.prompt_count, 3)
         self.assertEqual(case.tool_calls[1].returncode, 3)
         self.assertIn("diagnostic", case.tool_calls[1].stderr)
         turns = session.children[0].turns
@@ -101,7 +103,9 @@ class TestPythonHarness(unittest.TestCase):
             ],
         )
         self.assertEqual(interactions[0]["content"], session.responses[0])
-        self.assertEqual(interactions[1]["code"], "print(6 * 7)")
+        self.assertEqual(
+            interactions[1]["code"], "def checked():\n    return 6 * 7\nprint(checked())"
+        )
         self.assertEqual(interactions[1]["argv"], case.tool_calls[0].command)
         self.assertEqual(interactions[1]["argv"][:2], [sys.executable, "-u"])
         self.assertEqual(interactions[1]["cwd"], os.path.dirname(interactions[1]["argv"][-1]))
@@ -117,11 +121,15 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(frame["tool_call_count"].tolist(), [2, 2])
         stats = _compute_case_stats(frame)
         self.assertEqual(stats["tool_call_count"].tolist(), [2])
+        self.assertEqual(stats["function_call_count"].tolist(), [1])
+        self.assertEqual(stats["prompt_count"].tolist(), [3])
+        self.assertEqual(exported[0]["function_call_count"], 1)
+        self.assertEqual(exported[0]["prompt_count"], 3)
 
     def test_budget_boundary_and_reset(self):
         """Allows a final answer after ten calls and resets each problem."""
         session = ScriptedSession(
-            ["<python>print('test')</python>"] * 10
+            ["<python>def checked():\n    return 'test'\nprint(checked())</python>"] * 10
             + ["```python\ndef answer():\n    return 42\n```"]
         )
         tests = [
@@ -150,9 +158,9 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIn("budget exhausted", result.to_json()[0]["harness_error"])
         self.assertFalse(result.results[0].run_status.compiled)
 
-    def test_tagged_final_function_after_verification(self):
-        """Accepts tagged definitions after testing instead of repeating tool calls."""
-        final = (
+    def test_tagged_definitions_execute_and_receive_feedback(self):
+        """Executes definitions and returns even empty output before the final answer."""
+        definitions = (
             "<think>Now return the function.</think>\n<python>\n"
             "from math import factorial\n"
             "def answer():\n"
@@ -164,7 +172,11 @@ class TestPythonHarness(unittest.TestCase):
                     "<python>def answer():\n    return 120\n"
                     "assert answer() == 120\nprint(answer())</python>"
                 ),
-                final,
+                definitions,
+                (
+                    "```python\nfrom math import factorial\n"
+                    "def answer():\n    return factorial(5)\n```"
+                ),
             ]
         )
         result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 120)])]).run(
@@ -172,37 +184,93 @@ class TestPythonHarness(unittest.TestCase):
         )
         self.assertEqual(result.passed, 1)
         case = result.results[0]
-        self.assertEqual(case.tool_call_count, 1)
+        self.assertEqual(case.tool_call_count, 2)
         self.assertEqual(case.tool_calls[0].stdout, "120\n")
-        self.assertEqual(len(session.children[0].turns), 2)
+        self.assertEqual(case.tool_calls[1].stdout, "")
+        self.assertEqual(case.tool_calls[1].returncode, 0)
+        self.assertEqual(case.function_call_count, 2)
+        turns = session.children[0].turns
+        self.assertEqual(len(turns), 3)
+        self.assertIn("stdout:\n\nstderr:\n", turns[2][0])
+        self.assertIn("exit code: 0", turns[2][0])
+        self.assertIn("WITHOUT <python>", turns[2][0])
         responses = [
             event for event in result.to_json()[0]["events"] if event["type"] == "model_response"
         ]
-        self.assertEqual(responses[-1]["content"], final)
+        self.assertEqual(responses[1]["content"], definitions)
 
-    def test_tagged_answer_at_tool_budget_boundary(self):
-        """Accepts a tagged final function even after all executions are consumed."""
+    def test_definition_only_calls_do_not_bypass_the_tool_budget(self):
+        """Executes ten definition-only scripts instead of treating them as answers."""
         answer = 'def answer():\n    return "<think>literal</think>"'
-        for calls in [0, 10]:
-            with self.subTest(calls=calls):
-                session = ScriptedSession(
-                    ["<python>pass</python>"] * calls + [f"<python>{answer}</python>"]
-                )
-                result = BenchPromptTest(
-                    [PromptTest("Problem.", [ExpectedResult((), "<think>literal</think>")])]
-                ).run(session, harness=PythonHarness())
-                self.assertEqual(result.passed, 1)
-                self.assertEqual(result.results[0].tool_call_count, calls)
-                self.assertEqual(extract_code(f"<python>{answer}</python>"), answer)
+        session = ScriptedSession([f"<python>{answer}</python>"] * 11)
+        result = PythonHarness().run(session, "Problem.", max_length=100)
+        self.assertEqual(len(result.tool_calls), 10)
+        self.assertTrue(all(call.returncode == 0 for call in result.tool_calls))
+        self.assertIn("budget exhausted", result.error)
+        self.assertEqual(len(session.turns), 11)
+        self.assertEqual(result.token_count, 55)
+        self.assertEqual(extract_code(f"<python>{answer}</python>"), answer)
+
+    def test_mixed_tool_call_executes_before_another_model_response(self):
+        """Returns real execution output instead of accepting an accompanying answer."""
+        final = "```python\ndef answer():\n    return 42\n```"
+        session = ScriptedSession(
+            [
+                "Here is my check:\n<python>def answer():\n"
+                "    return 6 * 7\nprint(answer())</python>\n" + final,
+                final,
+            ]
+        )
+        result = PythonHarness().run(session, "Problem.", max_length=100)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.text, final)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].stdout, "42\n")
+        self.assertEqual(len(session.turns), 2)
+        self.assertIn("stdout:\n42\n", session.turns[1][0])
+        self.assertEqual(result.token_count, 10)
+
+    def test_final_answer_requires_tool_execution(self):
+        """Requests verification before accepting a direct answer without tool use."""
+        final = '```python\ndef answer():\n    return "<python>literal</python>"\n```'
+        session = ScriptedSession(
+            [final, "<python>def answer():\n    return 42\nprint(answer())</python>", final]
+        )
+        result = PythonHarness().run(session, "Problem.", max_length=100)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.text, final)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertIn("Before answering, check your solution", session.turns[1][0])
+        self.assertIn("stdout:\n42\n", session.turns[2][0])
+        omitted = PythonHarness().run(ScriptedSession([final, final]), "Problem.", max_length=100)
+        self.assertIn("without executing", omitted.error)
+        multiple = PythonHarness().run(
+            ScriptedSession(["<python>print(1)</python><python>print(2)</python>"]),
+            "Problem.",
+            max_length=100,
+        )
+        self.assertIn("Multiple Python tool calls", multiple.error)
+        self.assertEqual(multiple.tool_calls, [])
+        definitions = "<python>def answer():\n    return 42</python>"
+        unchecked = PythonHarness().run(
+            ScriptedSession([definitions, final, final]), "Problem.", max_length=100
+        )
+        self.assertIn("without executing a function", unchecked.error)
+        self.assertEqual(len(unchecked.tool_calls), 1)
+        self.assertEqual(unchecked.tool_calls[0].function_call_count, 0)
 
     def test_invalid_tagged_script_receives_tool_feedback(self):
         """Keeps invalid Python scripts on the tool execution error path."""
         session = ScriptedSession(
-            ["<python>def answer(:</python>", "<python>def answer():\n    return 42</python>"]
+            [
+                "<python>def answer(:</python>",
+                "<python>def answer():\n    return 42\nassert answer() == 42</python>",
+                "```python\ndef answer():\n    return 42\n```",
+            ]
         )
         result = PythonHarness().run(session, "Problem.", max_length=100)
         self.assertIsNone(result.error)
-        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(len(result.tool_calls), 2)
         self.assertIn("SyntaxError", result.tool_calls[0].stderr)
         self.assertIn("SyntaxError", session.turns[1][0])
 
@@ -212,11 +280,13 @@ class TestPythonHarness(unittest.TestCase):
             [
                 (
                     "<python>from pathlib import Path\n"
-                    "Path('value.txt').write_text('42')\n"
+                    "def prepare():\n    Path('value.txt').write_text('42')\nprepare()\n"
                     "import time\ntime.sleep(30)</python>"
                 ),
                 (
-                    "<python>from pathlib import Path\nprint(Path('value.txt').read_text())"
+                    "<python>from pathlib import Path\n"
+                    "def read_value():\n    return Path('value.txt').read_text()\n"
+                    "print(read_value())"
                     "</python>"
                 ),
                 "def answer():\n    return 42",
@@ -225,6 +295,7 @@ class TestPythonHarness(unittest.TestCase):
         result = PythonHarness(timeout=0.5).run(session, "Problem.", max_length=100)
         self.assertEqual(len(result.tool_calls), 2)
         self.assertTrue(result.tool_calls[0].timed_out)
+        self.assertEqual(result.tool_calls[0].function_call_count, 1)
         self.assertIsNone(result.tool_calls[0].returncode)
         self.assertIn("timed out: True", session.turns[1][0])
         self.assertEqual(
@@ -235,9 +306,8 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIsNone(result.error)
 
     def test_no_tool_and_invalid_responses(self):
-        """Handles optional tool use and reports malformed or empty turns."""
+        """Reports malformed and empty turns without executing incomplete scripts."""
         for response, error in [
-            ("def answer():\n    return 42", None),
             ("<python>print(42)", "Malformed"),
             ("<think><python>print(42)</python>", "empty answer"),
             ("", "empty answer"),
@@ -247,11 +317,7 @@ class TestPythonHarness(unittest.TestCase):
                     ScriptedSession([response]), "Problem.", max_length=100
                 )
                 self.assertEqual(len(result.tool_calls), 0)
-                if error is None:
-                    self.assertIsNone(result.error)
-                    self.assertEqual(result.text, response)
-                else:
-                    self.assertIn(error, result.error)
+                self.assertIn(error, result.error)
 
     def test_script_error_and_output_truncation(self):
         """Captures script failures and bounds the output sent to the model."""
@@ -263,6 +329,26 @@ class TestPythonHarness(unittest.TestCase):
             large = harness.execute("print('x' * 20000)", directory)
         self.assertTrue(large.stdout.endswith("[output truncated]"))
         self.assertLess(len(large.stdout), 16_100)
+
+    def test_function_counter_records_calls_not_definitions(self):
+        """Counts actual script-defined calls, including recursion and failures."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = PythonHarness()
+            definitions = harness.execute("def answer():\n    return 42", directory)
+            recursive = harness.execute(
+                "def factorial(n):\n"
+                "    return n * factorial(n - 1) if n else 1\n"
+                "print(factorial(5))",
+                directory,
+            )
+            failed = harness.execute(
+                "def fail():\n    raise ValueError('failure')\nfail()", directory
+            )
+        self.assertEqual(definitions.function_call_count, 0)
+        self.assertEqual(recursive.function_call_count, 6)
+        self.assertEqual(recursive.stdout, "120\n")
+        self.assertEqual(failed.function_call_count, 1)
+        self.assertNotEqual(failed.returncode, 0)
 
     def test_without_harness_preserves_single_generation(self):
         """Keeps the original generation path and reports zero tool calls."""
@@ -308,16 +394,23 @@ class TestPythonHarness(unittest.TestCase):
             ("```python\ndef answer():\n    raise ValueError('failure')\n```", "ValueError"),
         ]:
             with self.subTest(error=error):
-                session = ScriptedSession([response])
+                session = ScriptedSession(
+                    [
+                        "<python>def checked():\n    return 'check'\nprint(checked())</python>",
+                        response,
+                    ]
+                )
                 result = BenchPromptTest(
                     [PromptTest("Problem.", [ExpectedResult((), "hidden-value")])]
                 ).run(session, harness=PythonHarness())
                 entry = result.to_json()[0]
                 json.dumps(entry)
                 self.assertEqual(result.failed, 1)
-                self.assertEqual(len(session.children[0].turns), 1)
-                self.assertNotIn("hidden-value", session.children[0].turns[0][0])
-                self.assertEqual(entry["events"][0]["content"], response)
+                self.assertEqual(len(session.children[0].turns), 2)
+                self.assertTrue(
+                    all("hidden-value" not in turn[0] for turn in session.children[0].turns)
+                )
+                self.assertEqual(entry["events"][-2]["content"], response)
                 evaluation = entry["events"][-1]
                 self.assertEqual(evaluation["type"], "evaluation")
                 self.assertIn(error, evaluation["compile_error"] or evaluation["run_error"])
