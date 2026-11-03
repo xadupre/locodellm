@@ -6,7 +6,7 @@ import unittest
 
 from locodellm.__main__ import _compute_case_stats
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
-from locodellm.bench.python_harness import PythonHarness
+from locodellm.bench.python_harness import PythonHarness, extract_python_calls
 from locodellm.utils import extract_code, strip_thinking
 
 
@@ -310,6 +310,74 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(len(rejected.tool_calls), 9)
         self.assertIn("budget exhausted", rejected.error)
         self.assertIn("requested 2 with 1 remaining", rejected.error)
+
+    def test_native_python_request_executes_before_final_answer(self):
+        """Executes Nemotron requests and preserves literal thinking tags in code."""
+        request = (
+            "<tool_call>\n<function=stateful_python_code_exec>\n<parameter=code>\n"
+            "def checked():\n    return 42\n"
+            "print('<think>literal</think>', checked())\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        final = "```python\ndef answer():\n    return 42\n```"
+        response = "<think>Prepare the check.</think>\n" + request + "\n" + final
+        session = ScriptedSession([response, final])
+        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+            session, harness=PythonHarness()
+        )
+        case = result.results[0]
+        self.assertEqual(result.passed, 1)
+        self.assertEqual(case.tool_call_count, 1)
+        self.assertEqual(case.prompt_count, 2)
+        self.assertEqual(case.tool_calls[0].stdout, "<think>literal</think> 42\n")
+        self.assertIn("stdout:\n<think>literal</think> 42\n", session.children[0].turns[1][0])
+        self.assertEqual(case.interactions[1]["content"], response)
+        self.assertEqual(case.interactions[1]["requested_tool_call_count"], 1)
+
+    def test_mixed_native_and_python_requests_preserve_order(self):
+        """Combines native and Python-tagged requests without executing fenced examples."""
+        native = (
+            "<tool_call><function=stateful_python_code_exec><parameter=code>"
+            "from pathlib import Path\nPath('value.txt').write_text('42')\nprint('created')"
+            "</parameter></function></tool_call>"
+        )
+        response = (
+            f"```text\n{native}\n```\n{native}\n"
+            "<python>from pathlib import Path\nprint(Path('value.txt').read_text())</python>"
+        )
+        session = ScriptedSession([response, "```python\ndef answer():\n    return 42\n```"])
+        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+            session, harness=PythonHarness()
+        )
+        case = result.results[0]
+        self.assertEqual(result.passed, 1)
+        self.assertEqual(case.tool_call_count, 2)
+        self.assertEqual([call.stdout for call in case.tool_calls], ["created\n", "42\n"])
+        self.assertEqual(case.multi_tool_turn_count, 1)
+        self.assertEqual(case.max_tool_calls_per_turn, 2)
+        self.assertEqual(len(extract_python_calls(response)), 2)
+        feedback = session.children[0].turns[1][0]
+        self.assertIn("Remaining Python tool calls: 8", feedback)
+        self.assertLess(feedback.index("created"), feedback.index("42"))
+
+    def test_native_request_budget_and_unsupported_tools(self):
+        """Rejects oversized native batches and unknown tools before executing scripts."""
+        native = (
+            "<tool_call><function=stateful_python_code_exec>"
+            "<parameter=code>raise AssertionError('must not execute')"
+            "</parameter></function></tool_call>"
+        )
+        rejected = PythonHarness().run(ScriptedSession([native * 11]), "Problem.", 100)
+        self.assertEqual(rejected.tool_calls, [])
+        self.assertIn("requested 11 with 10 remaining", rejected.error)
+        for request in [
+            native.replace("stateful_python_code_exec", "unknown_tool"),
+            native.removesuffix("</tool_call>"),
+        ]:
+            with self.subTest(request=request):
+                result = PythonHarness().run(ScriptedSession([request]), "Problem.", 100)
+                self.assertEqual(result.tool_calls, [])
+                self.assertIn("native Python tool call", result.error)
 
     def test_invalid_tagged_script_receives_tool_feedback(self):
         """Keeps invalid Python scripts on the tool execution error path."""

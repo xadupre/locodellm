@@ -6,14 +6,16 @@ import re
 
 _FENCED_CODE_RE = re.compile(r"```(?:\w*)\n(.*?)```", re.DOTALL)
 _PYTHON_CODE_RE = re.compile(r"\s*<python>\s*(.*?)\s*</python>\s*", re.DOTALL)
-_THINKING_MARKER_RE = re.compile(r"```.*?```|<python>.*?</python>|</?think>", re.DOTALL)
+_THINKING_MARKER_RE = re.compile(
+    r"```.*?```|<python>.*?</python>|<tool_call>.*?</tool_call>|</?think>", re.DOTALL
+)
 
 
 def strip_thinking(text: str) -> str:
     """Returns the answer after thinking, without modifying the original response.
 
     Handles completions whose opening ``<think>`` was already in the prompt.
-    Fenced and Python-tagged code is opaque so literal thinking tags are preserved.
+    Fenced and tool-tagged code is opaque so literal thinking tags are preserved.
     An explicitly unclosed thinking section contains no final answer.
     """
     answer_start = 0

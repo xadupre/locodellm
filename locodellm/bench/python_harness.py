@@ -12,7 +12,12 @@ from typing import Any
 
 from locodellm.utils import strip_thinking
 
-_PYTHON_CALL = re.compile(r"```.*?```|<python>\s*(.*?)\s*</python>", re.DOTALL)
+_PYTHON_CALL = re.compile(
+    r"```.*?```|<python>\s*(.*?)\s*</python>"
+    r"|<tool_call>\s*<function=stateful_python_code_exec>\s*"
+    r"<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>",
+    re.DOTALL,
+)
 _INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
 You may execute up to 10 scripts to solve this problem.
 To call it, reply with one or more <python>...</python> blocks, each containing
@@ -82,6 +87,16 @@ class HarnessResult:
     tool_calls: list[PythonToolResult] = field(default_factory=list)
     interactions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+
+
+def extract_python_calls(text: str) -> list[str]:
+    """Extracts explicit Python requests outside thinking and Markdown fences."""
+    return [
+        code
+        for match in _PYTHON_CALL.finditer(strip_thinking(text))
+        for code in match.groups()
+        if code is not None
+    ]
 
 
 def generate_with_trace(
@@ -178,11 +193,7 @@ class PythonHarness:
                 )
                 result.token_count += session.generated_token_count
                 response = strip_thinking(session.text)
-                calls = [
-                    match.group(1)
-                    for match in _PYTHON_CALL.finditer(response)
-                    if match.group(1) is not None
-                ]
+                calls = extract_python_calls(response)
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
                 if not calls:
                     if not response:
@@ -191,6 +202,8 @@ class PythonHarness:
                         result.error = (
                             "Malformed Python tool call; expected <python>...</python>."
                         )
+                    elif response.startswith("<tool_call") or response.endswith("</tool_call>"):
+                        result.error = "Unsupported or malformed native Python tool call."
                     else:
                         result.text = response
                     return result
@@ -240,7 +253,7 @@ class PythonHarness:
                 message = "\n\n".join(feedback) + (
                     "\n"
                     f"Remaining Python tool calls: {remaining}.\n"
-                    "The preceding <python> blocks were executed, not accepted as a final "
+                    "The preceding Python tool requests were executed, not accepted as a final "
                     "answer. An empty stdout means the script printed nothing; defining "
                     "a function does not call it.\n"
                     "To finish, return your final function in a ```python markdown "

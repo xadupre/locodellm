@@ -145,6 +145,11 @@ Runs the same built-in problems with Python execution and feedback:
 The model can request one or more executions per turn using
 ``<python>...script...</python>`` blocks. The application executes the scripts and
 returns stdout, stderr, exit code, timeout status, and the remaining budget.
+The Nemotron form
+``<tool_call><function=stateful_python_code_exec><parameter=code>...code...</parameter></function></tool_call>``
+is also accepted as an explicit Python execution request outside Markdown
+fences and thinking. Despite the native tool name, it uses the same fresh-process
+semantics as ``<python>``; Python variables do not persist between scripts.
 Grouped calls execute sequentially in message order, not concurrently, because
 scripts can depend on files in their shared working directory. All results are
 returned together before the next model response, even if a script fails.
