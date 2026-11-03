@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -92,6 +94,30 @@ class TestGenerateFromModel(ExtTestCase):
             verbose=1,
         )
         self.assertGreater(len(session.text), 0)
+
+    @requires_onnxruntime_genai()
+    def test_cached_session_process_shutdown(self):
+        """Checks that cached native sessions are released before process shutdown."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "faulthandler",
+                "-m",
+                "pytest",
+                "-q",
+                f"{os.path.abspath(__file__)}::TestGenerateFromModel::test_mock_generate_model",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Cached-session subprocess failed:\n{result.stdout}\n{result.stderr}",
+        )
 
     def test_unknown_model_raises(self):
         """Checks that an unknown model id raises KeyError."""
