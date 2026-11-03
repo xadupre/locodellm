@@ -7,6 +7,7 @@ import unittest
 from locodellm.__main__ import _compute_case_stats
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
 from locodellm.bench.python_harness import PythonHarness
+from locodellm.utils import extract_code, strip_thinking
 
 
 class ScriptedSession:
@@ -37,8 +38,16 @@ class TestPythonHarness(unittest.TestCase):
         """Checks real script execution, feedback, scoring, and exported counts."""
         session = ScriptedSession(
             [
-                "<python>print(6 * 7)</python>",
-                "<python>import sys\nprint('diagnostic', file=sys.stderr)\nsys.exit(3)</python>",
+                (
+                    "<think><python>raise AssertionError('not a tool call')</python></think>\n"
+                    "<python>print(6 * 7)</python>"
+                ),
+                (
+                    "I should test the error path.\n"
+                    "```python\nraise AssertionError('not the final answer')\n```\n</think>\n"
+                    "<python>import sys\nprint('diagnostic', file=sys.stderr)\n"
+                    "sys.exit(3)</python>"
+                ),
                 (
                     "<think>The tool confirmed the value.</think>\n"
                     "```python\ndef answer():\n    return 42\n```"
@@ -174,6 +183,7 @@ class TestPythonHarness(unittest.TestCase):
         for response, error in [
             ("def answer():\n    return 42", None),
             ("<python>print(42)", "Malformed"),
+            ("<think><python>print(42)</python>", "empty answer"),
             ("", "empty answer"),
         ]:
             with self.subTest(response=response):
@@ -200,7 +210,14 @@ class TestPythonHarness(unittest.TestCase):
 
     def test_without_harness_preserves_single_generation(self):
         """Keeps the original generation path and reports zero tool calls."""
-        session = ScriptedSession(["def answer():\n    return 42"])
+        session = ScriptedSession(
+            [
+                (
+                    "<think>```python\nraise AssertionError('thinking must not execute')\n```"
+                    "</think>\n```python\ndef answer():\n    return 42\n```"
+                )
+            ]
+        )
         result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(session)
         self.assertEqual(result.passed, 1)
         self.assertEqual(result.results[0].tool_call_count, 0)
@@ -212,6 +229,21 @@ class TestPythonHarness(unittest.TestCase):
             [event["type"] for event in interactions], ["model_response", "evaluation"]
         )
         self.assertEqual(interactions[0]["content"], session.responses[0])
+
+    def test_thinking_boundaries(self):
+        """Ignores reasoning and preserves literal tags inside fenced final code."""
+        answer = 'def answer():\n    return "<think>literal</think>"'
+        fenced = f"```python\n{answer}\n```"
+        for prefix in [
+            "",
+            "<think>Plan.</think>\n",
+            "Plan already started in the prompt.</think>\n",
+            "<think>First.</think>\n<think>Second.</think>\n",
+        ]:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(extract_code(prefix + fenced), answer)
+                self.assertEqual(strip_thinking(prefix + fenced), fenced)
+        self.assertEqual(extract_code("<think>```python\nraise AssertionError()\n```"), "")
 
     def test_failed_evaluation_is_logged_without_feedback(self):
         """Records errors without revealing test outcomes to the model."""

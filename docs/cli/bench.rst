@@ -182,6 +182,10 @@ prompts include their own ``generation_options``.
 Responses preserve any ``<think>`` sections or other reasoning text actually
 emitted by the model. Internal reasoning that the model does not expose
 cannot be recorded.
+Tool-call detection and final code extraction ignore this thinking text,
+including when the opening ``<think>`` was already supplied by the tokenizer's
+chat template. The complete original responses remain unchanged in the JSON
+events, and token counts still include reasoning tokens.
 
 The final evaluation includes compilation/execution errors and the per-input
 results, solely for inspection in the JSON file. It is **never sent to the

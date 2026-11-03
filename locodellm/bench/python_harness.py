@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from locodellm.utils import strip_thinking
+
 _PYTHON_CALL = re.compile(r"\s*<python>\s*(.*?)\s*</python>\s*", re.DOTALL)
 _INSTRUCTIONS = """You may use a Python tool up to 10 times to solve this problem.
 To call it, reply ONLY with <python> followed by a complete Python script and
@@ -132,7 +134,7 @@ class PythonHarness:
                     **search_options,
                 )
                 result.token_count += session.generated_token_count
-                response = session.text.strip()
+                response = strip_thinking(session.text)
                 call = _PYTHON_CALL.fullmatch(response)
                 if call is None:
                     if not response:
