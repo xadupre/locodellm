@@ -107,7 +107,14 @@ class SessionState:
             chat_template=self._chat_template,
         )
 
-    def generate(self, prompt: str, max_length: int = 200, **search_options: Any) -> SessionState:
+    def generate(
+        self,
+        prompt: str,
+        max_length: int = 200,
+        *,
+        max_new_tokens: int | None = None,
+        **search_options: Any,
+    ) -> SessionState:
         """Generate text from *prompt*, appending to the conversation history.
 
         The full token history (previous turns + *prompt*) is replayed so
@@ -117,6 +124,8 @@ class SessionState:
             prompt: The text prompt to send to the model.
             max_length: Maximum number of tokens (including all tokens
                 accumulated across turns).
+            max_new_tokens: If set, limits new tokens for this turn instead
+                of using the total ``max_length`` limit.
             **search_options: Extra search options forwarded to
                 ``GeneratorParams.set_search_options`` (e.g. ``temperature``,
                 ``top_k``, ``top_p``).
@@ -124,6 +133,9 @@ class SessionState:
         Returns:
             ``self``, with :attr:`tokens` and :attr:`text` updated.
         """
+        if max_new_tokens is not None and max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive.")
+
         import onnxruntime_genai as og
 
         if self.verbose:
@@ -136,6 +148,9 @@ class SessionState:
             context = np.concatenate([self.tokens, prompt_ids])
         else:
             context = np.asarray(prompt_ids, dtype=np.int32)
+
+        if max_new_tokens is not None:
+            max_length = len(context) + max_new_tokens
 
         if self.verbose:
             print(

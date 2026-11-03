@@ -47,7 +47,16 @@ Options
 
 ``--max-length``
     Maximum token length for generation (default: 200 for built-in
-    benchmarks and 2048 for LM-Eval).
+    benchmarks and 2048 for LM-Eval). With ``--harness python``, limits
+    **new tokens per model turn**, instead of total conversation length
+    (default: 1024).
+
+``--harness python``
+    Enables model-requested Python script execution for a built-in benchmark.
+    Each problem starts a fresh conversation with a budget of **10 executions**.
+    The model decides whether to use the tool, receives its output, and can
+    revise its solution before returning a final function. The default,
+    without this option, remains a single generation with no tool.
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
@@ -80,6 +89,10 @@ Output columns
 - ``duration``: generation time in seconds
 - ``token_count``: number of generated tokens
 - ``tokens_per_second``: generation speed
+- ``tool_call_count``: Python tool executions for this problem, repeated on
+  each input row (not a per-input counter)
+- ``harness_error``: malformed tool request, exhausted budget, or empty answer,
+  if the harness could not obtain a final answer
 - ``compiled``: whether the generated code compiled
 - ``ran``: whether the code ran without error
 - ``input_index``: index of the input set within the prompt
@@ -94,7 +107,44 @@ Output columns
 
 - ``total_cases``, ``total_inputs``, ``total_passed``, ``total_failed``,
   ``cases_compiled``, ``cases_ran``, ``avg_duration``,
-  ``avg_tokens_per_second``, ``avg_score``.
+  ``avg_tokens_per_second``, ``avg_score``, ``total_tool_calls``.
+
+The per-prompt statistics include ``tool_call_count`` once per problem.
+``total_tool_calls`` sums the executions across problems, without counting
+the repeated input rows. Failed scripts and timeouts count as tool uses;
+final benchmark scoring does not. Without the harness these counts are zero.
+
+Python tool harness
+-------------------
+
+Runs the same built-in problems with optional tool use:
+
+.. code-block:: bash
+
+    python -m locodellm bench Qwen/Qwen2.5-Coder-0.5B-Instruct basic \
+        --harness python --chat-template chatml --max-length 1024 \
+        --output results.xlsx --verbose 1
+
+The model is instructed to request one execution per turn using
+``<python>...script...</python>``. The application executes the script and
+returns stdout, stderr, exit code, timeout status, and the remaining budget.
+After the tenth execution the model can still provide its final function,
+but an eleventh request is refused and the problem is marked failed.
+Hidden test inputs and expected results are not supplied to the tool.
+
+Each script runs in a fresh Python process, with the current interpreter,
+in a temporary working directory shared only across that problem's calls.
+Executions time out after 10 seconds, and each stdout/stderr response is
+limited to 16,000 bytes, with an explicit truncation marker. Detailed JSON
+also records the scripts and their execution results in ``tool_calls``.
+Generation token counts sum all model turns; duration includes the complete
+conversation and tool execution, so tokens/s is an end-to-end rate in this mode.
+
+**This is not a sandbox:** generated scripts run with your user's permissions,
+can access files and the network, and can start other processes. Run only in
+an appropriately isolated environment. The timeout and output capture do not
+provide process-tree, disk, or memory isolation. Final code evaluation retains
+the existing in-process execution behavior.
 
 Examples
 --------
@@ -128,7 +178,8 @@ Run with a HuggingFace model and export to Excel:
     python -m locodellm bench Qwen/Qwen2.5-Coder-0.5B-Instruct basic \
         --chat-template chatml --output results.xlsx --verbose 1
 
-Example output (``Qwen/Qwen2.5-Coder-0.5B-Instruct``, ``basic`` benchmark):
+Example output (selected columns, ``Qwen/Qwen2.5-Coder-0.5B-Instruct``,
+``basic`` benchmark):
 
 .. code-block:: text
 
@@ -166,6 +217,7 @@ Summary:
     | avg_duration          |  7.51    |
     | avg_tokens_per_second | 19.53    |
     | avg_score             |  0.9     |
+    | total_tool_calls      |  0       |
 
 Export to detailed JSON and aggregated Excel (the JSON is written
 incrementally during the run):

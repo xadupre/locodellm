@@ -246,7 +246,7 @@ class TestLmEvalCommand(unittest.TestCase):
 
     def test_lm_eval_runs_through_bench(self):
         """Checks that a non-built-in benchmark runs with LM-Eval."""
-        args = SimpleNamespace(benchmark=["gsm8k"])
+        args = SimpleNamespace(benchmark=["gsm8k"], harness=None)
         with (
             patch("locodellm.bench.get_available_benchmarks", return_value={"basic": "built-in"}),
             patch("locodellm.__main__._cmd_lm_eval") as command,

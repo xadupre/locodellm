@@ -170,12 +170,15 @@ def _compute_case_stats(df):  # noqa: ANN001, ANN202
         duration = float(group["duration"].iloc[0])
         token_count = int(group["token_count"].iloc[0])
         tokens_per_second = float(group["tokens_per_second"].iloc[0])
+        tool_call_count = int(group["tool_call_count"].iloc[0])
         rows.append(
             {
                 "prompt": prompt,
                 "duration": duration,
                 "token_count": token_count,
                 "tokens_per_second": tokens_per_second,
+                "tool_call_count": tool_call_count,
+                "harness_error": group["harness_error"].iloc[0],
                 "compiled": compiled,
                 "ran": ran,
                 "inputs": total_inputs,
@@ -190,6 +193,7 @@ def _compute_case_stats(df):  # noqa: ANN001, ANN202
 def _cmd_builtin_bench(args: argparse.Namespace) -> None:
     """Runs a benchmark against a model and outputs results."""
     from locodellm.bench import load_benchmark
+    from locodellm.bench.python_harness import PythonHarness
     from locodellm.generate.generate_from_model import get_session
 
     inner_verbose = max(args.verbose - 1, 0)
@@ -213,8 +217,15 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         xlsx_output = args.output if output_suffix == ".xlsx" else f"{output_root}.xlsx"
 
     benchmark = load_benchmark(args.benchmark[0])
-    benchmark.max_length = 200 if args.max_length is None else args.max_length
-    result = benchmark.run(session, verbose=args.verbose, json_output=json_output)
+    benchmark.max_length = (
+        (1024 if args.harness else 200) if args.max_length is None else args.max_length
+    )
+    result = benchmark.run(
+        session,
+        verbose=args.verbose,
+        json_output=json_output,
+        harness=PythonHarness() if args.harness else None,
+    )
     df = result.to_dataframe()
 
     # Add model metadata columns.
@@ -231,6 +242,8 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         "duration",
         "token_count",
         "tokens_per_second",
+        "tool_call_count",
+        "harness_error",
         "compiled",
         "ran",
         "input_index",
@@ -264,6 +277,10 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
             {"metric": "avg_duration", "value": avg_duration},
             {"metric": "avg_tokens_per_second", "value": avg_tokens_per_second},
             {"metric": "avg_score", "value": avg_score},
+            {
+                "metric": "total_tool_calls",
+                "value": sum(item.tool_call_count for item in result.results),
+            },
         ]
     )
 
@@ -318,6 +335,8 @@ def _cmd_bench(args: argparse.Namespace) -> None:
     if len(args.benchmark) == 1 and args.benchmark[0] in get_available_benchmarks():
         _cmd_builtin_bench(args)
     else:
+        if args.harness:
+            raise ValueError("--harness is only supported for a single built-in benchmark.")
         _cmd_lm_eval(args)
 
 
@@ -426,7 +445,16 @@ def main(args: list[str] | None = None) -> None:
         "--max-length",
         type=int,
         default=None,
-        help="Maximum token length (default: 200 built-in, 2048 LM-Eval).",
+        help=(
+            "Maximum token length (default: 200 built-in, 2048 LM-Eval); "
+            "with --harness, new tokens per turn (default: 1024)."
+        ),
+    )
+    bench_parser.add_argument(
+        "--harness",
+        choices=["python"],
+        default=None,
+        help="Enables up to ten model-requested Python executions per built-in problem.",
     )
     bench_parser.add_argument(
         "--chat-template", default=None, help="Chat template (e.g. chatml)."
@@ -473,6 +501,8 @@ def main(args: list[str] | None = None) -> None:
 
     if parsed.command == "chat" and parsed.max_length < 1:
         chat_parser.error("--max-length must be positive")
+    if parsed.command == "bench" and parsed.max_length is not None and parsed.max_length < 1:
+        bench_parser.error("--max-length must be positive")
 
     dispatch = {
         "version": _cmd_version,

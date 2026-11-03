@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pandas
 
 from locodellm.bench.prompt_test import ExpectedResult, PromptTest
+from locodellm.bench.python_harness import PythonToolResult
 from locodellm.bench.run_code import RunStatus
 
 
@@ -22,7 +23,10 @@ class PromptTestResult:
             with undefined arguments.
         results: A list of tuples ``(expected, actual, passed)`` for each
             :class:`ExpectedResult` entry.
-        duration: Time in seconds spent generating the answer.
+        duration: Time in seconds spent generating the answer, including
+            tool execution when using a harness.
+        tool_calls: Python tool executions, excluding final benchmark scoring.
+        harness_error: Failure to obtain a final answer through the harness.
     """
 
     prompt_test: PromptTest
@@ -31,6 +35,13 @@ class PromptTestResult:
     results: list[tuple[ExpectedResult, Any, bool]] = field(default_factory=list)
     duration: float = 0.0
     token_count: int = 0
+    tool_calls: list[PythonToolResult] = field(default_factory=list)
+    harness_error: str | None = None
+
+    @property
+    def tool_call_count(self) -> int:
+        """Returns the number of Python tool executions for this problem."""
+        return len(self.tool_calls)
 
     @property
     def tokens_per_second(self) -> float:
@@ -92,6 +103,8 @@ class BenchResult:
                 "duration": result.duration,
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
+                "tool_call_count": result.tool_call_count,
+                "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
             }
@@ -118,6 +131,9 @@ class BenchResult:
                 "duration": result.duration,
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
+                "tool_call_count": result.tool_call_count,
+                "tool_calls": [asdict(call) for call in result.tool_calls],
+                "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
                 "generated_code": result.generated_code,
