@@ -53,6 +53,20 @@ class TestMockGenerateModel(ExtTestCase):
         self.assertEqual(session.tokens.size, 114)
 
     @requires_onnxruntime_genai()
+    def test_new_token_budget_across_turns(self):
+        """Limits new tokens independently of the accumulated conversation."""
+        session = create_session(self.model_path, chat_template="chatml")
+        prompt = 'write a python function which returns "hello"'
+        session.generate(prompt, max_new_tokens=5)
+        self.assertEqual(session.generated_token_count, 5)
+        first_length = session.tokens.size
+        session.generate("Continue.", max_new_tokens=5)
+        self.assertEqual(session.generated_token_count, 5)
+        self.assertGreater(session.tokens.size, first_length)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            session.generate("Continue.", max_new_tokens=0)
+
+    @requires_onnxruntime_genai()
     def test_new_session(self):
         """Checks that new_session resets conversation state."""
         session = create_session(self.model_path, chat_template="chatml")

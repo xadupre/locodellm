@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import pandas
 
 from locodellm.bench.prompt_test import ExpectedResult, PromptTest
+from locodellm.bench.python_harness import PythonToolResult
 from locodellm.bench.run_code import RunStatus
 
 
@@ -22,7 +23,11 @@ class PromptTestResult:
             with undefined arguments.
         results: A list of tuples ``(expected, actual, passed)`` for each
             :class:`ExpectedResult` entry.
-        duration: Time in seconds spent generating the answer.
+        duration: Time in seconds spent generating the answer, including
+            tool execution when using a harness.
+        tool_calls: Python tool executions, excluding final benchmark scoring.
+        interactions: Ordered prompts, unmodified model responses, and tool events.
+        harness_error: Failure to obtain a final answer through the harness.
     """
 
     prompt_test: PromptTest
@@ -31,6 +36,14 @@ class PromptTestResult:
     results: list[tuple[ExpectedResult, Any, bool]] = field(default_factory=list)
     duration: float = 0.0
     token_count: int = 0
+    tool_calls: list[PythonToolResult] = field(default_factory=list)
+    interactions: list[dict[str, Any]] = field(default_factory=list)
+    harness_error: str | None = None
+
+    @property
+    def tool_call_count(self) -> int:
+        """Returns the number of Python tool executions for this problem."""
+        return len(self.tool_calls)
 
     @property
     def tokens_per_second(self) -> float:
@@ -92,6 +105,8 @@ class BenchResult:
                 "duration": result.duration,
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
+                "tool_call_count": result.tool_call_count,
+                "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
             }
@@ -106,7 +121,10 @@ class BenchResult:
         """Exports the results as a JSON-serializable list.
 
         Each entry contains the prompt, the generated code, and the
-        detailed results for each input set.
+        detailed results for each input set. Each entry starts with the
+        complete initial prompt followed by an ordered event sequence.
+        Responses, commands, stdout, stderr, subsequent prompts, and the final
+        evaluation are separate events. The evaluation is not sent to the model.
 
         Returns:
             A list of dictionaries, one per prompt test.
@@ -118,8 +136,23 @@ class BenchResult:
                 "duration": result.duration,
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
+                "tool_call_count": result.tool_call_count,
+                "tool_calls": [asdict(call) for call in result.tool_calls],
+                "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
+                "compile_error": (
+                    f"{type(result.run_status.compile_error).__name__}: "
+                    f"{result.run_status.compile_error}"
+                    if result.run_status.compile_error is not None
+                    else None
+                ),
                 "ran": result.run_status.ran,
+                "run_error": (
+                    f"{type(result.run_status.run_error).__name__}: "
+                    f"{result.run_status.run_error}"
+                    if result.run_status.run_error is not None
+                    else None
+                ),
                 "generated_code": result.generated_code,
                 "results": [],
             }
@@ -132,5 +165,26 @@ class BenchResult:
                         "passed": passed,
                     }
                 )
-            entries.append(entry)
+            initial = result.interactions[0] if result.interactions else None
+            events = [
+                *result.interactions[1:],
+                {
+                    "type": "evaluation",
+                    "compiled": entry["compiled"],
+                    "compile_error": entry["compile_error"],
+                    "ran": entry["ran"],
+                    "run_error": entry["run_error"],
+                    "results": entry["results"],
+                },
+            ]
+            entries.append(
+                {
+                    "initial_prompt": initial["content"] if initial is not None else None,
+                    "events": events,
+                    "initial_generation_options": (
+                        initial["generation_options"] if initial is not None else None
+                    ),
+                    **entry,
+                }
+            )
         return entries

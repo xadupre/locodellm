@@ -9,7 +9,8 @@ from typing import Any
 
 from locodellm.bench.bench_result import BenchResult, PromptTestResult
 from locodellm.bench.prompt_test import ExpectedResult, PromptTest
-from locodellm.bench.run_code import run_function
+from locodellm.bench.python_harness import PythonHarness, generate_with_trace
+from locodellm.bench.run_code import RunStatus, run_function
 
 
 class BenchPromptTest:
@@ -33,6 +34,7 @@ class BenchPromptTest:
         session: Any,
         verbose: int = 0,
         json_output: str | None = None,
+        harness: PythonHarness | None = None,
         **search_options: Any,
     ) -> BenchResult:
         """Runs all prompt tests against the given session.
@@ -46,6 +48,8 @@ class BenchPromptTest:
             verbose: Verbosity level. When >= 1, displays a progress bar.
             json_output: If set, writes results incrementally to this JSON
                 file path after each prompt test completes.
+            harness: Optional Python tool harness with a fresh ten-call
+                budget per prompt. The token limit applies to each turn.
             **search_options: Extra options forwarded to
                 :meth:`~locodellm.session.SessionState.generate`.
 
@@ -68,11 +72,36 @@ class BenchPromptTest:
 
             current = session.new_session()
             t0 = time.perf_counter()
-            current.generate(prompt_test.prompt, max_length=self.max_length, **search_options)
+            tool_calls = []
+            interactions: list[dict[str, Any]] = []
+            harness_error = None
+            if harness is None:
+                generate_with_trace(
+                    current,
+                    prompt_test.prompt,
+                    interactions,
+                    max_length=self.max_length,
+                    **search_options,
+                )
+                answer = current.text
+                token_count = current.generated_token_count
+            else:
+                interaction = harness.run(
+                    current, prompt_test.prompt, self.max_length, **search_options
+                )
+                answer = interaction.text
+                token_count = interaction.token_count
+                tool_calls = interaction.tool_calls
+                interactions = interaction.interactions
+                harness_error = interaction.error
             duration = time.perf_counter() - t0
 
-            generated_code = extract_code(current.text)
-            run_status = run_function(generated_code)
+            generated_code = extract_code(answer)
+            run_status = (
+                RunStatus(run_error=RuntimeError(harness_error))
+                if harness_error
+                else run_function(generated_code)
+            )
 
             results: list[tuple[ExpectedResult, Any, bool]] = []
 
@@ -97,7 +126,10 @@ class BenchPromptTest:
                     run_status=run_status,
                     results=results,
                     duration=duration,
-                    token_count=current.generated_token_count,
+                    token_count=token_count,
+                    tool_calls=tool_calls,
+                    interactions=interactions,
+                    harness_error=harness_error,
                 )
             )
 

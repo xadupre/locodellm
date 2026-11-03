@@ -71,6 +71,51 @@ class TestMainGenerate(ExtTestCase):
 class TestMainBench(ExtTestCase):
     """Tests for the bench subcommand."""
 
+    def test_harness_rejects_lm_eval(self):
+        """Rejects the Python harness for external LM-Eval tasks."""
+        with self.assertRaisesRegex(ValueError, "single built-in benchmark"):
+            main(["bench", "unused/model", "gsm8k", "--harness", "python"])
+
+    @requires_onnxruntime_genai()
+    def test_bench_python_harness(self):
+        """Checks harness CLI output and the matching JSON and Excel exports."""
+        import json
+        import os
+        import tempfile
+
+        import pandas
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = os.path.join(directory, "results.csv")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                main(
+                    [
+                        "bench",
+                        "mock/generate",
+                        "basic",
+                        "--harness",
+                        "python",
+                        "--max-length",
+                        "200",
+                        "--chat-template",
+                        "chatml",
+                        "--output",
+                        output_path,
+                    ]
+                )
+            raw = pandas.read_csv(output_path)
+            with pandas.ExcelFile(os.path.join(directory, "results.xlsx")) as workbook:
+                stats = pandas.read_excel(workbook, sheet_name="aggregated")
+            with open(os.path.join(directory, "results.json"), encoding="utf-8") as stream:
+                detailed = json.load(stream)
+        self.assertIn("total_tool_calls", buf.getvalue())
+        self.assertIn("tool_call_count", buf.getvalue())
+        self.assertEqual(raw["tool_call_count"].tolist(), [0] * len(raw))
+        self.assertEqual(stats["tool_call_count"].tolist(), [0] * 10)
+        self.assertEqual([case["tool_call_count"] for case in detailed], [0] * 10)
+        self.assertEqual([case["tool_calls"] for case in detailed], [[] for _ in range(10)])
+
     @requires_onnxruntime_genai()
     def test_bench_mock_model(self):
         """Checks that bench subcommand produces a markdown table."""
