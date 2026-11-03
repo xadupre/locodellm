@@ -140,15 +140,31 @@ also records the scripts and their execution results in ``tool_calls``.
 Generation token counts sum all model turns; duration includes the complete
 conversation and tool execution, so tokens/s is an end-to-end rate in this mode.
 
-The JSON ``interactions`` array records events in order: ``prompt``,
-``response``, ``tool_call``, ``tool_result``, and finally ``evaluation``.
-Prompts include the harness instructions and every tool-feedback message;
-generation options and generated token counts are recorded as well.
-Responses are preserved before code extraction, including any ``<think>``
-sections or other reasoning text actually emitted by the model. Internal
-reasoning that the model does not expose cannot be recorded. Tool outputs
-are the same bounded stdout/stderr returned to the model, including any
-truncation marker.
+Each JSON problem starts with ``initial_prompt``, the complete first message
+sent to the model, including the harness instructions. It is followed
+immediately by an ``events`` array in conversation order:
+
+- ``model_response``: the complete model response, before code extraction
+- ``command``: the actual process argument list (``argv``), working directory
+  (``cwd``), Python script (``code``), and timeout
+- ``stdout``: the tool's standard output, including an explicit empty string
+  when the script prints nothing
+- ``stderr``: the tool's standard error, as a separate event
+- ``process_exit``: exit code and timeout status
+- ``prompt``: the next message sent to the model
+- Further responses, commands, and outputs as needed, then ``evaluation``
+
+Stdout and stderr are collected after each command completes; these separate
+events do not represent byte-level interleaving between the two streams.
+They contain the same bounded outputs returned to the model, including any
+truncation marker. The event array comes before the summary statistics and
+other detailed result fields, so it can be read directly from start to finish.
+Initial generation options are in ``initial_generation_options``; later
+prompts include their own ``generation_options``.
+
+Responses preserve any ``<think>`` sections or other reasoning text actually
+emitted by the model. Internal reasoning that the model does not expose
+cannot be recorded.
 
 The final evaluation includes compilation/execution errors and the per-input
 results, solely for inspection in the JSON file. It is **never sent to the

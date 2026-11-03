@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,8 @@ class PythonToolResult:
     stderr: str
     returncode: int | None
     timed_out: bool
+    command: list[str]
+    cwd: str
 
 
 @dataclass
@@ -56,7 +58,7 @@ def generate_with_trace(
     session.generate(prompt, **search_options)
     interactions.append(
         {
-            "type": "response",
+            "type": "model_response",
             "content": session.text,
             "generated_token_count": session.generated_token_count,
         }
@@ -80,12 +82,13 @@ class PythonHarness:
         """Executes a script and captures bounded output and execution status."""
         script = Path(directory) / "tool_script.py"
         script.write_text(code, encoding="utf-8")
+        command = [sys.executable, "-u", str(script)]
         timed_out = False
         returncode = None
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             try:
                 completed = subprocess.run(
-                    [sys.executable, "-u", str(script)],
+                    command,
                     cwd=directory,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout,
@@ -106,7 +109,9 @@ class PythonHarness:
                     text += "\n[output truncated]"
                 outputs.append(text)
 
-        return PythonToolResult(code, outputs[0], outputs[1], returncode, timed_out)
+        return PythonToolResult(
+            code, outputs[0], outputs[1], returncode, timed_out, command, directory
+        )
 
     def run(
         self, session: Any, prompt: str, max_length: int, **search_options: Any
@@ -144,13 +149,25 @@ class PythonHarness:
                     return result
 
                 code = call.group(1)
-                result.interactions.append(
-                    {"type": "tool_call", "name": "python", "code": code, "timeout": self.timeout}
-                )
                 execution = self.execute(code, directory)
                 result.tool_calls.append(execution)
-                result.interactions.append(
-                    {"type": "tool_result", "name": "python", **asdict(execution)}
+                result.interactions.extend(
+                    [
+                        {
+                            "type": "command",
+                            "argv": execution.command,
+                            "cwd": execution.cwd,
+                            "code": code,
+                            "timeout": self.timeout,
+                        },
+                        {"type": "stdout", "content": execution.stdout},
+                        {"type": "stderr", "content": execution.stderr},
+                        {
+                            "type": "process_exit",
+                            "returncode": execution.returncode,
+                            "timed_out": execution.timed_out,
+                        },
+                    ]
                 )
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 message = (

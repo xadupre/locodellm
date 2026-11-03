@@ -121,9 +121,10 @@ class BenchResult:
         """Exports the results as a JSON-serializable list.
 
         Each entry contains the prompt, the generated code, and the
-        detailed results for each input set. The interaction trace preserves
-        raw model responses, including any emitted reasoning text, followed
-        by the final evaluation, which is not sent to the model.
+        detailed results for each input set. Each entry starts with the
+        complete initial prompt followed by an ordered event sequence.
+        Responses, commands, stdout, stderr, subsequent prompts, and the final
+        evaluation are separate events. The evaluation is not sent to the model.
 
         Returns:
             A list of dictionaries, one per prompt test.
@@ -164,8 +165,9 @@ class BenchResult:
                         "passed": passed,
                     }
                 )
-            entry["interactions"] = [
-                *result.interactions,
+            initial = result.interactions[0] if result.interactions else None
+            events = [
+                *result.interactions[1:],
                 {
                     "type": "evaluation",
                     "compiled": entry["compiled"],
@@ -175,5 +177,14 @@ class BenchResult:
                     "results": entry["results"],
                 },
             ]
-            entries.append(entry)
+            entries.append(
+                {
+                    "initial_prompt": initial["content"] if initial is not None else None,
+                    "events": events,
+                    "initial_generation_options": (
+                        initial["generation_options"] if initial is not None else None
+                    ),
+                    **entry,
+                }
+            )
         return entries
