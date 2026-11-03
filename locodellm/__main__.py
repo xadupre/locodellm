@@ -180,6 +180,8 @@ def _compute_case_stats(df):  # noqa: ANN001, ANN202
                 "tool_call_count": tool_call_count,
                 "function_call_count": int(group["function_call_count"].iloc[0]),
                 "prompt_count": int(group["prompt_count"].iloc[0]),
+                "multi_tool_turn_count": int(group["multi_tool_turn_count"].iloc[0]),
+                "max_tool_calls_per_turn": int(group["max_tool_calls_per_turn"].iloc[0]),
                 "harness_error": group["harness_error"].iloc[0],
                 "compiled": compiled,
                 "ran": ran,
@@ -251,6 +253,8 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         "tool_call_count",
         "function_call_count",
         "prompt_count",
+        "multi_tool_turn_count",
+        "max_tool_calls_per_turn",
         "harness_error",
         "compiled",
         "ran",
@@ -292,6 +296,14 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
             {"metric": "avg_generated_tokens", "value": float(stats["token_count"].mean())},
             {"metric": "avg_prompts", "value": float(stats["prompt_count"].mean())},
             {"metric": "total_function_calls", "value": int(stats["function_call_count"].sum())},
+            {
+                "metric": "multi_tool_turn_count",
+                "value": int(stats["multi_tool_turn_count"].sum()),
+            },
+            {
+                "metric": "max_tool_calls_per_turn",
+                "value": int(stats["max_tool_calls_per_turn"].max()),
+            },
             {
                 "metric": "total_tool_calls",
                 "value": sum(item.tool_call_count for item in result.results),

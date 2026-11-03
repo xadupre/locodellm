@@ -239,13 +239,6 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(result.text, final)
         self.assertEqual(result.tool_calls, [])
         self.assertEqual(len(session.turns), 1)
-        multiple = PythonHarness().run(
-            ScriptedSession(["<python>print(1)</python><python>print(2)</python>"]),
-            "Problem.",
-            max_length=100,
-        )
-        self.assertIn("Multiple Python tool calls", multiple.error)
-        self.assertEqual(multiple.tool_calls, [])
         definitions = "<python>def answer():\n    return 42</python>"
         unchecked = PythonHarness().run(
             ScriptedSession([definitions, final]), "Problem.", max_length=100
@@ -254,6 +247,69 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(unchecked.text, final)
         self.assertEqual(len(unchecked.tool_calls), 1)
         self.assertEqual(unchecked.tool_calls[0].function_call_count, 0)
+
+    def test_multiple_calls_return_all_outputs_before_the_final_answer(self):
+        """Executes grouped scripts in order and returns failures with other outputs."""
+        response = (
+            "<python>from pathlib import Path\n"
+            "Path('value.txt').write_text('21')\nprint('created')</python>\n"
+            "<python>raise ValueError('bad check')</python>\n"
+            "<python>from pathlib import Path\n"
+            "def answer():\n    return 2 * int(Path('value.txt').read_text())\n"
+            "print(answer())</python>\n"
+            "```python\ndef answer():\n    return 999\n```"
+        )
+        session = ScriptedSession([response, "```python\ndef answer():\n    return 42\n```"])
+        result = BenchPromptTest(
+            [PromptTest("Problem.", [ExpectedResult((), 42), ExpectedResult((), 42)])]
+        ).run(session, harness=PythonHarness())
+        self.assertEqual(result.passed, 1)
+        case = result.results[0]
+        self.assertEqual(case.tool_call_count, 3)
+        self.assertEqual(case.function_call_count, 1)
+        self.assertEqual(case.prompt_count, 2)
+        self.assertEqual(case.token_count, 10)
+        self.assertEqual([call.returncode for call in case.tool_calls], [0, 1, 0])
+        self.assertEqual(case.multi_tool_turn_count, 1)
+        self.assertEqual(case.max_tool_calls_per_turn, 3)
+        feedback = session.children[0].turns[1][0]
+        self.assertIn("stdout:\ncreated\n", feedback)
+        self.assertIn("ValueError: bad check", feedback)
+        self.assertIn("stdout:\n42\n", feedback)
+        self.assertIn("Remaining Python tool calls: 7", feedback)
+        self.assertLess(feedback.index("result 1/3"), feedback.index("result 2/3"))
+        self.assertLess(feedback.index("result 2/3"), feedback.index("result 3/3"))
+        entry = result.to_json()[0]
+        self.assertEqual(entry["events"][0]["content"], response)
+        self.assertEqual(entry["events"][0]["requested_tool_call_count"], 3)
+        self.assertEqual(entry["multi_tool_turn_count"], 1)
+        self.assertEqual(entry["max_tool_calls_per_turn"], 3)
+        stats = _compute_case_stats(result.to_dataframe())
+        self.assertEqual(stats["multi_tool_turn_count"].tolist(), [1])
+        self.assertEqual(stats["max_tool_calls_per_turn"].tolist(), [3])
+
+    def test_batch_budget_boundary_and_overflow(self):
+        """Counts each grouped script and rejects an over-budget batch atomically."""
+        session = ScriptedSession(
+            ["<python>pass</python>" * 10, "```python\ndef answer():\n    return 42\n```"]
+        )
+        accepted = PythonHarness().run(session, "Problem.", max_length=100)
+        self.assertIsNone(accepted.error)
+        self.assertEqual(len(accepted.tool_calls), 10)
+        self.assertEqual(len(session.turns), 2)
+        self.assertIn("Remaining Python tool calls: 0", session.turns[1][0])
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "should-not-exist")
+            script = f"<python>open({marker!r}, 'w').close()</python>"
+            rejected = PythonHarness().run(
+                ScriptedSession(["<python>pass</python>"] * 9 + [script * 2]),
+                "Problem.",
+                max_length=100,
+            )
+            self.assertFalse(os.path.exists(marker))
+        self.assertEqual(len(rejected.tool_calls), 9)
+        self.assertIn("budget exhausted", rejected.error)
+        self.assertIn("requested 2 with 1 remaining", rejected.error)
 
     def test_invalid_tagged_script_receives_tool_feedback(self):
         """Keeps invalid Python scripts on the tool execution error path."""

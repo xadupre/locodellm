@@ -56,6 +56,27 @@ class PromptTestResult:
         return sum(event["type"] == "prompt" for event in self.interactions)
 
     @property
+    def multi_tool_turn_count(self) -> int:
+        """Returns the number of model responses requesting multiple tool executions."""
+        return sum(
+            event.get("requested_tool_call_count", 0) > 1
+            for event in self.interactions
+            if event["type"] == "model_response"
+        )
+
+    @property
+    def max_tool_calls_per_turn(self) -> int:
+        """Returns the largest number of tool executions requested in one response."""
+        return max(
+            (
+                event.get("requested_tool_call_count", 0)
+                for event in self.interactions
+                if event["type"] == "model_response"
+            ),
+            default=0,
+        )
+
+    @property
     def tokens_per_second(self) -> float:
         """Returns the token generation speed."""
         if self.duration > 0:
@@ -118,6 +139,8 @@ class BenchResult:
                 "tool_call_count": result.tool_call_count,
                 "function_call_count": result.function_call_count,
                 "prompt_count": result.prompt_count,
+                "multi_tool_turn_count": result.multi_tool_turn_count,
+                "max_tool_calls_per_turn": result.max_tool_calls_per_turn,
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
@@ -151,6 +174,8 @@ class BenchResult:
                 "tool_call_count": result.tool_call_count,
                 "function_call_count": result.function_call_count,
                 "prompt_count": result.prompt_count,
+                "multi_tool_turn_count": result.multi_tool_turn_count,
+                "max_tool_calls_per_turn": result.max_tool_calls_per_turn,
                 "tool_calls": [asdict(call) for call in result.tool_calls],
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,

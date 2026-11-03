@@ -15,8 +15,10 @@ from locodellm.utils import strip_thinking
 _PYTHON_CALL = re.compile(r"```.*?```|<python>\s*(.*?)\s*</python>", re.DOTALL)
 _INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
 You may execute up to 10 scripts to solve this problem.
-To call it, reply ONLY with <python> followed by a complete Python script and
-</python>. Print the values you want to inspect. You will receive stdout,
+To call it, reply with one or more <python>...</python> blocks, each containing
+a complete Python script. Blocks execute in order, and their results are returned
+together before your next response. Each block consumes one execution.
+Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
 Each script runs in a fresh Python process in the same temporary directory.
 When finished, return your final function in a Python markdown code block,
@@ -181,9 +183,7 @@ class PythonHarness:
                     for match in _PYTHON_CALL.finditer(response)
                     if match.group(1) is not None
                 ]
-                if len(calls) > 1:
-                    result.error = "Multiple Python tool calls; expected one script per turn."
-                    return result
+                result.interactions[-1]["requested_tool_call_count"] = len(calls)
                 if not calls:
                     if not response:
                         result.error = "The model returned an empty answer."
@@ -194,40 +194,53 @@ class PythonHarness:
                     else:
                         result.text = response
                     return result
-                code = calls[0]
-                if len(result.tool_calls) == self.max_tool_calls:
-                    result.error = "Python tool budget exhausted (10 executions per problem)."
-                    return result
-                execution = self.execute(code, directory)
-                result.tool_calls.append(execution)
-                result.interactions.extend(
-                    [
-                        {
-                            "type": "command",
-                            "argv": execution.command,
-                            "cwd": execution.cwd,
-                            "code": code,
-                            "timeout": self.timeout,
-                        },
-                        {"type": "stdout", "content": execution.stdout},
-                        {"type": "stderr", "content": execution.stderr},
-                        {
-                            "type": "process_exit",
-                            "returncode": execution.returncode,
-                            "timed_out": execution.timed_out,
-                        },
-                    ]
-                )
                 remaining = self.max_tool_calls - len(result.tool_calls)
-                message = (
-                    f"Python tool result:\n"
-                    f"stdout:\n{execution.stdout}\n"
-                    f"stderr:\n{execution.stderr}\n"
-                    f"exit code: {execution.returncode}\n"
-                    f"timed out: {execution.timed_out}\n"
-                    f"Function calls executed: {execution.function_call_count}.\n"
+                if len(calls) > remaining:
+                    result.error = (
+                        "Python tool budget exhausted (10 executions per problem; "
+                        f"requested {len(calls)} with {remaining} remaining)."
+                    )
+                    return result
+                feedback = []
+                for index, code in enumerate(calls, 1):
+                    execution = self.execute(code, directory)
+                    result.tool_calls.append(execution)
+                    result.interactions.extend(
+                        [
+                            {
+                                "type": "command",
+                                "argv": execution.command,
+                                "cwd": execution.cwd,
+                                "code": code,
+                                "timeout": self.timeout,
+                            },
+                            {"type": "stdout", "content": execution.stdout},
+                            {"type": "stderr", "content": execution.stderr},
+                            {
+                                "type": "process_exit",
+                                "returncode": execution.returncode,
+                                "timed_out": execution.timed_out,
+                            },
+                        ]
+                    )
+                    heading = (
+                        "Python tool result"
+                        if len(calls) == 1
+                        else f"Python tool result {index}/{len(calls)}"
+                    )
+                    feedback.append(
+                        f"{heading}:\n"
+                        f"stdout:\n{execution.stdout}\n"
+                        f"stderr:\n{execution.stderr}\n"
+                        f"exit code: {execution.returncode}\n"
+                        f"timed out: {execution.timed_out}\n"
+                        f"Function calls executed: {execution.function_call_count}."
+                    )
+                remaining = self.max_tool_calls - len(result.tool_calls)
+                message = "\n\n".join(feedback) + (
+                    "\n"
                     f"Remaining Python tool calls: {remaining}.\n"
-                    "The preceding <python> block was executed, not accepted as a final "
+                    "The preceding <python> blocks were executed, not accepted as a final "
                     "answer. An empty stdout means the script printed nothing; defining "
                     "a function does not call it.\n"
                     "To finish, return your final function in a ```python markdown "
