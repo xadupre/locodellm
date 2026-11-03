@@ -149,6 +149,11 @@ After the tenth execution the model can still provide its final function,
 but an eleventh request is refused and the problem is marked failed.
 Hidden test inputs and expected results are not supplied to the tool.
 
+Final functions also accept ``<python>...</python>`` instead of Markdown fences.
+A tagged block containing only function definitions and imports is a final
+answer, not a tool request. Scripts containing top-level calls, ``print``, or
+``assert`` statements still request execution and receive tool feedback.
+
 Each script runs in a fresh Python process, with the current interpreter,
 in a temporary working directory shared only across that problem's calls.
 Executions time out after 10 seconds, and each stdout/stderr response is

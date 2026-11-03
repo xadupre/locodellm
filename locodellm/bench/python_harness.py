@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -21,9 +22,23 @@ Each script runs in a fresh Python process in the same temporary directory.
 When finished, return your final function in a Python markdown code block,
 without a tool call. Tool calls are optional. The hidden benchmark tests are
 not available to the tool.
+Final functions may also use <python>...</python> if the block contains only
+function definitions and imports. Include print or assert statements when
+requesting execution to check a function.
 
 Problem:
 """
+
+
+def _is_final_function(code: str) -> bool:
+    """Recognizes definition-only answers without executing candidate code."""
+    try:
+        body = ast.parse(code).body
+    except SyntaxError:
+        return False
+    return any(isinstance(node, ast.FunctionDef) for node in body) and all(
+        isinstance(node, (ast.FunctionDef, ast.Import, ast.ImportFrom)) for node in body
+    )
 
 
 @dataclass
@@ -146,11 +161,13 @@ class PythonHarness:
                     else:
                         result.text = response
                     return result
+                code = call.group(1)
+                if _is_final_function(code):
+                    result.text = response
+                    return result
                 if len(result.tool_calls) == self.max_tool_calls:
                     result.error = "Python tool budget exhausted (10 executions per problem)."
                     return result
-
-                code = call.group(1)
                 execution = self.execute(code, directory)
                 result.tool_calls.append(execution)
                 result.interactions.extend(

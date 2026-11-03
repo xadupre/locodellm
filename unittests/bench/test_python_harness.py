@@ -150,6 +150,62 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIn("budget exhausted", result.to_json()[0]["harness_error"])
         self.assertFalse(result.results[0].run_status.compiled)
 
+    def test_tagged_final_function_after_verification(self):
+        """Accepts tagged definitions after testing instead of repeating tool calls."""
+        final = (
+            "<think>Now return the function.</think>\n<python>\n"
+            "from math import factorial\n"
+            "def answer():\n"
+            "    return factorial(5)\n</python>"
+        )
+        session = ScriptedSession(
+            [
+                (
+                    "<python>def answer():\n    return 120\n"
+                    "assert answer() == 120\nprint(answer())</python>"
+                ),
+                final,
+            ]
+        )
+        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 120)])]).run(
+            session, harness=PythonHarness()
+        )
+        self.assertEqual(result.passed, 1)
+        case = result.results[0]
+        self.assertEqual(case.tool_call_count, 1)
+        self.assertEqual(case.tool_calls[0].stdout, "120\n")
+        self.assertEqual(len(session.children[0].turns), 2)
+        responses = [
+            event for event in result.to_json()[0]["events"] if event["type"] == "model_response"
+        ]
+        self.assertEqual(responses[-1]["content"], final)
+
+    def test_tagged_answer_at_tool_budget_boundary(self):
+        """Accepts a tagged final function even after all executions are consumed."""
+        answer = 'def answer():\n    return "<think>literal</think>"'
+        for calls in [0, 10]:
+            with self.subTest(calls=calls):
+                session = ScriptedSession(
+                    ["<python>pass</python>"] * calls + [f"<python>{answer}</python>"]
+                )
+                result = BenchPromptTest(
+                    [PromptTest("Problem.", [ExpectedResult((), "<think>literal</think>")])]
+                ).run(session, harness=PythonHarness())
+                self.assertEqual(result.passed, 1)
+                self.assertEqual(result.results[0].tool_call_count, calls)
+                self.assertEqual(extract_code(f"<python>{answer}</python>"), answer)
+
+    def test_invalid_tagged_script_receives_tool_feedback(self):
+        """Keeps invalid Python scripts on the tool execution error path."""
+        session = ScriptedSession(
+            ["<python>def answer(:</python>", "<python>def answer():\n    return 42</python>"]
+        )
+        result = PythonHarness().run(session, "Problem.", max_length=100)
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertIn("SyntaxError", result.tool_calls[0].stderr)
+        self.assertIn("SyntaxError", session.turns[1][0])
+
     def test_timeout_feedback_and_working_directory(self):
         """Counts timed-out executions and preserves files between calls."""
         session = ScriptedSession(
