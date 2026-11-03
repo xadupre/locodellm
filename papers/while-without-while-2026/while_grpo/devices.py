@@ -1,0 +1,80 @@
+"""Selects all idle visible GPUs using the original study's device policy."""
+
+import csv
+import os
+import subprocess
+
+
+def select_devices(device, visible_uuids, busy_uuids):
+    """Uses every idle visible GPU, without a task-count or eight-device hard cap."""
+    if device != "cuda":
+        return [device]
+    busy = {str(uuid).removeprefix("GPU-") for uuid in busy_uuids}
+    devices = [
+        f"cuda:{index}"
+        for index, uuid in enumerate(visible_uuids)
+        if str(uuid).removeprefix("GPU-") not in busy
+    ]
+    if not devices:
+        raise RuntimeError("No idle visible CUDA GPU. Use cpu or an explicit cuda:N to share.")
+    return devices
+
+
+def query_busy_gpus():
+    """Queries process ownership and reports unavailable tools or malformed CSV explicitly."""
+    hint = (
+        "Check nvidia-smi and the NVIDIA driver, or use --device cpu "
+        "or an explicit --device cuda:N to bypass idle detection."
+    )
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Cannot query GPU availability: {error}. {hint}") from error
+    if result.returncode:
+        error = result.stderr.strip() or f"exit status {result.returncode}"
+        raise RuntimeError(f"Cannot query GPU availability: {error}. {hint}")
+    busy = set()
+    try:
+        for row in csv.reader(result.stdout.splitlines(), strict=True):
+            if not row or (len(row) == 1 and not row[0].strip()):
+                continue
+            if len(row) != 2 or not row[0].strip():
+                raise ValueError(f"Expected a GPU UUID and PID, got {row!r}")
+            uuid, pid_text = row
+            pid = int(pid_text.strip())
+            if pid <= 0:
+                raise ValueError(f"Expected a positive PID, got {pid}")
+            if pid != os.getpid():
+                busy.add(uuid.strip())
+    except (csv.Error, ValueError) as error:
+        raise RuntimeError(
+            f"Cannot parse GPU availability from nvidia-smi: {error}. {hint}"
+        ) from error
+    return busy
+
+
+def discover_devices(device):
+    """Queries active compute processes before creating any model replicas."""
+    import torch
+
+    if device == "cpu":
+        return ["cpu"]
+    if device != "cuda":
+        if not device.startswith("cuda:") or not device[5:].isdigit():
+            raise ValueError("device must be cpu, cuda, or cuda:N.")
+        if int(device[5:]) >= torch.cuda.device_count():
+            raise ValueError(f"Device is not visible: {device}")
+        return [device]
+    visible = [
+        str(torch.cuda.get_device_properties(index).uuid)
+        for index in range(torch.cuda.device_count())
+    ]
+    if not visible:
+        raise RuntimeError("CUDA requested, but no GPU is visible.")
+    return select_devices(device, visible, query_busy_gpus())

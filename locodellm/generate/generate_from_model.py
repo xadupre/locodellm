@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import threading
 from typing import Any
@@ -12,6 +13,8 @@ from locodellm.session import SessionState, create_session
 _session_cache: dict[
     tuple[str, str | None, str | None, tuple[tuple[str, str], ...], str], SessionState
 ] = {}
+# Release native models before GenAI's module cleanup invokes OgaShutdown.
+atexit.register(_session_cache.clear)
 _cache_lock = threading.Lock()
 
 # Cache for converted model paths keyed by (model_id, precision).
