@@ -369,6 +369,69 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIn("Remaining Python tool calls: 8", feedback)
         self.assertLess(feedback.index("created"), feedback.index("42"))
 
+    def test_abbreviated_native_request(self):
+        """Executes complete code-parameter replies without guessing missing closing tags."""
+        request = (
+            "<parameter=code>\ndef answer():\n    return 42\n"
+            "print('<think>literal</think>', answer())\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        final = "```python\ndef answer():\n    return 42\n```"
+        response = "<think>Check the solution.</think>\n" + request
+        session = ScriptedSession([response, final])
+        result = PythonHarness().run(session, "Problem.", max_length=100)
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].stdout, "<think>literal</think> 42\n")
+        self.assertIn("<think>literal</think> 42", session.turns[1][0])
+        self.assertEqual(result.interactions[1]["content"], response)
+        for text in [
+            f"```text\n{request}\n```",
+            f"<think>{request}</think>",
+            request.removesuffix("</tool_call>"),
+            request.replace("</function>", ""),
+            "Example:\n" + request,
+            request.replace("<parameter=code>", "<parameter=other>"),
+            request.replace("<parameter=code>", "<tool_call><function=unknown><parameter=code>"),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(extract_python_calls(text), [])
+
+    def test_final_python_blocks_exclude_output_and_explanations(self):
+        """Scores published Python without compiling output or other-language fences."""
+        response = (
+            "<think>Prepare the answer.</think>\n"
+            "```python\ndef answer():\n    return helper()\n```\n"
+            "Explanation:\n```text\nThis is not Python.\n```\n"
+            "```py\ndef helper():\n    return 42\n```\n"
+            "Output:\n```\n42 is the result.\n```"
+        )
+        for harness in [None, PythonHarness()]:
+            with self.subTest(harness=harness):
+                session = ScriptedSession([response])
+                result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+                    session, harness=harness
+                )
+                self.assertEqual(result.passed, 1)
+                self.assertEqual(result.results[0].tool_call_count, 0)
+                self.assertEqual(result.results[0].interactions[1]["content"], response)
+        self.assertEqual(
+            extract_code("```\ndef answer():\n    return 42\n```"), "def answer():\n    return 42"
+        )
+        self.assertEqual(extract_code("```text\nprint('not code')\n```"), "")
+
+    def test_published_assertions_are_not_removed(self):
+        """Keeps incorrect self-tests as real evaluation failures."""
+        response = (
+            "```python\ndef answer():\n    return 42\nassert answer() == 0\n```\n"
+            "Output:\n```\n0\n```"
+        )
+        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+            ScriptedSession([response])
+        )
+        self.assertEqual(result.passed, 0)
+        self.assertIsInstance(result.results[0].run_status.run_error, AssertionError)
+
     def test_native_request_budget_and_unsupported_tools(self):
         """Rejects oversized native batches and unknown tools before executing scripts."""
         native = (

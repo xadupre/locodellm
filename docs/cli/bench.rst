@@ -151,6 +151,10 @@ is also accepted, with ``stateful_python_code_exec`` or ``python`` as the tool
 name, as an explicit Python execution request outside Markdown fences and
 thinking. Despite the native tool name, it uses the same fresh-process
 semantics as ``<python>``; Python variables do not persist between scripts.
+The abbreviated Nemotron response starting with ``<parameter=code>`` is also
+recognized when it occupies the entire answer after thinking and ends with
+``</parameter></function></tool_call>``. Missing closing tags and unknown
+explicit tool names remain errors.
 Grouped calls execute sequentially in message order, not concurrently, because
 scripts can depend on files in their shared working directory. All results are
 returned together before the next model response, even if a script fails.
@@ -159,6 +163,12 @@ rejected in full without executing any of its scripts.
 After the tenth execution the model can still provide its final function,
 but an eleventh request is refused and the problem is marked failed.
 Hidden test inputs and expected results are not supplied to the tool.
+
+Final-answer extraction prefers Markdown blocks labelled ``python`` or ``py``
+and ignores accompanying unlabelled output or other-language blocks. When no
+Python-labelled block is present, unlabelled blocks remain accepted as code.
+Assertions included in the published Python code still execute and can fail;
+the parser does not remove incorrect checks to improve a score.
 
 Every ``<python>...</python>`` block outside Markdown fences requests execution,
 even if it only defines functions or accompanies a proposed final answer.

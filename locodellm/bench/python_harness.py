@@ -15,7 +15,8 @@ from locodellm.utils import strip_thinking
 _PYTHON_CALL = re.compile(
     r"```.*?```|<python>\s*(.*?)\s*</python>"
     r"|<tool_call>\s*<function=(?:stateful_python_code_exec|python)>\s*"
-    r"<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>",
+    r"<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>"
+    r"|\A<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>\Z",
     re.DOTALL,
 )
 _INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
