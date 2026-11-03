@@ -35,9 +35,23 @@ Options
 
 ``--precision``
     Precision qualifier for conversion (e.g. ``fp32``, ``fp16``, ``int4``).
+    With PyTorch, selects the loading dtype: ``auto`` (default), ``fp32``,
+    ``fp16``, or ``bf16``. It does not quantize the model.
+
+``--backend``
+    Generation backend: ``onnx`` (default) or ``pytorch``. The PyTorch backend
+    loads Hugging Face Transformers checkpoints directly, without ONNX
+    conversion. It supports both built-in benchmarks (including the Python
+    tool harness) and generation-based LM-Eval tasks.
+
+``--device``
+    PyTorch device, e.g. ``cpu`` (default), ``cuda``, or ``cuda:0``.
+    ``auto`` lets Accelerate distribute model weights across available
+    devices. Requires ``--backend pytorch``.
 
 ``--provider``
-    Execution provider (e.g. ``CUDAExecutionProvider``).
+    ONNX execution provider (e.g. ``CUDAExecutionProvider``). This option,
+    ``--provider-option``, and ``--session-option`` cannot be used with PyTorch.
 
 ``--provider-option NAME=VALUE``
     ONNX Runtime option for the selected provider. May be repeated.
@@ -60,6 +74,9 @@ Options
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
+    With PyTorch, the tokenizer's native chat template is used by default
+    when available; otherwise prompts are sent as plain text. An explicit
+    ``chatml`` overrides the native template.
 
 ``--output, -o``
     Built-in benchmark output path. Every output writes a detailed ``.json``
@@ -182,6 +199,53 @@ the existing in-process execution behavior.
 Examples
 --------
 
+Run directly with PyTorch
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the optional backend dependencies:
+
+.. code-block:: bash
+
+    pip install "locodellm[pytorch]"
+
+Load a native Qwen3.5 checkpoint without converting it to ONNX:
+
+.. code-block:: bash
+
+    python -m locodellm bench Qwen/Qwen3.5-4B basic \
+        --backend pytorch --device cuda --precision bf16 \
+        --max-length 1024 --output results.xlsx
+
+For a pre-quantized Transformers checkpoint, omit ``--precision int4``:
+the model's own quantization configuration is used. For example:
+
+.. code-block:: bash
+
+    python -m locodellm bench QuantTrio/Qwen3.5-4B-AWQ basic \
+        --backend pytorch --device cuda --max-length 1024 \
+        --output results.xlsx
+
+AWQ, GPTQ, and FP8 checkpoints require their respective Transformers
+quantization dependencies, supported kernels, and compatible hardware.
+The PyTorch extra alone does not guarantee support for every quantization.
+GGUF files and ``mock/`` ONNX models are not PyTorch checkpoints.
+Qwen3.5 vision-language checkpoints are loaded with
+``AutoModelForImageTextToText`` for text-only benchmark prompts.
+
+Use the Python tool harness independently of the inference backend:
+
+.. code-block:: bash
+
+    python -m locodellm bench Qwen/Qwen3.5-4B basic \
+        --backend pytorch --device cuda --harness python --max-length 1024
+
+CSV exports and the Excel ``raw_data`` sheet include ``backend`` and
+``device`` columns so PyTorch runs can be distinguished from ONNX runs.
+ONNX remains the default.
+
+Run with ONNX Runtime GenAI
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Install the optional dependency before running LM-Eval benchmarks:
 
 .. code-block:: bash
@@ -194,9 +258,9 @@ Run ten samples from the LM-Eval ``gsm8k`` task:
 
     python -m locodellm bench path/to/model gsm8k --limit 10
 
-Only LM-Eval tasks using ``generate_until`` are supported; likelihood and
-perplexity tasks require model logits, which ONNX Runtime GenAI does not
-expose.
+Only LM-Eval tasks using ``generate_until`` are supported by the session
+adapter, with either backend. Likelihood and perplexity tasks are not
+implemented by this adapter.
 
 Run with the mock model:
 

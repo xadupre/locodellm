@@ -10,9 +10,7 @@ from typing import Any
 from locodellm.session import SessionState, create_session
 
 # Thread-safe cache for loaded sessions keyed by model and runtime configuration.
-_session_cache: dict[
-    tuple[str, str | None, str | None, tuple[tuple[str, str], ...], str], SessionState
-] = {}
+_session_cache: dict[tuple[Any, ...], SessionState] = {}
 # Release native models before GenAI's module cleanup invokes OgaShutdown.
 atexit.register(_session_cache.clear)
 _cache_lock = threading.Lock()
@@ -148,6 +146,8 @@ def get_session(
     cache_dir: str | None = None,
     chat_template: str | None = None,
     verbose: int = 0,
+    backend: str = "onnx",
+    device: str | None = None,
 ) -> SessionState:
     """Returns a cached session for the given model, creating it on first access.
 
@@ -163,10 +163,39 @@ def get_session(
         cache_dir: Directory for storing converted models.
         chat_template: Chat template name (e.g. ``"chatml"``).
         verbose: Verbosity level.
+        backend: ``"onnx"`` (default) or native ``"pytorch"`` generation.
+        device: PyTorch device, e.g. ``"cpu"``, ``"cuda:0"``, or ``"auto"``.
 
     Returns:
         A :class:`~locodellm.session.SessionState` ready for generation.
     """
+    if backend not in {"onnx", "pytorch"}:
+        raise ValueError(f"Unknown backend: {backend!r}. Expected onnx or pytorch.")
+    if backend == "pytorch":
+        if provider or provider_options or session_options:
+            raise ValueError(
+                "--provider, --provider-option and --session-option are ONNX-only; "
+                "use --device with --backend pytorch."
+            )
+        from locodellm.session.pytorch_session import create_pytorch_session
+
+        pytorch_key = ("pytorch", model_id, precision, device, cache_dir, chat_template)
+        with _cache_lock:
+            if pytorch_key in _session_cache:
+                return _session_cache[pytorch_key]
+        pytorch_session = create_pytorch_session(
+            model_id,
+            precision=precision,
+            device=device,
+            cache_dir=cache_dir,
+            chat_template=chat_template,
+            verbose=verbose,
+        )
+        with _cache_lock:
+            _session_cache[pytorch_key] = pytorch_session
+        return pytorch_session
+    if device is not None:
+        raise ValueError("--device requires --backend pytorch; use --provider for ONNX.")
     if provider_options and provider is None:
         raise ValueError("Provider options require an execution provider.")
     import json

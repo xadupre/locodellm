@@ -36,6 +36,9 @@ class _Session:
     def _wrap_prompt(self, prompt):
         return prompt
 
+    def get_prompt_length(self, prompt):
+        return len(self.tokenizer.encode(self._wrap_prompt(prompt)))
+
     def generate(self, prompt, **kwargs):
         self.calls.append((prompt, kwargs))
         return self
@@ -236,6 +239,8 @@ class TestLmEvalCommand(unittest.TestCase):
             num_fewshot=None,
             limit=10,
             verbose=0,
+            backend="onnx",
+            device=None,
         )
         with patch.dict(sys.modules, {"locodellm.lm_eval": adapter, "lm_eval.utils": utils}):
             _cmd_lm_eval(args)

@@ -24,6 +24,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+pytorch = [
+    "torch",
+    "accelerate",
+    "transformers>=5.3",
+]
 style = [
     "black==26.5.1",
     "ruff==0.15.20",
@@ -34,6 +39,7 @@ typing = [
 ]
 dev = [
     "locodellm[style]",
+    "locodellm[pytorch]",
     "pytest>=7",
     "pytest-cov",
     "onnx",
