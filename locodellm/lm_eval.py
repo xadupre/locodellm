@@ -1,4 +1,4 @@
-"""Connects ONNX Runtime GenAI models to LM Evaluation Harness."""
+"""Connects generation sessions to LM Evaluation Harness."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from locodellm.generate.generate_from_model import get_session
 
 
 class OnnxRuntimeGenAILM(LM):
-    """Runs LM-Eval generation requests with an ONNX Runtime GenAI model."""
+    """Runs LM-Eval generation requests with an ONNX or PyTorch model."""
 
     def __init__(
         self,
@@ -22,6 +22,8 @@ class OnnxRuntimeGenAILM(LM):
         chat_template: str | None = None,
         max_length: int = 2048,
         verbose: int = 0,
+        backend: str = "onnx",
+        device: str | None = None,
     ) -> None:
         super().__init__()
         self.model_id = model
@@ -34,6 +36,8 @@ class OnnxRuntimeGenAILM(LM):
             session_options=session_options,
             chat_template=chat_template,
             verbose=int(verbose),
+            backend=backend,
+            device=device,
         )
 
     @property
@@ -42,12 +46,12 @@ class OnnxRuntimeGenAILM(LM):
         return self.model_id
 
     def loglikelihood(self, requests: list[Any]) -> list[tuple[float, bool]]:
-        """Rejects likelihood requests unsupported by ONNX Runtime GenAI."""
-        raise NotImplementedError("ONNX Runtime GenAI only supports LM-Eval generation tasks.")
+        """Rejects likelihood requests not implemented by the session adapter."""
+        raise NotImplementedError("This session adapter only supports LM-Eval generation tasks.")
 
     def loglikelihood_rolling(self, requests: list[Any]) -> list[float]:
-        """Rejects rolling likelihood requests unsupported by ONNX Runtime GenAI."""
-        raise NotImplementedError("ONNX Runtime GenAI only supports LM-Eval generation tasks.")
+        """Rejects rolling likelihood requests not implemented by the session adapter."""
+        raise NotImplementedError("This session adapter only supports LM-Eval generation tasks.")
 
     def generate_until(self, requests: list[Any]) -> list[str]:
         """Generates one continuation for every LM-Eval request."""
@@ -63,7 +67,7 @@ class OnnxRuntimeGenAILM(LM):
             max_gen_toks = int(options.pop("max_gen_toks", 256))
 
             current = self.session.new_session()
-            prompt_length = len(current.tokenizer.encode(current._wrap_prompt(context)))
+            prompt_length = current.get_prompt_length(context)
             max_length = min(prompt_length + max_gen_toks, self.max_length)
             if max_length <= prompt_length:
                 raise ValueError(
@@ -92,8 +96,10 @@ def run_lm_eval(
     num_fewshot: int | None = None,
     limit: float | None = None,
     verbose: int = 0,
+    backend: str = "onnx",
+    device: str | None = None,
 ) -> dict[str, Any] | None:
-    """Runs LM Evaluation Harness with an ONNX Runtime GenAI model."""
+    """Runs LM Evaluation Harness generation tasks with the selected backend."""
     from lm_eval.evaluator import simple_evaluate
 
     evaluator_model = OnnxRuntimeGenAILM(
@@ -105,6 +111,8 @@ def run_lm_eval(
         chat_template=chat_template,
         max_length=max_length,
         verbose=verbose,
+        backend=backend,
+        device=device,
     )
     return simple_evaluate(
         model=evaluator_model, tasks=tasks, num_fewshot=num_fewshot, limit=limit

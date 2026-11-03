@@ -35,9 +35,23 @@ Options
 
 ``--precision``
     Precision qualifier for conversion (e.g. ``fp32``, ``fp16``, ``int4``).
+    With PyTorch, selects the loading dtype: ``auto`` (default), ``fp32``,
+    ``fp16``, or ``bf16``. It does not quantize the model.
+
+``--backend``
+    Generation backend: ``onnx`` (default) or ``pytorch``. The PyTorch backend
+    loads Hugging Face Transformers checkpoints directly, without ONNX
+    conversion. It supports both built-in benchmarks (including the Python
+    tool harness) and generation-based LM-Eval tasks.
+
+``--device``
+    PyTorch device, e.g. ``cpu`` (default), ``cuda``, or ``cuda:0``.
+    ``auto`` lets Accelerate distribute model weights across available
+    devices. Requires ``--backend pytorch``.
 
 ``--provider``
-    Execution provider (e.g. ``CUDAExecutionProvider``).
+    ONNX execution provider (e.g. ``CUDAExecutionProvider``). This option,
+    ``--provider-option``, and ``--session-option`` cannot be used with PyTorch.
 
 ``--provider-option NAME=VALUE``
     ONNX Runtime option for the selected provider. May be repeated.
@@ -60,6 +74,9 @@ Options
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
+    With PyTorch, the tokenizer's native chat template is used by default
+    when available; otherwise prompts are sent as plain text. An explicit
+    ``chatml`` overrides the native template.
 
 ``--output, -o``
     Built-in benchmark output path. Every output writes a detailed ``.json``
@@ -117,7 +134,7 @@ final benchmark scoring does not. Without the harness these counts are zero.
 Python tool harness
 -------------------
 
-Runs the same built-in problems with optional tool use:
+Runs the same built-in problems with Python execution and feedback:
 
 .. code-block:: bash
 
@@ -125,12 +142,38 @@ Runs the same built-in problems with optional tool use:
         --harness python --chat-template chatml --max-length 1024 \
         --output results.xlsx --verbose 1
 
-The model is instructed to request one execution per turn using
-``<python>...script...</python>``. The application executes the script and
+The model can request one or more executions per turn using
+``<python>...script...</python>`` blocks. The application executes the scripts and
 returns stdout, stderr, exit code, timeout status, and the remaining budget.
+Grouped calls execute sequentially in message order, not concurrently, because
+scripts can depend on files in their shared working directory. All results are
+returned together before the next model response, even if a script fails.
+Each block consumes one execution; a batch exceeding the remaining budget is
+rejected in full without executing any of its scripts.
 After the tenth execution the model can still provide its final function,
 but an eleventh request is refused and the problem is marked failed.
 Hidden test inputs and expected results are not supplied to the tool.
+
+Every ``<python>...</python>`` block outside Markdown fences requests execution,
+even if it only defines functions or accompanies a proposed final answer.
+The model always receives stdout, stderr, and execution status before another
+generation. Defining a function alone produces no output; the model must include
+its own calls, ``print``, or ``assert`` statements to check its behavior.
+Final functions use Markdown fences without tool tags. Tool use is optional:
+a final answer is accepted without requiring any script or function execution.
+Only the explicit message format distinguishes tool requests from published code.
+
+The summary reports ``success_rate`` over benchmark test inputs,
+``avg_generated_tokens`` and ``avg_prompts`` per problem, and
+``total_function_calls``. Token totals include thinking and all model responses;
+prompt counts include the initial prompt and every subsequent model turn.
+``function_call_count`` counts actual invocations of Python functions defined in
+tool scripts, including recursive and helper calls, not definitions or hidden-test
+evaluation. ``tool_call_count`` separately counts executed scripts.
+``multi_tool_turn_count`` counts model responses requesting at least two scripts,
+and ``max_tool_calls_per_turn`` records the largest requested batch, including a
+batch rejected for exceeding the budget. These describe grouped requests, not
+parallel execution.
 
 Each script runs in a fresh Python process, with the current interpreter,
 in a temporary working directory shared only across that problem's calls.
@@ -165,6 +208,10 @@ prompts include their own ``generation_options``.
 Responses preserve any ``<think>`` sections or other reasoning text actually
 emitted by the model. Internal reasoning that the model does not expose
 cannot be recorded.
+Tool-call detection and final code extraction ignore this thinking text,
+including when the opening ``<think>`` was already supplied by the tokenizer's
+chat template. The complete original responses remain unchanged in the JSON
+events, and token counts still include reasoning tokens.
 
 The final evaluation includes compilation/execution errors and the per-input
 results, solely for inspection in the JSON file. It is **never sent to the
@@ -182,6 +229,53 @@ the existing in-process execution behavior.
 Examples
 --------
 
+Run directly with PyTorch
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Install the optional backend dependencies:
+
+.. code-block:: bash
+
+    pip install "locodellm[pytorch]"
+
+Load a native Qwen3.5 checkpoint without converting it to ONNX:
+
+.. code-block:: bash
+
+    python -m locodellm bench Qwen/Qwen3.5-4B basic \
+        --backend pytorch --device cuda --precision bf16 \
+        --max-length 1024 --output results.xlsx
+
+For a pre-quantized Transformers checkpoint, omit ``--precision int4``:
+the model's own quantization configuration is used. For example:
+
+.. code-block:: bash
+
+    python -m locodellm bench QuantTrio/Qwen3.5-4B-AWQ basic \
+        --backend pytorch --device cuda --max-length 1024 \
+        --output results.xlsx
+
+AWQ, GPTQ, and FP8 checkpoints require their respective Transformers
+quantization dependencies, supported kernels, and compatible hardware.
+The PyTorch extra alone does not guarantee support for every quantization.
+GGUF files and ``mock/`` ONNX models are not PyTorch checkpoints.
+Qwen3.5 vision-language checkpoints are loaded with
+``AutoModelForImageTextToText`` for text-only benchmark prompts.
+
+Use the Python tool harness independently of the inference backend:
+
+.. code-block:: bash
+
+    python -m locodellm bench Qwen/Qwen3.5-4B basic \
+        --backend pytorch --device cuda --harness python --max-length 1024
+
+CSV exports and the Excel ``raw_data`` sheet include ``backend`` and
+``device`` columns so PyTorch runs can be distinguished from ONNX runs.
+ONNX remains the default.
+
+Run with ONNX Runtime GenAI
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Install the optional dependency before running LM-Eval benchmarks:
 
 .. code-block:: bash
@@ -194,9 +288,9 @@ Run ten samples from the LM-Eval ``gsm8k`` task:
 
     python -m locodellm bench path/to/model gsm8k --limit 10
 
-Only LM-Eval tasks using ``generate_until`` are supported; likelihood and
-perplexity tasks require model logits, which ONNX Runtime GenAI does not
-expose.
+Only LM-Eval tasks using ``generate_until`` are supported by the session
+adapter, with either backend. Likelihood and perplexity tasks are not
+implemented by this adapter.
 
 Run with the mock model:
 

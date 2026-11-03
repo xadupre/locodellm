@@ -10,17 +10,52 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-_PYTHON_CALL = re.compile(r"\s*<python>\s*(.*?)\s*</python>\s*", re.DOTALL)
-_INSTRUCTIONS = """You may use a Python tool up to 10 times to solve this problem.
-To call it, reply ONLY with <python> followed by a complete Python script and
-</python>. Print the values you want to inspect. You will receive stdout,
+from locodellm.utils import strip_thinking
+
+_PYTHON_CALL = re.compile(r"```.*?```|<python>\s*(.*?)\s*</python>", re.DOTALL)
+_INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
+You may execute up to 10 scripts to solve this problem.
+To call it, reply with one or more <python>...</python> blocks, each containing
+a complete Python script. Blocks execute in order, and their results are returned
+together before your next response. Each block consumes one execution.
+Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
 Each script runs in a fresh Python process in the same temporary directory.
 When finished, return your final function in a Python markdown code block,
-without a tool call. Tool calls are optional. The hidden benchmark tests are
+without a tool call. The hidden benchmark tests are
 not available to the tool.
+Every <python>...</python> block is an execution request, never a final answer.
+A function definition alone does not call the function or print anything.
+Include calls and print or assert statements to check your solution.
 
 Problem:
+"""
+# Shared memory preserves completed function calls even when the script times out.
+_TOOL_RUNNER = """
+import mmap
+import runpy
+import struct
+import sys
+
+counter_path, script = sys.argv[1:]
+sys.argv = [script]
+with open(counter_path, "r+b") as counter_file:
+    with mmap.mmap(counter_file.fileno(), 8) as counter:
+        def record_call(frame, event, argument):
+            name = frame.f_code.co_name
+            if (
+                event == "call"
+                and frame.f_code.co_filename == script
+                and (not name.startswith("<") or name == "<lambda>")
+            ):
+                count = struct.unpack_from("Q", counter)[0]
+                struct.pack_into("Q", counter, 0, count + 1)
+
+        sys.setprofile(record_call)
+        try:
+            runpy.run_path(script, run_name="__main__")
+        finally:
+            sys.setprofile(None)
 """
 
 
@@ -35,6 +70,7 @@ class PythonToolResult:
     timed_out: bool
     command: list[str]
     cwd: str
+    function_call_count: int = 0
 
 
 @dataclass
@@ -82,7 +118,9 @@ class PythonHarness:
         """Executes a script and captures bounded output and execution status."""
         script = Path(directory) / "tool_script.py"
         script.write_text(code, encoding="utf-8")
-        command = [sys.executable, "-u", str(script)]
+        counter = Path(directory) / "tool_function_calls.bin"
+        counter.write_bytes(b"\0" * 8)
+        command = [sys.executable, "-u", "-c", _TOOL_RUNNER, str(counter), str(script)]
         timed_out = False
         returncode = None
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -110,7 +148,14 @@ class PythonHarness:
                 outputs.append(text)
 
         return PythonToolResult(
-            code, outputs[0], outputs[1], returncode, timed_out, command, directory
+            code,
+            outputs[0],
+            outputs[1],
+            returncode,
+            timed_out,
+            command,
+            directory,
+            int.from_bytes(counter.read_bytes(), sys.byteorder),
         )
 
     def run(
@@ -132,9 +177,14 @@ class PythonHarness:
                     **search_options,
                 )
                 result.token_count += session.generated_token_count
-                response = session.text.strip()
-                call = _PYTHON_CALL.fullmatch(response)
-                if call is None:
+                response = strip_thinking(session.text)
+                calls = [
+                    match.group(1)
+                    for match in _PYTHON_CALL.finditer(response)
+                    if match.group(1) is not None
+                ]
+                result.interactions[-1]["requested_tool_call_count"] = len(calls)
+                if not calls:
                     if not response:
                         result.error = "The model returned an empty answer."
                     elif response.startswith("<python") or response.endswith("</python>"):
@@ -144,39 +194,58 @@ class PythonHarness:
                     else:
                         result.text = response
                     return result
-                if len(result.tool_calls) == self.max_tool_calls:
-                    result.error = "Python tool budget exhausted (10 executions per problem)."
-                    return result
-
-                code = call.group(1)
-                execution = self.execute(code, directory)
-                result.tool_calls.append(execution)
-                result.interactions.extend(
-                    [
-                        {
-                            "type": "command",
-                            "argv": execution.command,
-                            "cwd": execution.cwd,
-                            "code": code,
-                            "timeout": self.timeout,
-                        },
-                        {"type": "stdout", "content": execution.stdout},
-                        {"type": "stderr", "content": execution.stderr},
-                        {
-                            "type": "process_exit",
-                            "returncode": execution.returncode,
-                            "timed_out": execution.timed_out,
-                        },
-                    ]
-                )
                 remaining = self.max_tool_calls - len(result.tool_calls)
-                message = (
-                    f"Python tool result:\n"
-                    f"stdout:\n{execution.stdout}\n"
-                    f"stderr:\n{execution.stderr}\n"
-                    f"exit code: {execution.returncode}\n"
-                    f"timed out: {execution.timed_out}\n"
+                if len(calls) > remaining:
+                    result.error = (
+                        "Python tool budget exhausted (10 executions per problem; "
+                        f"requested {len(calls)} with {remaining} remaining)."
+                    )
+                    return result
+                feedback = []
+                for index, code in enumerate(calls, 1):
+                    execution = self.execute(code, directory)
+                    result.tool_calls.append(execution)
+                    result.interactions.extend(
+                        [
+                            {
+                                "type": "command",
+                                "argv": execution.command,
+                                "cwd": execution.cwd,
+                                "code": code,
+                                "timeout": self.timeout,
+                            },
+                            {"type": "stdout", "content": execution.stdout},
+                            {"type": "stderr", "content": execution.stderr},
+                            {
+                                "type": "process_exit",
+                                "returncode": execution.returncode,
+                                "timed_out": execution.timed_out,
+                            },
+                        ]
+                    )
+                    heading = (
+                        "Python tool result"
+                        if len(calls) == 1
+                        else f"Python tool result {index}/{len(calls)}"
+                    )
+                    feedback.append(
+                        f"{heading}:\n"
+                        f"stdout:\n{execution.stdout}\n"
+                        f"stderr:\n{execution.stderr}\n"
+                        f"exit code: {execution.returncode}\n"
+                        f"timed out: {execution.timed_out}\n"
+                        f"Function calls executed: {execution.function_call_count}."
+                    )
+                remaining = self.max_tool_calls - len(result.tool_calls)
+                message = "\n\n".join(feedback) + (
+                    "\n"
                     f"Remaining Python tool calls: {remaining}.\n"
-                    "Return your final function or make another allowed tool call."
+                    "The preceding <python> blocks were executed, not accepted as a final "
+                    "answer. An empty stdout means the script printed nothing; defining "
+                    "a function does not call it.\n"
+                    "To finish, return your final function in a ```python markdown "
+                    "code block, WITHOUT <python> or </python> tags. Otherwise make "
+                    "another allowed tool call with your own checks."
                 )
+        result.error = "The model did not return a final answer within the conversation budget."
         return result

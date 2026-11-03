@@ -107,6 +107,10 @@ class SessionState:
             chat_template=self._chat_template,
         )
 
+    def get_prompt_length(self, prompt: str) -> int:
+        """Returns the token count of the history and the next wrapped prompt."""
+        return self.tokens.size + len(self.tokenizer.encode(self._wrap_prompt(prompt)))
+
     def generate(
         self,
         prompt: str,

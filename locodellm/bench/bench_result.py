@@ -46,6 +46,37 @@ class PromptTestResult:
         return len(self.tool_calls)
 
     @property
+    def function_call_count(self) -> int:
+        """Returns actual calls to functions defined in the Python tool scripts."""
+        return sum(call.function_call_count for call in self.tool_calls)
+
+    @property
+    def prompt_count(self) -> int:
+        """Returns all model prompts, including initial and tool-feedback turns."""
+        return sum(event["type"] == "prompt" for event in self.interactions)
+
+    @property
+    def multi_tool_turn_count(self) -> int:
+        """Returns the number of model responses requesting multiple tool executions."""
+        return sum(
+            event.get("requested_tool_call_count", 0) > 1
+            for event in self.interactions
+            if event["type"] == "model_response"
+        )
+
+    @property
+    def max_tool_calls_per_turn(self) -> int:
+        """Returns the largest number of tool executions requested in one response."""
+        return max(
+            (
+                event.get("requested_tool_call_count", 0)
+                for event in self.interactions
+                if event["type"] == "model_response"
+            ),
+            default=0,
+        )
+
+    @property
     def tokens_per_second(self) -> float:
         """Returns the token generation speed."""
         if self.duration > 0:
@@ -106,6 +137,10 @@ class BenchResult:
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
                 "tool_call_count": result.tool_call_count,
+                "function_call_count": result.function_call_count,
+                "prompt_count": result.prompt_count,
+                "multi_tool_turn_count": result.multi_tool_turn_count,
+                "max_tool_calls_per_turn": result.max_tool_calls_per_turn,
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,
                 "ran": result.run_status.ran,
@@ -137,6 +172,10 @@ class BenchResult:
                 "token_count": result.token_count,
                 "tokens_per_second": result.tokens_per_second,
                 "tool_call_count": result.tool_call_count,
+                "function_call_count": result.function_call_count,
+                "prompt_count": result.prompt_count,
+                "multi_tool_turn_count": result.multi_tool_turn_count,
+                "max_tool_calls_per_turn": result.max_tool_calls_per_turn,
                 "tool_calls": [asdict(call) for call in result.tool_calls],
                 "harness_error": result.harness_error,
                 "compiled": result.run_status.compiled,

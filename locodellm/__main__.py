@@ -178,6 +178,10 @@ def _compute_case_stats(df):  # noqa: ANN001, ANN202
                 "token_count": token_count,
                 "tokens_per_second": tokens_per_second,
                 "tool_call_count": tool_call_count,
+                "function_call_count": int(group["function_call_count"].iloc[0]),
+                "prompt_count": int(group["prompt_count"].iloc[0]),
+                "multi_tool_turn_count": int(group["multi_tool_turn_count"].iloc[0]),
+                "max_tool_calls_per_turn": int(group["max_tool_calls_per_turn"].iloc[0]),
                 "harness_error": group["harness_error"].iloc[0],
                 "compiled": compiled,
                 "ran": ran,
@@ -206,6 +210,8 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         session_options=dict(args.session_option),
         chat_template=args.chat_template,
         verbose=inner_verbose,
+        backend=args.backend,
+        device=args.device,
     )
 
     output_root, output_suffix = os.path.splitext(args.output) if args.output else (None, "")
@@ -232,6 +238,8 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
     df.insert(0, "model_id", args.model)
     df.insert(1, "precision", args.precision or "")
     df.insert(2, "provider", args.provider or "")
+    df.insert(3, "backend", args.backend)
+    df.insert(4, "device", args.device or ("cpu" if args.backend == "pytorch" else ""))
 
     # Compute per-case statistics.
     stats = _compute_case_stats(df)
@@ -243,6 +251,10 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         "token_count",
         "tokens_per_second",
         "tool_call_count",
+        "function_call_count",
+        "prompt_count",
+        "multi_tool_turn_count",
+        "max_tool_calls_per_turn",
         "harness_error",
         "compiled",
         "ran",
@@ -277,6 +289,21 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
             {"metric": "avg_duration", "value": avg_duration},
             {"metric": "avg_tokens_per_second", "value": avg_tokens_per_second},
             {"metric": "avg_score", "value": avg_score},
+            {
+                "metric": "success_rate",
+                "value": total_passed / total_inputs if total_inputs else 0.0,
+            },
+            {"metric": "avg_generated_tokens", "value": float(stats["token_count"].mean())},
+            {"metric": "avg_prompts", "value": float(stats["prompt_count"].mean())},
+            {"metric": "total_function_calls", "value": int(stats["function_call_count"].sum())},
+            {
+                "metric": "multi_tool_turn_count",
+                "value": int(stats["multi_tool_turn_count"].sum()),
+            },
+            {
+                "metric": "max_tool_calls_per_turn",
+                "value": int(stats["max_tool_calls_per_turn"].max()),
+            },
             {
                 "metric": "total_tool_calls",
                 "value": sum(item.tool_call_count for item in result.results),
@@ -323,6 +350,8 @@ def _cmd_lm_eval(args: argparse.Namespace) -> None:
         num_fewshot=args.num_fewshot,
         limit=args.limit,
         verbose=args.verbose,
+        backend=args.backend,
+        device=args.device,
     )
     if results is not None:
         print(make_table(results))
@@ -421,6 +450,9 @@ def main(args: list[str] | None = None) -> None:
             "  python -m locodellm bench mock/generate basic \\\n"
             "      --chat-template chatml --output results.xlsx\n"
             "  python -m locodellm bench ./model gsm8k --limit 10"
+            "\n"
+            "  python -m locodellm bench Qwen/Qwen3.5-4B basic \\\n"
+            "      --backend pytorch --device cuda --max-length 1024"
         ),
     )
     bench_parser.add_argument(
@@ -436,7 +468,23 @@ def main(args: list[str] | None = None) -> None:
         help="Benchmark name(s) (use 'python -m locodellm benchmarks' to list).",
     )
     bench_parser.add_argument(
-        "--precision", default=None, help="Precision qualifier (e.g. fp16, int4)."
+        "--precision",
+        default=None,
+        help="ONNX conversion precision, or PyTorch loading dtype (auto, fp32, fp16, bf16).",
+    )
+    bench_parser.add_argument(
+        "--backend",
+        choices=["onnx", "pytorch"],
+        default="onnx",
+        help="Generation backend (default: onnx). PyTorch loads Transformers weights directly.",
+    )
+    bench_parser.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "PyTorch device (cpu, cuda, cuda:0, auto). "
+            "Defaults to cpu; auto distributes weights."
+        ),
     )
     bench_parser.add_argument(
         "--provider", default=None, help="Execution provider (e.g. CUDAExecutionProvider)."
@@ -457,7 +505,9 @@ def main(args: list[str] | None = None) -> None:
         help="Enables up to ten model-requested Python executions per built-in problem.",
     )
     bench_parser.add_argument(
-        "--chat-template", default=None, help="Chat template (e.g. chatml)."
+        "--chat-template",
+        default=None,
+        help="Chat template (e.g. chatml). PyTorch defaults to the tokenizer's native template.",
     )
     bench_parser.add_argument(
         "--output",
@@ -503,6 +553,20 @@ def main(args: list[str] | None = None) -> None:
         chat_parser.error("--max-length must be positive")
     if parsed.command == "bench" and parsed.max_length is not None and parsed.max_length < 1:
         bench_parser.error("--max-length must be positive")
+    if parsed.command == "bench":
+        if parsed.backend == "pytorch":
+            if parsed.provider or parsed.provider_option or parsed.session_option:
+                bench_parser.error(
+                    "--provider, --provider-option and --session-option are ONNX-only; "
+                    "use --device with --backend pytorch"
+                )
+            if parsed.precision not in {None, "auto", "fp32", "fp16", "bf16"}:
+                bench_parser.error(
+                    "PyTorch --precision must be auto, fp32, fp16, or bf16; "
+                    "load pre-quantized weights by model id"
+                )
+        elif parsed.device is not None:
+            bench_parser.error("--device requires --backend pytorch")
 
     dispatch = {
         "version": _cmd_version,
