@@ -320,19 +320,28 @@ class TestPythonHarness(unittest.TestCase):
             "</parameter>\n</function>\n</tool_call>"
         )
         final = "```python\ndef answer():\n    return 42\n```"
-        response = "<think>Prepare the check.</think>\n" + request + "\n" + final
-        session = ScriptedSession([response, final])
-        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
-            session, harness=PythonHarness()
-        )
-        case = result.results[0]
-        self.assertEqual(result.passed, 1)
-        self.assertEqual(case.tool_call_count, 1)
-        self.assertEqual(case.prompt_count, 2)
-        self.assertEqual(case.tool_calls[0].stdout, "<think>literal</think> 42\n")
-        self.assertIn("stdout:\n<think>literal</think> 42\n", session.children[0].turns[1][0])
-        self.assertEqual(case.interactions[1]["content"], response)
-        self.assertEqual(case.interactions[1]["requested_tool_call_count"], 1)
+        for name in ["stateful_python_code_exec", "python"]:
+            with self.subTest(tool=name):
+                response = (
+                    "<think>Prepare the check.</think>\n"
+                    + request.replace("stateful_python_code_exec", name)
+                    + "\n"
+                    + final
+                )
+                session = ScriptedSession([response, final])
+                result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+                    session, harness=PythonHarness()
+                )
+                case = result.results[0]
+                self.assertEqual(result.passed, 1)
+                self.assertEqual(case.tool_call_count, 1)
+                self.assertEqual(case.prompt_count, 2)
+                self.assertEqual(case.tool_calls[0].stdout, "<think>literal</think> 42\n")
+                self.assertIn(
+                    "stdout:\n<think>literal</think> 42\n", session.children[0].turns[1][0]
+                )
+                self.assertEqual(case.interactions[1]["content"], response)
+                self.assertEqual(case.interactions[1]["requested_tool_call_count"], 1)
 
     def test_mixed_native_and_python_requests_preserve_order(self):
         """Combines native and Python-tagged requests without executing fenced examples."""
