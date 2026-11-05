@@ -284,6 +284,120 @@ class TestPyTorchSession(unittest.TestCase):
         self.assertEqual(result.tool_calls, [])
         self.assertIsNone(result.error)
 
+    def test_harness_feedback_reaches_model_input_without_replaying_script(self):
+        """Checks actual model inputs after execution with all supported chat modes."""
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+        from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        from locodellm.bench.python_harness import PythonHarness
+        from locodellm.session.pytorch_session import PyTorchSessionState
+
+        script = (
+            "<python>import sys\n"
+            "print('unique_stdout_42')\n"
+            "print('unique_stderr_17', file=sys.stderr)\n"
+            "sys.exit(3)</python>"
+        )
+        final = "The script returned unique_stdout_42 with exit code 3."
+        raw = Tokenizer(models.BPE())
+        raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        raw.decoder = decoders.ByteLevel()
+        raw.train_from_iterator(
+            [script, final],
+            trainers.BpeTrainer(
+                vocab_size=300,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                special_tokens=["[EOS]", "[PAD]"],
+            ),
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=raw, eos_token="[EOS]", pad_token="[PAD]"
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{ '<|' + message['role'] + '|>\\n' + message['content'] + '<|end|>\\n' }}"
+            "{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
+        )
+        model = GPT2LMHeadModel(
+            GPT2Config(
+                vocab_size=len(tokenizer),
+                n_positions=4096,
+                n_embd=8,
+                n_layer=1,
+                n_head=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                bos_token_id=None,
+            )
+        ).eval()
+
+        class RecordedResponses(LogitsProcessor):
+            """Forces two responses while recording actual Transformers input tokens."""
+
+            def __init__(self):
+                self.responses = [
+                    [*tokenizer.encode(text, add_special_tokens=False), tokenizer.eos_token_id]
+                    for text in (script, final)
+                ]
+                self.contexts = []
+                self.turn = 0
+                self.step = 0
+
+            def __call__(self, input_ids, scores):
+                if self.step == 0:
+                    self.contexts.append(
+                        tokenizer.decode(input_ids[0], skip_special_tokens=False)
+                    )
+                token = self.responses[self.turn][self.step]
+                scores.fill_(-float("inf"))
+                scores[:, token] = 0
+                self.step += 1
+                if self.step == len(self.responses[self.turn]):
+                    self.turn += 1
+                    self.step = 0
+                return scores
+
+        for mode in ("native", "chatml", "plain"):
+            with self.subTest(mode=mode):
+                tokenizer.chat_template = tokenizer.chat_template if mode != "plain" else None
+                session = PyTorchSessionState(
+                    model, tokenizer, chat_template="chatml" if mode == "chatml" else None
+                )
+                processor = RecordedResponses()
+                result = PythonHarness(max_tool_calls=2).run(
+                    session,
+                    "Inspect the script result and then answer.",
+                    max_length=256,
+                    logits_processor=LogitsProcessorList([processor]),
+                )
+                self.assertIsNone(result.error)
+                self.assertEqual(result.text, final)
+                self.assertEqual(len(result.tool_calls), 1)
+                self.assertEqual(result.tool_calls[0].stdout, "unique_stdout_42\n")
+                self.assertEqual(result.tool_calls[0].stderr, "unique_stderr_17\n")
+                self.assertEqual(result.tool_calls[0].returncode, 3)
+                self.assertEqual(len(processor.contexts), 2)
+                feedback = next(
+                    event["content"]
+                    for event in result.interactions[2:]
+                    if event["type"] == "prompt"
+                )
+                context = processor.contexts[1]
+                self.assertIn(feedback, context)
+                self.assertIn("stdout:\nunique_stdout_42\n", context)
+                self.assertIn("stderr:\nunique_stderr_17\n", context)
+                self.assertIn("exit code: 3", context)
+                self.assertIn("Remaining Python tool calls: 1", context)
+                self.assertEqual(context.count(script), 1)
+                self.assertEqual(context.count("Inspect the script result and then answer."), 1)
+                self.assertEqual(context.count(feedback), 1)
+                self.assertEqual(processor.contexts[0].count(feedback), 0)
+                self.assertEqual(
+                    [message["role"] for message in session.messages],
+                    ["user", "assistant", "user", "assistant"],
+                )
+
     def test_qwen35_text_generation(self):
         """Loads a tiny multimodal Qwen3.5 checkpoint and generates text offline."""
         import torch

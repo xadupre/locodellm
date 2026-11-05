@@ -865,6 +865,11 @@ class TestPythonHarness(unittest.TestCase):
         """Reports malformed and empty turns without executing incomplete scripts."""
         for response, error in [
             ("<python>print(42)", "Malformed"),
+            (
+                "I will inspect the repository.\n<python>\n" + "print('files')\n" * 1000,
+                "Malformed",
+            ),
+            ("Here is a request.\n<tool_call><function=python>", "native Python tool call"),
             ("<think><python>print(42)</python>", "empty answer"),
             ("", "empty answer"),
         ]:
@@ -874,6 +879,14 @@ class TestPythonHarness(unittest.TestCase):
                 )
                 self.assertEqual(len(result.tool_calls), 0)
                 self.assertIn(error, result.error)
+                self.assertEqual(result.text, "")
+
+    def test_literal_tool_tags_in_final_markdown_are_not_requests(self):
+        """Accepts a final code block containing literal tool markers."""
+        final = '```python\nprint("<python>")\n```'
+        result = PythonHarness().run(ScriptedSession([final]), "Problem.", 100)
+        self.assertEqual(result.text, final)
+        self.assertIsNone(result.error)
 
     def test_script_error_and_output_truncation(self):
         """Captures script failures and bounds the output sent to the model."""

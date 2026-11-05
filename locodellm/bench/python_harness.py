@@ -19,6 +19,9 @@ _PYTHON_CALL = re.compile(
     r"|\A<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>\Z",
     re.DOTALL,
 )
+_TOOL_MARKER = re.compile(
+    r"```.*?```|(?P<python></?python\b)|(?P<native></?tool_call\b)", re.DOTALL
+)
 _INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
 You may execute up to {max_tool_calls} scripts to solve this problem.
 To call it, reply with one or more <python>...</python> blocks, each containing
@@ -250,13 +253,21 @@ class PythonHarness:
                 calls = extract_python_calls(response)
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
                 if not calls:
+                    marker = next(
+                        (
+                            match
+                            for match in _TOOL_MARKER.finditer(response)
+                            if match.lastgroup is not None
+                        ),
+                        None,
+                    )
                     if not response:
                         result.error = "The model returned an empty answer."
-                    elif response.startswith("<python") or response.endswith("</python>"):
+                    elif marker is not None and marker.lastgroup == "python":
                         result.error = (
                             "Malformed Python tool call; expected <python>...</python>."
                         )
-                    elif response.startswith("<tool_call") or response.endswith("</tool_call>"):
+                    elif marker is not None and marker.lastgroup == "native":
                         result.error = "Unsupported or malformed native Python tool call."
                     else:
                         result.text = response

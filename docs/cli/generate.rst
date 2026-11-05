@@ -72,6 +72,9 @@ Options
 ``--max-tool-calls``
     Maximum number of scripts with ``--harness python`` (default: 10).
     Each script in a grouped request consumes one execution.
+    A request must include its closing tool tag before it can execute.
+    An incomplete request, including one preceded by explanatory prose, is
+    reported as a harness error rather than accepted as a final answer.
 
 ``--output, -o``
     Writes a JSON document containing ``initial_prompt``, ordered ``events``,
