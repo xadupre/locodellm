@@ -157,10 +157,18 @@ def _cmd_generate(args: argparse.Namespace) -> None:
 
     from locodellm.bench.python_harness import HarnessResult, PythonHarness, generate_with_trace
     from locodellm.generate.generate_from_model import get_session
+    from locodellm.generate.repository import GitRepository
 
     prompts, repository = (
         _load_generate_input(args.input) if args.input is not None else ([args.prompt], None)
     )
+    target = GitRepository(repository) if repository is not None else None
+    if target is not None:
+        for filename in (args.input, args.output):
+            if filename is not None and Path(filename).resolve().is_relative_to(target.path):
+                raise ValueError(
+                    "Input and output JSON files must be outside the target repository."
+                )
     loaded = get_session(
         model_id=args.model,
         precision=args.precision,
@@ -173,6 +181,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     )
     documents = []
     for prompt in prompts:
+        if target is not None:
+            target.clean()
         session = loaded.new_session()
         if args.harness:
             result = PythonHarness(max_tool_calls=args.max_tool_calls).run(
@@ -199,13 +209,17 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             "tool_calls": [asdict(call) for call in result.tool_calls],
             "error": result.error,
         }
+        if target is not None:
+            document["diff"] = target.diff()
         documents.append(document)
         if args.output:
             exported = (
-                {"repo": repository, "results": documents} if args.input is not None else document
+                {"repo": repository, "base_revision": target.revision, "results": documents}
+                if target is not None
+                else document
             )
             Path(args.output).write_text(
-                json.dumps(exported, indent=2, ensure_ascii=False), encoding="utf-8"
+                json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
         if result.error:
             raise RuntimeError(result.error)

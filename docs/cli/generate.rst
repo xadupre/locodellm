@@ -26,12 +26,18 @@ Options
 
 ``--input``
     Reads a JSON object with exactly two fields: ``prompts``, a nonempty list
-    of nonempty strings, and ``repo``, an existing local directory path.
+    of nonempty strings, and ``repo``, the root of an existing local Git
+    working tree with a commit.
     Relative repository paths are resolved from the input file's directory.
     Enables the Python harness automatically. Prompts execute sequentially
     in independent conversations against the same directory, with a separate
-    script budget per prompt. Repository changes persist between prompts and
-    after the run. No repository is cloned, committed, or reset.
+    script budget per prompt. Before every prompt, tracked files are reset to
+    the run's starting revision and nonignored untracked files and directories
+    are removed, including modifications present before the run.
+    Ignored files are preserved. Changes persist between Python calls within
+    a prompt, but not between prompts. The last prompt's changes remain on disk.
+    No repository is cloned or committed. Input and output JSON files must be
+    outside the target working tree so cleanup cannot delete them.
 
 ``--precision``
     Precision qualifier for conversion (e.g. ``fp32``, ``fp16``, ``int4``).
@@ -62,10 +68,14 @@ Options
     responses, subsequent prompts, executed commands, stdout, stderr, and exit
     status. The file is written when the conversation ends, including on harness
     failure; a harness failure then raises an error instead of reporting success.
-    With ``--input``, the document contains ``repo`` and a ``results`` list of
-    per-prompt records (including the original ``prompt``), saved after every
-    prompt. Execution stops at the first harness error, retaining the completed
-    records and the failing record; subsequent prompts are not executed.
+    With ``--input``, the document contains ``repo``, ``base_revision``, and a
+    ``results`` list of per-prompt records, including the original ``prompt``
+    and a ``diff`` patch against the starting revision. The patch captures
+    tracked modifications and deletions, staged changes, and new nonignored
+    files, including binary patches, without altering the real Git index.
+    Records are saved after every prompt, before any subsequent cleanup.
+    Execution stops at the first harness error, retaining the completed
+    records, the failing record, and its diff; subsequent prompts are not executed.
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).

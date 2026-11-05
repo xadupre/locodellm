@@ -58,11 +58,22 @@ python -m locodellm generate path/to/model --input tasks.json \
 
 The JSON input enables the Python harness. Prompts run in order, each in an
 independent conversation with its own script budget, against the same directory.
-Relative `repo` paths are resolved from the JSON file's directory. File changes
-persist; no clone, commit, or reset is performed. Output contains the resolved
-`repo` and a `results` list with each prompt's events and final answer, saved
-after each prompt. Execution stops at the first harness error after exporting it.
-Scripts run with your permissions, without a sandbox.
+Relative `repo` paths are resolved from the JSON file's directory and must point
+to the root of an existing Git working tree with a commit. Keep `tasks.json` and
+`events.json` outside that working tree.
+
+**Destructive cleanup:** before every prompt, the harness resets tracked files
+to the run's starting revision and removes nonignored untracked files and
+directories. This also discards any initial local modifications. Ignored files
+are preserved. Changes persist between Python calls within a prompt, but are
+cleared before the next prompt.
+
+Output contains the resolved `repo`, `base_revision`, and a `results` list with
+each prompt's events, final answer, and `diff`, saved before the next cleanup.
+The patch includes modified, deleted, staged, and new nonignored files, including
+binary changes. Execution stops at the first harness error after exporting its
+events and diff. The last prompt's changes remain on disk. No clone or commit
+is performed. Scripts run with your permissions, without a sandbox.
 
 ### Python API
 

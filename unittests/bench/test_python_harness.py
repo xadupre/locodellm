@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from pathlib import Path
 from locodellm.__main__ import _compute_case_stats, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
 from locodellm.bench.python_harness import PythonHarness, extract_python_calls
+from locodellm.generate.repository import GitRepository
 from locodellm.utils import extract_code, strip_thinking
 
 
@@ -36,9 +38,47 @@ class ScriptedSession:
         self.generated_token_count = 5
 
 
+def create_repository(directory):
+    """Creates a real repository with committed files for cleanup and diff tests."""
+    directory.mkdir(exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(directory)], check=True, capture_output=True
+    )
+    for filename, content in {
+        ".gitignore": "ignored.txt\n",
+        "tracked.txt": "original\n",
+        "removed.txt": "remove me\n",
+        "tool_script.py": "Do not overwrite.",
+        "tool_function_calls.bin": "Do not overwrite.",
+    }.items():
+        (directory / filename).write_text(content, encoding="utf-8")
+    subprocess.run(["git", "-C", str(directory), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(directory),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "Initial files",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return GitRepository(str(directory))
+
+
 class TestPythonHarness(unittest.TestCase):
     def test_generate_json_repository_and_independent_prompts(self):
-        """Runs independent conversations with persistent repository changes."""
+        """Cleans each prompt and saves applicable patches including new binary files."""
         from locodellm.generate.generate_from_model import _session_cache
 
         model_id = "test/scripted-json-cli"
@@ -48,11 +88,24 @@ class TestPythonHarness(unittest.TestCase):
             [
                 (
                     "<python>from pathlib import Path\n"
+                    "assert Path('tracked.txt').read_text() == 'original\\n'\n"
+                    "assert not Path('initial_untracked').exists()\n"
+                    "assert not Path('initial_directory').exists()\n"
+                    "assert not Path('value.txt').exists()\n"
+                    "assert Path('ignored.txt').read_text() == 'keep'\n"
+                    "Path('tracked.txt').write_text('modified\\n')\n"
+                    "Path('removed.txt').unlink()\n"
+                    "Path('binary.bin').write_bytes(b'\\x00\\xffpayload')\n"
+                    "Path('non_utf8.txt').write_bytes(b'\\xff\\n')\n"
                     "path = Path('value.txt')\n"
                     "path.write_text(str(int(path.read_text()) + 1) if path.exists() else '1')\n"
                     "</python>"
                 ),
-                "<python>from pathlib import Path\nprint(Path('value.txt').read_text())</python>",
+                (
+                    "<python>from pathlib import Path\nimport subprocess\n"
+                    "subprocess.run(['git', 'add', 'tracked.txt'], check=True)\n"
+                    "print(Path('value.txt').read_text())</python>"
+                ),
                 "Updated the repository.",
             ]
         )
@@ -60,10 +113,16 @@ class TestPythonHarness(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
+                with self.assertRaisesRegex(RuntimeError, "Git rev-parse"):
+                    GitRepository(str(root))
                 repository = root / "repo"
-                repository.mkdir()
-                for filename in ("tool_script.py", "tool_function_calls.bin"):
-                    (repository / filename).write_text("Do not overwrite.", encoding="utf-8")
+                target = create_repository(repository)
+                (repository / "tracked.txt").write_text("initial dirty content")
+                target.git("add", "tracked.txt")
+                (repository / "initial_untracked").write_text("discard")
+                (repository / "initial_directory").mkdir()
+                (repository / "initial_directory" / "file").write_text("discard")
+                (repository / "ignored.txt").write_text("keep")
                 source = root / "tasks.json"
                 prompts = ["Make the first change.", "Make the second change."]
                 source.write_text(
@@ -85,17 +144,17 @@ class TestPythonHarness(unittest.TestCase):
                     )
                 document = json.loads(output.read_text(encoding="utf-8"))
                 self.assertEqual(document["repo"], str(repository))
-                self.assertEqual((repository / "value.txt").read_text(), "2")
-                self.assertEqual(
-                    sorted(path.name for path in repository.iterdir()),
-                    ["tool_function_calls.bin", "tool_script.py", "value.txt"],
-                )
+                self.assertEqual(document["base_revision"], target.revision)
+                self.assertEqual((repository / "value.txt").read_text(), "1")
+                self.assertEqual((repository / "tracked.txt").read_text(), "modified\n")
+                self.assertFalse((repository / "removed.txt").exists())
                 for filename in ("tool_script.py", "tool_function_calls.bin"):
                     self.assertEqual(
                         (repository / filename).read_text(encoding="utf-8"), "Do not overwrite."
                     )
                 self.assertEqual(stdout.getvalue(), "Updated the repository.\n" * 2)
                 results = document["results"]
+                self.assertEqual(results[0]["diff"], results[1]["diff"])
                 self.assertEqual([entry["prompt"] for entry in results], prompts)
                 self.assertEqual([len(child.turns) for child in session.children], [3, 3])
                 for index, (entry, child) in enumerate(zip(results, session.children)):
@@ -105,11 +164,32 @@ class TestPythonHarness(unittest.TestCase):
                     self.assertTrue(child.turns[0][0].endswith(prompts[index]))
                     self.assertNotIn(prompts[1 - index], child.turns[0][0])
                     self.assertIn("Remaining Python tool calls: 0", child.turns[-1][0])
-                    self.assertEqual(entry["tool_calls"][1]["stdout"], f"{index + 1}\n")
+                    self.assertEqual(entry["tool_calls"][1]["stdout"], "1\n")
+                    self.assertIn("-original\n+modified\n", entry["diff"])
+                    self.assertIn("deleted file mode", entry["diff"])
+                    self.assertIn("new file mode", entry["diff"])
+                    self.assertIn("GIT binary patch", entry["diff"])
+                    self.assertNotIn("ignored.txt", entry["diff"])
+                    self.assertNotIn("initial dirty content", entry["diff"])
                     for call in entry["tool_calls"]:
                         self.assertEqual(call["cwd"], str(repository))
                         self.assertNotEqual(Path(call["command"][-1]).parent, repository)
                         self.assertFalse(Path(call["command"][-1]).exists())
+                self.assertEqual(
+                    target.git("diff", "--cached", "--name-only").strip(), "tracked.txt"
+                )
+                target.clean()
+                subprocess.run(
+                    ["git", "-C", str(repository), "apply", "--binary", "-"],
+                    input=results[0]["diff"].encode("utf-8", errors="surrogateescape"),
+                    check=True,
+                    capture_output=True,
+                )
+                self.assertEqual((repository / "tracked.txt").read_text(), "modified\n")
+                self.assertFalse((repository / "removed.txt").exists())
+                self.assertEqual((repository / "value.txt").read_text(), "1")
+                self.assertEqual((repository / "binary.bin").read_bytes(), b"\x00\xffpayload")
+                self.assertEqual((repository / "non_utf8.txt").read_bytes(), b"\xff\n")
         finally:
             del _session_cache[key]
 
@@ -132,13 +212,15 @@ class TestPythonHarness(unittest.TestCase):
         _session_cache[key] = session
         try:
             with tempfile.TemporaryDirectory() as directory:
-                repository = Path(directory)
-                source = repository / "tasks.json"
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
                 source.write_text(
                     json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
                     encoding="utf-8",
                 )
-                output = repository / "events.json"
+                output = root / "events.json"
                 with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
                     main(
                         [
@@ -156,10 +238,47 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(len(document["results"]), 1)
                 self.assertIn("budget exhausted", document["results"][0]["error"])
                 self.assertEqual(document["results"][0]["tool_call_count"], 1)
+                self.assertIn("+kept", document["results"][0]["diff"])
                 self.assertEqual(len(session.children), 1)
                 self.assertEqual((repository / "changed.txt").read_text(), "kept")
         finally:
             del _session_cache[key]
+
+    def test_repository_validation_before_cleanup(self):
+        """Protects input files, output files, and repository parents from cleanup."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            target = create_repository(repository)
+            (repository / "tracked.txt").write_text("must remain dirty")
+            for source, output in [
+                (repository / "tasks.json", root / "events.json"),
+                (root / "tasks.json", repository / "events.json"),
+            ]:
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["Prompt."]}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "outside the target repository"):
+                    main(["generate", "unused/model", "--input", str(source), "-o", str(output)])
+                self.assertEqual((repository / "tracked.txt").read_text(), "must remain dirty")
+            subdirectory = repository / "subdirectory"
+            subdirectory.mkdir()
+            with self.assertRaisesRegex(ValueError, "repository root"):
+                GitRepository(str(subdirectory))
+            target.git("checkout", "-b", "other")
+            with self.assertRaisesRegex(RuntimeError, "branch changed"):
+                target.clean()
+            self.assertEqual((repository / "tracked.txt").read_text(), "must remain dirty")
+
+    def test_repository_diff_without_changes(self):
+        """Returns an empty patch without changing the real Git index."""
+        with tempfile.TemporaryDirectory() as directory:
+            target = create_repository(Path(directory))
+            index = target.path / ".git" / "index"
+            before = index.read_bytes()
+            self.assertEqual(target.diff(), "")
+            self.assertEqual(index.read_bytes(), before)
 
     def test_missing_working_directory(self):
         """Rejects a missing working directory before starting the model."""
