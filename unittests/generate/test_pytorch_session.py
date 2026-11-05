@@ -176,6 +176,40 @@ class TestPyTorchSession(unittest.TestCase):
             self.assertGreater(trace[0]["token_count"], 0)
             self.assertIn("Statistics", stdout.getvalue())
 
+    def test_generate_cli_and_harness_exports(self):
+        """Generates and exports real native-model answers with and without the harness."""
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        for harness in (False, True):
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as directory:
+                output = os.path.join(directory, "events.json")
+                limit = 2 if harness else session.get_prompt_length("hello") + 2
+                args = [
+                    "generate",
+                    self.model_path,
+                    "hello",
+                    "--backend",
+                    "pytorch",
+                    "--device",
+                    "cpu",
+                    "--max-length",
+                    str(limit),
+                    "--output",
+                    output,
+                ]
+                if harness:
+                    args += ["--harness", "python"]
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    main(args)
+                with open(output, encoding="utf-8") as stream:
+                    document = json.load(stream)
+                self.assertEqual(stdout.getvalue().strip(), "answer answer")
+                self.assertEqual(document["text"], "answer answer")
+                self.assertEqual(document["token_count"], 2)
+                self.assertIsNone(document["error"])
+                self.assertEqual(document["tool_calls"], [])
+                option = "max_new_tokens" if harness else "max_length"
+                self.assertEqual(document["initial_generation_options"], {option: limit})
+
     def test_python_harness(self):
         """Accepts direct answers while preserving per-turn generation limits."""
         from locodellm.bench.python_harness import PythonHarness

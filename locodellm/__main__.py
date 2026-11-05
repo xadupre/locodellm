@@ -175,6 +175,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         provider=args.provider,
         chat_template=args.chat_template,
         verbose=args.verbose,
+        backend=args.backend,
+        device=args.device,
     )
     max_length = (
         args.max_length if args.max_length is not None else (1024 if args.harness else 200)
@@ -503,7 +505,20 @@ def main(args: list[str] | None = None) -> None:
         help="JSON file containing prompts and a local repo path; enables the Python harness.",
     )
     gen_parser.add_argument(
-        "--precision", default=None, help="Precision qualifier (e.g. fp16, int4)."
+        "--precision",
+        default=None,
+        help="ONNX conversion precision, or PyTorch loading dtype (auto, fp32, fp16, bf16).",
+    )
+    gen_parser.add_argument(
+        "--backend",
+        choices=["onnx", "pytorch"],
+        default="onnx",
+        help="Generation backend (default: onnx). PyTorch loads Transformers weights directly.",
+    )
+    gen_parser.add_argument(
+        "--device",
+        default=None,
+        help="PyTorch device (cpu, cuda, cuda:0, auto). Defaults to cpu.",
     )
     gen_parser.add_argument(
         "--provider", default=None, help="Execution provider (e.g. CUDAExecutionProvider)."
@@ -680,20 +695,24 @@ def main(args: list[str] | None = None) -> None:
             command_parser.error("--max-tool-calls must be positive")
         if not parsed.harness and parsed.max_tool_calls != 10:
             command_parser.error("--max-tool-calls requires --harness python")
-    if parsed.command == "bench":
         if parsed.backend == "pytorch":
-            if parsed.provider or parsed.provider_option or parsed.session_option:
-                bench_parser.error(
+            onnx_options = bool(parsed.provider)
+            if parsed.command == "bench":
+                onnx_options = onnx_options or bool(
+                    parsed.provider_option or parsed.session_option
+                )
+            if onnx_options:
+                command_parser.error(
                     "--provider, --provider-option and --session-option are ONNX-only; "
                     "use --device with --backend pytorch"
                 )
             if parsed.precision not in {None, "auto", "fp32", "fp16", "bf16"}:
-                bench_parser.error(
+                command_parser.error(
                     "PyTorch --precision must be auto, fp32, fp16, or bf16; "
                     "load pre-quantized weights by model id"
                 )
         elif parsed.device is not None:
-            bench_parser.error("--device requires --backend pytorch")
+            command_parser.error("--device requires --backend pytorch")
 
     dispatch = {
         "version": _cmd_version,

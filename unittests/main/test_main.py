@@ -99,6 +99,9 @@ class TestMainGenerate(ExtTestCase):
                 ["--harness", "python", "--max-tool-calls", "0"],
                 ["--max-tool-calls", "100"],
                 ["--max-length", "0"],
+                ["--backend", "pytorch", "--provider", "CPUExecutionProvider"],
+                ["--backend", "pytorch", "--precision", "int4"],
+                ["--device", "cpu"],
             ]:
                 with self.subTest(command=command, options=options):
                     with (

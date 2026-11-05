@@ -4,6 +4,8 @@ generate
 Generates text from a prompt using a local LLM. The model can be a mock
 model id, a local path to an ONNX model directory, or a HuggingFace
 repository id (which is automatically downloaded and converted).
+With ``--backend pytorch``, Transformers weights are loaded directly without
+ONNX conversion.
 
 Usage
 -----
@@ -40,7 +42,17 @@ Options
     outside the target working tree so cleanup cannot delete them.
 
 ``--precision``
-    Precision qualifier for conversion (e.g. ``fp32``, ``fp16``, ``int4``).
+    Precision qualifier for ONNX conversion (e.g. ``fp32``, ``fp16``, ``int4``).
+    With PyTorch, loading dtype: ``auto``, ``fp32``, ``fp16``, or ``bf16``.
+    Pre-quantized checkpoints retain their own quantization configuration.
+
+``--backend``
+    Generation backend: ``onnx`` (default) or ``pytorch``. The PyTorch backend
+    requires the optional ``pytorch`` dependencies.
+
+``--device``
+    Device for the PyTorch backend: ``cpu`` (default), ``cuda``, ``cuda:0``,
+    or ``auto`` for automatic placement. Requires ``--backend pytorch``.
 
 ``--provider``
     Execution provider (e.g. ``CUDAExecutionProvider``).
@@ -144,3 +156,16 @@ Save this as ``tasks.json`` and run:
     python -m locodellm generate ./model --input tasks.json \
         --chat-template chatml --max-tool-calls 100 --max-length 1024 \
         --output evenements.json
+
+For native Transformers weights, use a Hugging Face model id or a complete
+local checkpoint directory containing its configuration, tokenizer, and weights,
+not the Hugging Face cache root (``models--OWNER--NAME``):
+
+.. code-block:: bash
+
+    python -m locodellm generate Qwen/Qwen3.5-35B-A3B-FP8 \
+        --backend pytorch --device auto --input tasks.json \
+        --max-tool-calls 100 --max-length 1024 --output evenements.json
+
+Missing checkpoint files are downloaded when using a model id. FP8 checkpoints
+require hardware and quantization support compatible with Transformers.

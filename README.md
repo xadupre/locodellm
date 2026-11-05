@@ -75,6 +75,19 @@ binary changes. Execution stops at the first harness error after exporting its
 events and diff. The last prompt's changes remain on disk. No clone or commit
 is performed. Scripts run with your permissions, without a sandbox.
 
+For native Transformers weights instead of ONNX, add ``--backend pytorch``
+and choose a device:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.5-35B-A3B-FP8 \
+  --backend pytorch --device auto --input tasks.json \
+  --max-tool-calls 100 --max-length 1024 --output events.json --verbose 1
+```
+
+This requires the optional `pytorch` dependencies and compatible FP8 hardware.
+Use a Hugging Face model id (missing files will be downloaded), or a complete
+local checkpoint directory, not the `models--OWNER--NAME` cache root.
+
 ### Python API
 
 #### `create_session` and `session.generate`
