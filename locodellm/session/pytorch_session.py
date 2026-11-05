@@ -12,10 +12,13 @@ from locodellm.session.session_state import SessionState
 
 
 class GenerationProgress:
-    """Reports token progress without buffering generated text or starting threads."""
+    """Reports token progress and a bounded response prefix without starting threads."""
 
-    def __init__(self, max_new_tokens: int) -> None:
+    def __init__(self, max_new_tokens: int, tokenizer: Any) -> None:
         self.max_new_tokens = max_new_tokens
+        self.tokenizer = tokenizer
+        self.preview_tokens: list[int] = []
+        self.preview_reported = False
         self.token_count = 0
         self.skip_prompt = True
         self.started_at = time.monotonic()
@@ -28,6 +31,13 @@ class GenerationProgress:
             print("[generate] waiting for first token", file=sys.stderr, flush=True)
             return
         self.token_count += tokens.numel()
+        if not self.preview_reported:
+            self.preview_tokens.extend(tokens.reshape(-1).tolist())
+            preview = self.tokenizer.decode(self.preview_tokens, skip_special_tokens=False)
+            if len(preview) >= 30:
+                print(f"[generate] response start: {preview[:30]!r}", file=sys.stderr, flush=True)
+                self.preview_reported = True
+                self.preview_tokens.clear()
         now = time.monotonic()
         if self.token_count == 1 or now - self.last_report >= 1:
             print(
@@ -122,7 +132,7 @@ class PyTorchSessionState(SessionState):
         if self.tokenizer.pad_token_id is not None:
             options.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         if self.verbose and "streamer" not in options:
-            options["streamer"] = GenerationProgress(max_new_tokens)
+            options["streamer"] = GenerationProgress(max_new_tokens, self.tokenizer)
         with torch.inference_mode():
             output = self.model.generate(
                 input_ids=input_ids,

@@ -246,21 +246,29 @@ class TestPyTorchSession(unittest.TestCase):
                             "--harness",
                             "python",
                             "--max-length",
-                            "2",
+                            "8",
                             "--verbose",
                             "1",
                         ]
                     )
-                self.assertEqual(stdout.getvalue(), "answer answer\n")
+                answer = " ".join(["answer"] * 8)
+                self.assertEqual(stdout.getvalue(), answer + "\n")
                 self.assertIn("[generate] starting:", stderr.flushed_texts[0])
                 self.assertNotIn("model ready", stderr.flushed_texts[0])
                 self.assertIn("[generate] model ready", stderr.getvalue())
                 self.assertIn("[harness] model turn 1;", stderr.getvalue())
                 self.assertIn("[generate] waiting for first token", stderr.getvalue())
-                self.assertIn("[generate] generated 1/2 tokens", stderr.getvalue())
-                self.assertIn("[generate] generation finished: 2 tokens", stderr.getvalue())
-                self.assertIn("[generate] response preview: 'answer answer'", stderr.getvalue())
-                self.assertIn("[harness] model turn 1 finished: 2 tokens", stderr.getvalue())
+                self.assertIn("[generate] generated 1/8 tokens", stderr.getvalue())
+                self.assertIn("[generate] generation finished: 8 tokens", stderr.getvalue())
+                self.assertIn(f"[generate] response preview: {answer[:30]!r}", stderr.getvalue())
+                self.assertIn("[harness] model turn 1 finished: 8 tokens", stderr.getvalue())
+                live_preview = next(
+                    text for text in stderr.flushed_texts if "[generate] response start:" in text
+                )
+                self.assertIn(f"[generate] response start: {answer[:30]!r}", live_preview)
+                self.assertNotIn("generation finished", live_preview)
+                self.assertNotIn("model turn 1 finished", live_preview)
+                self.assertEqual(stderr.getvalue().count("[generate] response start:"), 1)
                 waiting = next(
                     text for text in stderr.flushed_texts if "waiting for first token" in text
                 )
