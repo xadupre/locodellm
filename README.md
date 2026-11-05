@@ -88,6 +88,11 @@ This requires the optional `pytorch` dependencies and compatible FP8 hardware.
 Use a Hugging Face model id (missing files will be downloaded), or a complete
 local checkpoint directory, not the `models--OWNER--NAME` cache root.
 
+With `--verbose 1`, progress is flushed immediately to stderr: model loading
+stages, prompt and model-turn numbers, Python script execution, diff capture,
+and saving. PyTorch generation also reports first-token waiting, periodic token
+counts, and completion, rather than remaining silent until the answer is ready.
+
 ### Python API
 
 #### `create_session` and `session.generate`

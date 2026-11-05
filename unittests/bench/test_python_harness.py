@@ -129,7 +129,10 @@ class TestPythonHarness(unittest.TestCase):
                     json.dumps({"repo": "repo", "prompts": prompts}), encoding="utf-8"
                 )
                 output = root / "events.json"
-                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
                     main(
                         [
                             "generate",
@@ -140,6 +143,8 @@ class TestPythonHarness(unittest.TestCase):
                             "2",
                             "--output",
                             str(output),
+                            "--verbose",
+                            "1",
                         ]
                     )
                 document = json.loads(output.read_text(encoding="utf-8"))
@@ -153,6 +158,16 @@ class TestPythonHarness(unittest.TestCase):
                         (repository / filename).read_text(encoding="utf-8"), "Do not overwrite."
                     )
                 self.assertEqual(stdout.getvalue(), "Updated the repository.\n" * 2)
+                for phase in (
+                    "[generate] prompt 1/2",
+                    "[generate] prompt 2/2",
+                    "[generate] resetting repository",
+                    "[harness] executing script 1/2",
+                    "[harness] script 2/2 finished: exit=0, timed_out=False",
+                    "[generate] collecting repository diff",
+                    "[generate] saving",
+                ):
+                    self.assertIn(phase, stderr.getvalue())
                 results = document["results"]
                 self.assertEqual(results[0]["diff"], results[1]["diff"])
                 self.assertEqual([entry["prompt"] for entry in results], prompts)

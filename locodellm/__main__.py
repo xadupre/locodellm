@@ -151,6 +151,12 @@ def _load_generate_input(filename: str) -> tuple[list[str], str]:
 
 def _cmd_generate(args: argparse.Namespace) -> None:
     """Generates answers for a prompt or a JSON list of independent prompts."""
+    if args.verbose:
+        print(
+            f"[generate] starting: backend={args.backend}, model={args.model!r}",
+            file=sys.stderr,
+            flush=True,
+        )
     import json
     from dataclasses import asdict
     from pathlib import Path
@@ -159,6 +165,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     from locodellm.generate.generate_from_model import get_session
     from locodellm.generate.repository import GitRepository
 
+    if args.verbose:
+        print("[generate] reading prompts and validating repository", file=sys.stderr, flush=True)
     prompts, repository = (
         _load_generate_input(args.input) if args.input is not None else ([args.prompt], None)
     )
@@ -169,6 +177,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
                 raise ValueError(
                     "Input and output JSON files must be outside the target repository."
                 )
+    if args.verbose:
+        print("[generate] loading model", file=sys.stderr, flush=True)
     loaded = get_session(
         model_id=args.model,
         precision=args.precision,
@@ -178,16 +188,23 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         backend=args.backend,
         device=args.device,
     )
+    if args.verbose:
+        print("[generate] model ready", file=sys.stderr, flush=True)
     max_length = (
         args.max_length if args.max_length is not None else (1024 if args.harness else 200)
     )
     documents = []
-    for prompt in prompts:
+    for prompt_index, prompt in enumerate(prompts, 1):
+        if args.verbose:
+            print(f"[generate] prompt {prompt_index}/{len(prompts)}", file=sys.stderr, flush=True)
         if target is not None:
+            if args.verbose:
+                print("[generate] resetting repository", file=sys.stderr, flush=True)
             target.clean()
         session = loaded.new_session()
+        session.verbose = args.verbose
         if args.harness:
-            result = PythonHarness(max_tool_calls=args.max_tool_calls).run(
+            result = PythonHarness(max_tool_calls=args.max_tool_calls, verbose=args.verbose).run(
                 session,
                 prompt,
                 max_length=max_length,
@@ -212,9 +229,13 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             "error": result.error,
         }
         if target is not None:
+            if args.verbose:
+                print("[generate] collecting repository diff", file=sys.stderr, flush=True)
             document["diff"] = target.diff()
         documents.append(document)
         if args.output:
+            if args.verbose:
+                print(f"[generate] saving {args.output!r}", file=sys.stderr, flush=True)
             exported = (
                 {"repo": repository, "base_revision": target.revision, "results": documents}
                 if target is not None
@@ -225,7 +246,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             )
         if result.error:
             raise RuntimeError(result.error)
-        print(result.text)
+        print(result.text, flush=True)
 
 
 def _cmd_chat(args: argparse.Namespace) -> None:

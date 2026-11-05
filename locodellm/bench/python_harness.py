@@ -125,7 +125,7 @@ class PythonHarness:
 
     max_tool_calls = 10
 
-    def __init__(self, timeout: float = 10.0, max_tool_calls: int = 10) -> None:
+    def __init__(self, timeout: float = 10.0, max_tool_calls: int = 10, verbose: int = 0) -> None:
         if timeout <= 0:
             raise ValueError("The Python tool timeout must be positive.")
         if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int):
@@ -134,6 +134,7 @@ class PythonHarness:
             raise ValueError("The Python tool budget must be a positive integer.")
         self.timeout = timeout
         self.max_tool_calls = max_tool_calls
+        self.verbose = verbose
 
     def execute(
         self, code: str, directory: str, *, script_directory: str | None = None
@@ -222,7 +223,14 @@ class PythonHarness:
         )
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as script_directory:
             working_directory = directory or script_directory
-            for _ in range(self.max_tool_calls + 1):
+            for turn in range(1, self.max_tool_calls + 2):
+                if self.verbose:
+                    print(
+                        f"[harness] model turn {turn}; "
+                        f"{self.max_tool_calls - len(result.tool_calls)} scripts remaining",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 generate_with_trace(
                     session,
                     message,
@@ -230,6 +238,13 @@ class PythonHarness:
                     max_new_tokens=max_length,
                     **search_options,
                 )
+                if self.verbose:
+                    print(
+                        f"[harness] model turn {turn} finished: "
+                        f"{session.generated_token_count} tokens",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 result.token_count += session.generated_token_count
                 response = strip_thinking(session.text)
                 calls = extract_python_calls(response)
@@ -256,10 +271,25 @@ class PythonHarness:
                     return result
                 feedback = []
                 for index, code in enumerate(calls, 1):
+                    script_index = len(result.tool_calls) + 1
+                    if self.verbose:
+                        print(
+                            f"[harness] executing script {script_index}/{self.max_tool_calls} "
+                            f"(timeout={self.timeout}s)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     execution = self.execute(
                         code, working_directory, script_directory=script_directory
                     )
                     result.tool_calls.append(execution)
+                    if self.verbose:
+                        print(
+                            f"[harness] script {script_index}/{self.max_tool_calls} finished: "
+                            f"exit={execution.returncode}, timed_out={execution.timed_out}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     result.interactions.extend(
                         [
                             {

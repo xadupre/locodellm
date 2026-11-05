@@ -93,7 +93,13 @@ Options
     Chat template to use (e.g. ``chatml``).
 
 ``--verbose, -v``
-    Verbosity level (default: 0).
+    Verbosity level (default: 0). Level 1 immediately flushes progress messages
+    to stderr: startup, input validation, loading, prompt number, repository
+    reset, model turns, script execution and exit status, diff capture, and saving.
+    The PyTorch backend reports configuration, weight and tokenizer loading,
+    then first-token waiting, periodic generated-token counts, and completion.
+    Token counts appear during decoding; they do not indicate progress inside
+    model loading or before the first token. The final answer remains on stdout.
 
 Examples
 --------

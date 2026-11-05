@@ -12,6 +12,18 @@ from locodellm.__main__ import main
 from locodellm.generate.generate_from_model import _model_path_cache, _session_cache, get_session
 
 
+class FlushedOutput(io.StringIO):
+    """Records the text made visible by each explicit flush."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushed_texts = []
+
+    def flush(self):
+        self.flushed_texts.append(self.getvalue())
+        super().flush()
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
 class TestPyTorchSession(unittest.TestCase):
     @classmethod
@@ -209,6 +221,57 @@ class TestPyTorchSession(unittest.TestCase):
                 self.assertEqual(document["tool_calls"], [])
                 option = "max_new_tokens" if harness else "max_length"
                 self.assertEqual(document["initial_generation_options"], {option: limit})
+
+    def test_verbose_generation_progress_and_cached_sessions(self):
+        """Reports flushed loading, model-turn, and token progress with a real model."""
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                _session_cache.clear()
+                if cached:
+                    get_session(self.model_path, backend="pytorch", device="cpu", verbose=0)
+                stderr = FlushedOutput()
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    main(
+                        [
+                            "generate",
+                            self.model_path,
+                            "hello",
+                            "--backend",
+                            "pytorch",
+                            "--device",
+                            "cpu",
+                            "--harness",
+                            "python",
+                            "--max-length",
+                            "2",
+                            "--verbose",
+                            "1",
+                        ]
+                    )
+                self.assertEqual(stdout.getvalue(), "answer answer\n")
+                self.assertIn("[generate] starting:", stderr.flushed_texts[0])
+                self.assertNotIn("model ready", stderr.flushed_texts[0])
+                self.assertIn("[generate] model ready", stderr.getvalue())
+                self.assertIn("[harness] model turn 1;", stderr.getvalue())
+                self.assertIn("[generate] waiting for first token", stderr.getvalue())
+                self.assertIn("[generate] generated 1/2 tokens", stderr.getvalue())
+                self.assertIn("[generate] generation finished: 2 tokens", stderr.getvalue())
+                self.assertIn("[harness] model turn 1 finished: 2 tokens", stderr.getvalue())
+                waiting = next(
+                    text for text in stderr.flushed_texts if "waiting for first token" in text
+                )
+                self.assertNotIn("generation finished", waiting)
+                if not cached:
+                    for phase in (
+                        "importing Transformers",
+                        "loading configuration",
+                        "loading weights",
+                        "loading tokenizer",
+                    ):
+                        self.assertIn(phase, stderr.getvalue())
 
     def test_python_harness(self):
         """Accepts direct answers while preserving per-turn generation limits."""
