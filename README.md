@@ -28,6 +28,32 @@ pip install -e .
 python -m locodellm version
 ```
 
+### ATen failure-discovery datasets
+
+`datasets/aten_failures_set_1.jsonl` and `datasets/aten_failures_set_2.jsonl`
+contain 8 converter-discovery tasks each, covering 16 ATen
+functions in `xadupre/yet-another-onnx-builder`. Related dispatchers and helpers
+stay together; the sets share no functions, source issues, or reference examples.
+
+Each JSONL record contains `function`, an English discovery `prompt`, and an
+`expected_answer` with executable module-export examples, observed failures,
+passing controls, and issue links. Every example converts a real
+`torch.nn.Module` using `to_onnx(module, inputs)`; none calls a converter or
+constructs a graph builder directly. Run its `setup_code` followed by one
+example's `code` at a time. Export modes and actual converter routing are
+recorded: some failures require `ExportOptions(tracing=True)` and pass with
+default export. Invalid `tensor_split(sections=0)` is excluded because both
+PyTorch and public export correctly reject it.
+
+Verification records the source revision, dependency versions, and relevant
+pre-existing source edits; the recorded embedding-bag value mismatches require
+that edit, while unmodified sources reject the same inputs during conversion.
+
+Only send `prompt` to the model; keep `expected_answer` and issue links with the
+evaluator. These JSONL files are evaluation data, not executable task files.
+Load one JSON object per line and extract only its `prompt` when preparing
+model inputs.
+
 ### Python API
 
 #### `create_session` and `session.generate`
