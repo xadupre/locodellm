@@ -111,6 +111,8 @@ def generate_with_trace(
         {"type": "prompt", "content": prompt, "generation_options": search_options}
     )
     session.generate(prompt, **search_options)
+    if getattr(session, "verbose", 0):
+        print(f"[generate] response preview: {session.text[:30]!r}", file=sys.stderr, flush=True)
     interactions.append(
         {
             "type": "model_response",

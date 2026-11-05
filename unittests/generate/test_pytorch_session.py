@@ -259,6 +259,7 @@ class TestPyTorchSession(unittest.TestCase):
                 self.assertIn("[generate] waiting for first token", stderr.getvalue())
                 self.assertIn("[generate] generated 1/2 tokens", stderr.getvalue())
                 self.assertIn("[generate] generation finished: 2 tokens", stderr.getvalue())
+                self.assertIn("[generate] response preview: 'answer answer'", stderr.getvalue())
                 self.assertIn("[harness] model turn 1 finished: 2 tokens", stderr.getvalue())
                 waiting = next(
                     text for text in stderr.flushed_texts if "waiting for first token" in text

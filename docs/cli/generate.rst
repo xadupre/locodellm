@@ -101,6 +101,8 @@ Options
     reset, model turns, script execution and exit status, diff capture, and saving.
     The PyTorch backend reports configuration, weight and tokenizer loading,
     then first-token waiting, periodic generated-token counts, and completion.
+    After each model response, the first 30 characters are printed as a preview,
+    with line breaks escaped to keep the preview on one line.
     Token counts appear during decoding; they do not indicate progress inside
     model loading or before the first token. The final answer remains on stdout.
 

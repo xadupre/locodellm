@@ -77,6 +77,33 @@ def create_repository(directory):
 
 
 class TestPythonHarness(unittest.TestCase):
+    def test_verbose_response_previews(self):
+        """Reports exactly the first thirty response characters on every model turn."""
+        responses = [
+            "<python>print('a sufficiently long diagnostic message')</python>",
+            "A final answer that is longer than thirty characters.",
+        ]
+        session = ScriptedSession(responses)
+        session.verbose = 1
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = PythonHarness(verbose=1).run(session, "Problem.", 100)
+        self.assertIsNone(result.error)
+        previews = [
+            line for line in stderr.getvalue().splitlines() if "response preview:" in line
+        ]
+        self.assertEqual(
+            previews,
+            [f"[generate] response preview: {response[:30]!r}" for response in responses],
+        )
+        self.assertEqual(
+            [
+                event["content"]
+                for event in result.interactions
+                if event["type"] == "model_response"
+            ],
+            responses,
+        )
+
     def test_generate_json_repository_and_independent_prompts(self):
         """Cleans each prompt and saves applicable patches including new binary files."""
         from locodellm.generate.generate_from_model import _session_cache
