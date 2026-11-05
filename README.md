@@ -28,6 +28,42 @@ pip install -e .
 python -m locodellm version
 ```
 
+Run a prompt with up to 100 Python script executions and export conversation
+and execution events:
+
+```bash
+python -m locodellm generate path/to/model \
+  "Write 42 to value.txt, read it back, and report its contents." \
+  --chat-template chatml --harness python --max-tool-calls 100 \
+  --output events.json
+```
+
+For changes in an existing local repository, create `tasks.json`:
+
+```json
+{
+  "repo": "../my-project",
+  "prompts": [
+    "Update the README to explain the installation steps.",
+    "Add a test for the behavior described in the README."
+  ]
+}
+```
+
+```bash
+python -m locodellm generate path/to/model --input tasks.json \
+  --chat-template chatml --max-tool-calls 100 --max-length 1024 \
+  --output events.json
+```
+
+The JSON input enables the Python harness. Prompts run in order, each in an
+independent conversation with its own script budget, against the same directory.
+Relative `repo` paths are resolved from the JSON file's directory. File changes
+persist; no clone, commit, or reset is performed. Output contains the resolved
+`repo` and a `results` list with each prompt's events and final answer, saved
+after each prompt. Execution stops at the first harness error after exporting it.
+Scripts run with your permissions, without a sandbox.
+
 ### Python API
 
 #### `create_session` and `session.generate`

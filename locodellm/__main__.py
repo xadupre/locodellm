@@ -121,8 +121,36 @@ def _cmd_models(args: argparse.Namespace) -> None:  # noqa: ARG001
         print(f"{model_id:<{width}}  {description}")
 
 
+def _load_generate_input(filename: str) -> tuple[list[str], str]:
+    """Loads independent prompts and resolves their repository directory."""
+    import json
+    from pathlib import Path
+
+    source = Path(filename).resolve()
+    document = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or set(document) != {"prompts", "repo"}:
+        raise ValueError("JSON input must contain exactly 'prompts' and 'repo'.")
+    prompts = document["prompts"]
+    if (
+        not isinstance(prompts, list)
+        or not prompts
+        or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)
+    ):
+        raise ValueError("'prompts' must be a nonempty list of nonempty strings.")
+    repository = document["repo"]
+    if not isinstance(repository, str) or not repository.strip():
+        raise ValueError("'repo' must be a nonempty local directory path.")
+    path = Path(repository).expanduser()
+    if not path.is_absolute():
+        path = source.parent / path
+    path = path.resolve()
+    if not path.is_dir():
+        raise ValueError(f"Repository directory does not exist: {path}")
+    return prompts, str(path)
+
+
 def _cmd_generate(args: argparse.Namespace) -> None:
-    """Generates text from a prompt using a model."""
+    """Generates answers for a prompt or a JSON list of independent prompts."""
     import json
     from dataclasses import asdict
     from pathlib import Path
@@ -130,46 +158,58 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     from locodellm.bench.python_harness import HarnessResult, PythonHarness, generate_with_trace
     from locodellm.generate.generate_from_model import get_session
 
-    session = get_session(
+    prompts, repository = (
+        _load_generate_input(args.input) if args.input is not None else ([args.prompt], None)
+    )
+    loaded = get_session(
         model_id=args.model,
         precision=args.precision,
         provider=args.provider,
         chat_template=args.chat_template,
         verbose=args.verbose,
-    ).new_session()
+    )
     max_length = (
         args.max_length if args.max_length is not None else (1024 if args.harness else 200)
     )
-    if args.harness:
-        result = PythonHarness(max_tool_calls=args.max_tool_calls).run(
-            session,
-            args.prompt,
-            max_length=max_length,
-            final_answer_instructions="return your final answer without a tool call.",
-        )
-    else:
-        result = HarnessResult()
-        generate_with_trace(session, args.prompt, result.interactions, max_length=max_length)
-        result.text = session.text
-        result.token_count = session.generated_token_count
-    if args.output:
+    documents = []
+    for prompt in prompts:
+        session = loaded.new_session()
+        if args.harness:
+            result = PythonHarness(max_tool_calls=args.max_tool_calls).run(
+                session,
+                prompt,
+                max_length=max_length,
+                final_answer_instructions="return your final answer without a tool call.",
+                directory=repository,
+            )
+        else:
+            result = HarnessResult()
+            generate_with_trace(session, prompt, result.interactions, max_length=max_length)
+            result.text = session.text
+            result.token_count = session.generated_token_count
         initial = result.interactions[0]
         document = {
             "initial_prompt": initial["content"],
             "events": result.interactions[1:],
             "initial_generation_options": initial["generation_options"],
+            "prompt": prompt,
             "text": result.text,
             "token_count": result.token_count,
             "tool_call_count": len(result.tool_calls),
             "tool_calls": [asdict(call) for call in result.tool_calls],
             "error": result.error,
         }
-        Path(args.output).write_text(
-            json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    if result.error:
-        raise RuntimeError(result.error)
-    print(result.text)
+        documents.append(document)
+        if args.output:
+            exported = (
+                {"repo": repository, "results": documents} if args.input is not None else document
+            )
+            Path(args.output).write_text(
+                json.dumps(exported, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        if result.error:
+            raise RuntimeError(result.error)
+        print(result.text)
 
 
 def _cmd_chat(args: argparse.Namespace) -> None:
@@ -441,7 +481,13 @@ def main(args: list[str] | None = None) -> None:
             "or a HuggingFace id like Qwen/Qwen2.5-Coder-0.5B-Instruct."
         ),
     )
-    gen_parser.add_argument("prompt", help="The prompt to send to the model.")
+    gen_parser.add_argument("prompt", nargs="?", help="The prompt to send to the model.")
+    gen_parser.add_argument(
+        "--input",
+        default=None,
+        metavar="JSON",
+        help="JSON file containing prompts and a local repo path; enables the Python harness.",
+    )
     gen_parser.add_argument(
         "--precision", default=None, help="Precision qualifier (e.g. fp16, int4)."
     )
@@ -607,6 +653,11 @@ def main(args: list[str] | None = None) -> None:
 
     if parsed.command == "chat" and parsed.max_length < 1:
         chat_parser.error("--max-length must be positive")
+    if parsed.command == "generate":
+        if (parsed.prompt is None) == (parsed.input is None):
+            gen_parser.error("provide either PROMPT or --input JSON, but not both")
+        if parsed.input is not None:
+            parsed.harness = "python"
     if parsed.command in {"generate", "bench"}:
         command_parser = gen_parser if parsed.command == "generate" else bench_parser
         if parsed.max_length is not None and parsed.max_length < 1:

@@ -26,7 +26,7 @@ a complete Python script. Blocks execute in order, and their results are returne
 together before your next response. Each block consumes one execution.
 Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
-Each script runs in a fresh Python process in the same temporary directory.
+{working_directory_instructions}
 When finished, {final_answer_instructions}
 The hidden benchmark tests are
 not available to the tool.
@@ -135,11 +135,13 @@ class PythonHarness:
         self.timeout = timeout
         self.max_tool_calls = max_tool_calls
 
-    def execute(self, code: str, directory: str) -> PythonToolResult:
+    def execute(
+        self, code: str, directory: str, *, script_directory: str | None = None
+    ) -> PythonToolResult:
         """Executes a script and captures bounded output and execution status."""
-        script = Path(directory) / "tool_script.py"
+        script = Path(script_directory or directory) / "tool_script.py"
         script.write_text(code, encoding="utf-8")
-        counter = Path(directory) / "tool_function_calls.bin"
+        counter = script.parent / "tool_function_calls.bin"
         counter.write_bytes(b"\0" * 8)
         command = [sys.executable, "-u", "-c", _TOOL_RUNNER, str(counter), str(script)]
         timed_out = False
@@ -187,21 +189,39 @@ class PythonHarness:
         final_answer_instructions: str = (
             "return your final function in a Python markdown code block, without a tool call."
         ),
+        directory: str | None = None,
         **search_options: Any,
     ) -> HarnessResult:
         """Runs tool calls until the model answers or exhausts its budget.
 
         ``max_length`` is the maximum number of new tokens per model turn.
+        ``directory`` selects a persistent working directory instead of a
+        temporary one. Internal scripts and counters remain in temporary storage.
         """
+        if directory is not None:
+            path = Path(directory).resolve()
+            if not path.is_dir():
+                raise ValueError(f"Working directory does not exist: {path}")
+            directory = str(path)
         result = HarnessResult()
         message = (
             _INSTRUCTIONS.format(
                 max_tool_calls=self.max_tool_calls,
                 final_answer_instructions=final_answer_instructions,
+                working_directory_instructions=(
+                    "Each script runs in a fresh Python process in the same temporary directory."
+                    if directory is None
+                    else (
+                        "Each script runs in a fresh Python process in the repository "
+                        f"working directory {directory!r}. Relative file paths refer to this "
+                        "directory. File modifications persist after execution."
+                    )
+                ),
             )
             + prompt
         )
-        with tempfile.TemporaryDirectory(prefix="locodellm-python-") as directory:
+        with tempfile.TemporaryDirectory(prefix="locodellm-python-") as script_directory:
+            working_directory = directory or script_directory
             for _ in range(self.max_tool_calls + 1):
                 generate_with_trace(
                     session,
@@ -236,7 +256,9 @@ class PythonHarness:
                     return result
                 feedback = []
                 for index, code in enumerate(calls, 1):
-                    execution = self.execute(code, directory)
+                    execution = self.execute(
+                        code, working_directory, script_directory=script_directory
+                    )
                     result.tool_calls.append(execution)
                     result.interactions.extend(
                         [

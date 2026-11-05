@@ -11,6 +11,7 @@ Usage
 .. code-block:: bash
 
     python -m locodellm generate MODEL PROMPT [OPTIONS]
+    python -m locodellm generate MODEL --input tasks.json [OPTIONS]
 
 Options
 -------
@@ -21,7 +22,16 @@ Options
     ``Qwen/Qwen2.5-Coder-0.5B-Instruct``.
 
 ``PROMPT``
-    The prompt text to send to the model.
+    The prompt text to send to the model. Mutually exclusive with ``--input``.
+
+``--input``
+    Reads a JSON object with exactly two fields: ``prompts``, a nonempty list
+    of nonempty strings, and ``repo``, an existing local directory path.
+    Relative repository paths are resolved from the input file's directory.
+    Enables the Python harness automatically. Prompts execute sequentially
+    in independent conversations against the same directory, with a separate
+    script budget per prompt. Repository changes persist between prompts and
+    after the run. No repository is cloned, committed, or reset.
 
 ``--precision``
     Precision qualifier for conversion (e.g. ``fp32``, ``fp16``, ``int4``).
@@ -37,7 +47,9 @@ Options
     Executes model-requested Python scripts and returns their output to the model.
     Scripts can read and write files. Each script starts a fresh Python process
     in a temporary directory shared across this prompt's calls and deleted at
-    the end. Execution uses the current user's permissions: this is not a sandbox.
+    the end, unless ``--input`` selects a persistent repository directory.
+    Internal harness scripts and counters always remain in temporary storage.
+    Execution uses the current user's permissions: this is not a sandbox.
 
 ``--max-tool-calls``
     Maximum number of scripts with ``--harness python`` (default: 10).
@@ -50,6 +62,10 @@ Options
     responses, subsequent prompts, executed commands, stdout, stderr, and exit
     status. The file is written when the conversation ends, including on harness
     failure; a harness failure then raises an error instead of reporting success.
+    With ``--input``, the document contains ``repo`` and a ``results`` list of
+    per-prompt records (including the original ``prompt``), saved after every
+    prompt. Execution stops at the first harness error, retaining the completed
+    records and the failing record; subsequent prompts are not executed.
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
@@ -99,4 +115,22 @@ Running a custom prompt with up to 100 Python scripts and collecting events:
 
 The final answer is printed to stdout; it need not be a Python function.
 To keep generated files after the run, the prompt must specify an absolute
-output path outside the temporary directory.
+output path outside the temporary directory, or use JSON input:
+
+.. code-block:: json
+
+    {
+      "repo": "../my-project",
+      "prompts": [
+        "Update README.md to explain the installation steps.",
+        "Add a test for the documented behavior."
+      ]
+    }
+
+Save this as ``tasks.json`` and run:
+
+.. code-block:: bash
+
+    python -m locodellm generate ./model --input tasks.json \
+        --chat-template chatml --max-tool-calls 100 --max-length 1024 \
+        --output evenements.json

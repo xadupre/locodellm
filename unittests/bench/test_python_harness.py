@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from locodellm.__main__ import _compute_case_stats, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
@@ -36,6 +37,138 @@ class ScriptedSession:
 
 
 class TestPythonHarness(unittest.TestCase):
+    def test_generate_json_repository_and_independent_prompts(self):
+        """Runs independent conversations with persistent repository changes."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/scripted-json-cli"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = ScriptedSession(
+            [
+                (
+                    "<python>from pathlib import Path\n"
+                    "path = Path('value.txt')\n"
+                    "path.write_text(str(int(path.read_text()) + 1) if path.exists() else '1')\n"
+                    "</python>"
+                ),
+                "<python>from pathlib import Path\nprint(Path('value.txt').read_text())</python>",
+                "Updated the repository.",
+            ]
+        )
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                repository.mkdir()
+                for filename in ("tool_script.py", "tool_function_calls.bin"):
+                    (repository / filename).write_text("Do not overwrite.", encoding="utf-8")
+                source = root / "tasks.json"
+                prompts = ["Make the first change.", "Make the second change."]
+                source.write_text(
+                    json.dumps({"repo": "repo", "prompts": prompts}), encoding="utf-8"
+                )
+                output = root / "events.json"
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--max-tool-calls",
+                            "2",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(document["repo"], str(repository))
+                self.assertEqual((repository / "value.txt").read_text(), "2")
+                self.assertEqual(
+                    sorted(path.name for path in repository.iterdir()),
+                    ["tool_function_calls.bin", "tool_script.py", "value.txt"],
+                )
+                for filename in ("tool_script.py", "tool_function_calls.bin"):
+                    self.assertEqual(
+                        (repository / filename).read_text(encoding="utf-8"), "Do not overwrite."
+                    )
+                self.assertEqual(stdout.getvalue(), "Updated the repository.\n" * 2)
+                results = document["results"]
+                self.assertEqual([entry["prompt"] for entry in results], prompts)
+                self.assertEqual([len(child.turns) for child in session.children], [3, 3])
+                for index, (entry, child) in enumerate(zip(results, session.children)):
+                    self.assertEqual(entry["tool_call_count"], 2)
+                    self.assertIsNone(entry["error"])
+                    self.assertIn(str(repository), child.turns[0][0])
+                    self.assertTrue(child.turns[0][0].endswith(prompts[index]))
+                    self.assertNotIn(prompts[1 - index], child.turns[0][0])
+                    self.assertIn("Remaining Python tool calls: 0", child.turns[-1][0])
+                    self.assertEqual(entry["tool_calls"][1]["stdout"], f"{index + 1}\n")
+                    for call in entry["tool_calls"]:
+                        self.assertEqual(call["cwd"], str(repository))
+                        self.assertNotEqual(Path(call["command"][-1]).parent, repository)
+                        self.assertFalse(Path(call["command"][-1]).exists())
+        finally:
+            del _session_cache[key]
+
+    def test_generate_json_exports_failure_before_stopping(self):
+        """Preserves changes and failure events without starting later prompts."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/scripted-json-failure"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = ScriptedSession(
+            [
+                (
+                    "<python>from pathlib import Path\n"
+                    "Path('changed.txt').write_text('kept')</python>"
+                ),
+                "<python>raise AssertionError('must not execute')</python>",
+            ]
+        )
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory)
+                source = repository / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = repository / "events.json"
+                with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--max-tool-calls",
+                            "1",
+                            "-o",
+                            str(output),
+                        ]
+                    )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(len(document["results"]), 1)
+                self.assertIn("budget exhausted", document["results"][0]["error"])
+                self.assertEqual(document["results"][0]["tool_call_count"], 1)
+                self.assertEqual(len(session.children), 1)
+                self.assertEqual((repository / "changed.txt").read_text(), "kept")
+        finally:
+            del _session_cache[key]
+
+    def test_missing_working_directory(self):
+        """Rejects a missing working directory before starting the model."""
+        with tempfile.TemporaryDirectory() as directory:
+            session = ScriptedSession([])
+            with self.assertRaisesRegex(ValueError, "Working directory does not exist"):
+                PythonHarness().run(session, "Problem.", 100, directory=f"{directory}/missing")
+            self.assertEqual(session.turns, [])
+
     def test_generate_cli_events_and_configurable_budget(self):
         """Exports real file operations, all turns, and exhausted-budget errors."""
         from locodellm.generate.generate_from_model import _session_cache
