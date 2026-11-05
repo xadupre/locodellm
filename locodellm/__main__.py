@@ -204,7 +204,11 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         session = loaded.new_session()
         session.verbose = args.verbose
         if args.harness:
-            result = PythonHarness(max_tool_calls=args.max_tool_calls, verbose=args.verbose).run(
+            result = PythonHarness(
+                max_tool_calls=args.max_tool_calls,
+                verbose=args.verbose,
+                bash_only=args.harness == "bash",
+            ).run(
                 session,
                 prompt,
                 max_length=max_length,
@@ -342,7 +346,11 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         session,
         verbose=args.verbose,
         json_output=json_output,
-        harness=PythonHarness(max_tool_calls=args.max_tool_calls) if args.harness else None,
+        harness=(
+            PythonHarness(max_tool_calls=args.max_tool_calls, bash_only=args.harness == "bash")
+            if args.harness
+            else None
+        ),
     )
     df = result.to_dataframe()
 
@@ -552,9 +560,9 @@ def main(args: list[str] | None = None) -> None:
     )
     gen_parser.add_argument(
         "--harness",
-        choices=["python"],
+        choices=["python", "bash"],
         default=None,
-        help="Enables Python and Bash script execution.",
+        help="Enables Python/Bash script execution, or Bash only with --harness bash.",
     )
     gen_parser.add_argument(
         "--max-tool-calls",
@@ -649,9 +657,9 @@ def main(args: list[str] | None = None) -> None:
     )
     bench_parser.add_argument(
         "--harness",
-        choices=["python"],
+        choices=["python", "bash"],
         default=None,
-        help="Enables model-requested Python and Bash scripts per built-in problem.",
+        help="Enables Python/Bash scripts per problem, or Bash only with --harness bash.",
     )
     bench_parser.add_argument(
         "--max-tool-calls",
@@ -710,7 +718,7 @@ def main(args: list[str] | None = None) -> None:
         if (parsed.prompt is None) == (parsed.input is None):
             gen_parser.error("provide either PROMPT or --input JSON, but not both")
         if parsed.input is not None:
-            parsed.harness = "python"
+            parsed.harness = parsed.harness or "python"
     if parsed.command in {"generate", "bench"}:
         command_parser = gen_parser if parsed.command == "generate" else bench_parser
         if parsed.max_length is not None and parsed.max_length < 1:
@@ -718,7 +726,7 @@ def main(args: list[str] | None = None) -> None:
         if parsed.max_tool_calls < 1:
             command_parser.error("--max-tool-calls must be positive")
         if not parsed.harness and parsed.max_tool_calls != 10:
-            command_parser.error("--max-tool-calls requires --harness python")
+            command_parser.error("--max-tool-calls requires --harness python or bash")
         if parsed.backend == "pytorch":
             onnx_options = bool(parsed.provider)
             if parsed.command == "bench":

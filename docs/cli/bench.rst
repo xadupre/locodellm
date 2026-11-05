@@ -154,6 +154,8 @@ the Python execution budget and working directory. Mixed scripts run in order.
 Bash requires ``bash`` on PATH and runs with ``pipefail`` enabled, without
 profile or rc files. Its commands, output, status, and ``tool: bash`` are exported;
 Bash scripts do not contribute to Python function-call counts.
+Use ``--harness bash`` to advertise and accept only Bash tool requests;
+Python requests, including mixed batches, are rejected before execution.
 The Nemotron form
 ``<tool_call><function=stateful_python_code_exec><parameter=code>...code...</parameter></function></tool_call>``
 is also accepted, with ``stateful_python_code_exec`` or ``python`` as the tool

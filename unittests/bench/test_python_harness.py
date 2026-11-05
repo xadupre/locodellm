@@ -84,6 +84,79 @@ def create_repository(directory):
 
 class TestPythonHarness(unittest.TestCase):
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_bash_only_cli_json_input(self):
+        """Preserves explicit Bash-only mode for JSON batches and executes real commands."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/bash-only-cli"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = ScriptedSession(
+            ["<bash>printf 42 > answer.txt; cat answer.txt</bash>", "Done."]
+        )
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--harness",
+                            "bash",
+                            "--max-tool-calls",
+                            "1",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(len(document["results"]), 2)
+                for result, child in zip(document["results"], session.children):
+                    self.assertIsNone(result["error"])
+                    self.assertIn("only the Bash tool", result["initial_prompt"])
+                    self.assertNotIn("<python>", result["initial_prompt"])
+                    self.assertIn("Remaining Bash tool calls: 0", child.turns[1][0])
+                    self.assertIn("Only Bash tool requests are allowed.", child.turns[1][0])
+                    self.assertEqual(result["tool_calls"][0]["tool"], "bash")
+                    self.assertEqual(result["tool_calls"][0]["stdout"], "42")
+                    self.assertIn("+42", result["diff"])
+        finally:
+            del _session_cache[key]
+
+    def test_bash_only_rejects_python_requests_before_any_execution(self):
+        """Rejects Python and mixed batches atomically in Bash-only mode."""
+        for request in [
+            "<python>print(42)</python>",
+            (
+                "<tool_call><function=python><parameter=code>print(42)</parameter>"
+                "</function></tool_call>"
+            ),
+            "<bash>exit 99</bash><python>print(42)</python>",
+        ]:
+            with self.subTest(request=request):
+                result = PythonHarness(bash_only=True).run(
+                    ScriptedSession([request]), "Problem.", 100
+                )
+                self.assertIn("disabled in Bash-only mode", result.error)
+                self.assertEqual(result.tool_calls, [])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "disabled in Bash-only mode"):
+                PythonHarness(bash_only=True).execute("print(42)", directory)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_mixed_bash_and_python_requests(self):
         """Executes mixed scripts in order and returns every result to the next turn."""
         session = ScriptedSession(

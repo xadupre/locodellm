@@ -75,6 +75,13 @@ Options
     Internal harness scripts and counters always remain in temporary storage.
     Execution uses the current user's permissions: this is not a sandbox.
 
+``--harness bash``
+    Enables only Bash tool requests. The initial prompt advertises only
+    ``<bash>...</bash>`` calls; Python tool requests are rejected before execution,
+    including entire mixed batches. This explicit choice is preserved with
+    ``--input``. It selects a tool protocol, not a sandbox: Bash can still
+    launch installed programs, including Python.
+
 ``--max-tool-calls``
     Maximum combined number of Python and Bash scripts (default: 10).
     Each script in a grouped request consumes one execution.

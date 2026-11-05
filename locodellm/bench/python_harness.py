@@ -26,11 +26,8 @@ _SCRIPT_CALL = re.compile(_PYTHON_CALL.pattern + r"|<bash>\s*(.*?)\s*</bash>", r
 _TOOL_MARKER = re.compile(
     r"```.*?```|(?P<python></?python\b)|(?P<bash></?bash\b)|(?P<native></?tool_call\b)", re.DOTALL
 )
-_INSTRUCTIONS = """You may use the Python and Bash tools to solve the task before answering.
+_INSTRUCTIONS = """{tool_instructions}
 You may execute up to {max_tool_calls} scripts to solve this problem.
-To call it, reply with one or more <python>...</python> blocks, each containing
-a complete Python script, or <bash>...</bash> blocks containing Bash commands.
-Python and Bash share the same execution budget and working directory.
 Blocks execute in order, and their results are returned
 together before your next response. Each block consumes one execution.
 Print the values you want to inspect. You will receive stdout,
@@ -39,11 +36,8 @@ stderr, the exit code, and whether execution timed out.
 When finished, {final_answer_instructions}
 The hidden benchmark tests are
 not available to the tool.
-Every <python>...</python> block is an execution request, never a final answer.
-Every <bash>...</bash> block is also an execution request, never a final answer.
+{tool_rules}
 Bash uses pipefail; shell variables do not persist between scripts.
-A function definition alone does not call the function or print anything.
-Include calls and print or assert statements to check your solution.
 
 Problem:
 """
@@ -144,7 +138,13 @@ class PythonHarness:
 
     max_tool_calls = 10
 
-    def __init__(self, timeout: float = 10.0, max_tool_calls: int = 10, verbose: int = 0) -> None:
+    def __init__(
+        self,
+        timeout: float = 10.0,
+        max_tool_calls: int = 10,
+        verbose: int = 0,
+        bash_only: bool = False,
+    ) -> None:
         if timeout <= 0:
             raise ValueError("The Python tool timeout must be positive.")
         if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int):
@@ -154,6 +154,7 @@ class PythonHarness:
         self.timeout = timeout
         self.max_tool_calls = max_tool_calls
         self.verbose = verbose
+        self.bash_only = bash_only
 
     def execute(
         self,
@@ -166,6 +167,8 @@ class PythonHarness:
         """Executes a script and captures bounded output and execution status."""
         if tool not in {"python", "bash"}:
             raise ValueError(f"Unsupported execution tool: {tool!r}")
+        if self.bash_only and tool != "bash":
+            raise ValueError("Python tool requests are disabled in Bash-only mode.")
         script = Path(script_directory or directory) / (
             "tool_script.sh" if tool == "bash" else "tool_script.py"
         )
@@ -245,6 +248,28 @@ class PythonHarness:
         result = HarnessResult()
         message = (
             _INSTRUCTIONS.format(
+                tool_instructions=(
+                    "You may use only the Bash tool to solve the task before answering.\n"
+                    "To call it, reply with one or more <bash>...</bash> blocks "
+                    "containing Bash commands.\nPython tool requests are disabled."
+                    if self.bash_only
+                    else (
+                        "You may use Python and Bash tools to solve the task before answering.\n"
+                        "Reply with one or more <python>...</python> blocks containing "
+                        "Python scripts, or <bash>...</bash> blocks containing Bash commands.\n"
+                        "Python and Bash share the same execution budget and working directory."
+                    )
+                ),
+                tool_rules=(
+                    "Every <bash>...</bash> block is an execution request, never a final answer."
+                    if self.bash_only
+                    else (
+                        "Every <python>...</python> or <bash>...</bash> block is an execution "
+                        "request, never a final answer.\n"
+                        "A function definition alone does not call it or print anything.\n"
+                        "Include calls and print or assert statements to check your solution."
+                    )
+                ),
                 max_tool_calls=self.max_tool_calls,
                 final_answer_instructions=final_answer_instructions,
                 working_directory_instructions=(
@@ -287,12 +312,19 @@ class PythonHarness:
                 response = strip_thinking(session.text)
                 calls = extract_script_calls(response)
                 budget_label = (
-                    "Python/Bash"
-                    if any(tool == "bash" for tool, _ in calls)
-                    or any(call.tool == "bash" for call in result.tool_calls)
-                    else "Python"
+                    "Bash"
+                    if self.bash_only
+                    else (
+                        "Python/Bash"
+                        if any(tool == "bash" for tool, _ in calls)
+                        or any(call.tool == "bash" for call in result.tool_calls)
+                        else "Python"
+                    )
                 )
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
+                if self.bash_only and any(tool != "bash" for tool, _ in calls):
+                    result.error = "Python tool requests are disabled in Bash-only mode."
+                    return result
                 if not calls:
                     marker = next(
                         (
@@ -386,7 +418,11 @@ class PythonHarness:
                     "Answer WITHOUT <python> or </python> tags. Otherwise make "
                     "another allowed tool call with your own checks. "
                     "Do not include <bash> or </bash> tags in the final answer. "
-                    "Python and Bash share the remaining execution budget."
+                    + (
+                        "Only Bash tool requests are allowed."
+                        if self.bash_only
+                        else "Python and Bash share the remaining execution budget."
+                    )
                 )
         result.error = "The model did not return a final answer within the conversation budget."
         return result

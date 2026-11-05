@@ -104,6 +104,17 @@ Both tools share the script budget and working directory. Bash runs with
 `pipefail` enabled; outputs and exit status are sent back to the model and saved
 with `tool: "bash"` in the JSON trace. Bash must be available on PATH.
 
+To expose only the Bash tool, use `--harness bash`, including with JSON input:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.5-0.8B \
+  --backend pytorch --device cuda --input tasks.json --harness bash \
+  --max-tool-calls 100 --max-length 4096 --output events.json --verbose 1
+```
+
+The initial instructions advertise only Bash. Python tool requests are rejected;
+this is not isolation, since Bash commands can still launch Python.
+
 ### Python API
 
 #### `create_session` and `session.generate`
