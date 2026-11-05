@@ -101,6 +101,8 @@ Options
     reset, model turns, script execution and exit status, diff capture, and saving.
     The PyTorch backend reports configuration, weight and tokenizer loading,
     then first-token waiting, periodic generated-token counts, and completion.
+    Each periodic token-count line includes ``text=...`` with the latest
+    30 decoded characters, so the displayed text advances during generation.
     During PyTorch decoding, a response-start preview is flushed as soon as
     30 characters are available, without waiting for generation to finish.
     After each model response, the first 30 characters are also printed as a

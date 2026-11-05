@@ -259,6 +259,12 @@ class TestPyTorchSession(unittest.TestCase):
                 self.assertIn("[harness] model turn 1;", stderr.getvalue())
                 self.assertIn("[generate] waiting for first token", stderr.getvalue())
                 self.assertIn("[generate] generated 1/8 tokens", stderr.getvalue())
+                first_progress = next(
+                    line
+                    for line in stderr.getvalue().splitlines()
+                    if "[generate] generated 1/8 tokens" in line
+                )
+                self.assertIn("text='answer'", first_progress)
                 self.assertIn("[generate] generation finished: 8 tokens", stderr.getvalue())
                 self.assertIn(f"[generate] response preview: {answer[:30]!r}", stderr.getvalue())
                 self.assertIn("[harness] model turn 1 finished: 8 tokens", stderr.getvalue())
@@ -281,6 +287,34 @@ class TestPyTorchSession(unittest.TestCase):
                         "loading tokenizer",
                     ):
                         self.assertIn(phase, stderr.getvalue())
+
+    def test_progress_reports_current_generated_text(self):
+        """Includes a changing thirty-character suffix in periodic token reports."""
+        import torch
+
+        from locodellm.session.pytorch_session import GenerationProgress
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        progress = GenerationProgress(1000, session.tokenizer)
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            progress.put(torch.tensor([[1]]))
+            progress.put(torch.tensor([0]))
+            progress.last_report = 0
+            progress.put(torch.tensor([0] * 200))
+            progress.last_report = 0
+            progress.put(torch.tensor([1]))
+        lines = [
+            line for line in stderr.getvalue().splitlines() if "[generate] generated " in line
+        ]
+        self.assertEqual(len(lines), 3)
+        self.assertIn("generated 1/1000 tokens", lines[0])
+        self.assertTrue(lines[0].endswith("text='answer'"))
+        self.assertIn("generated 201/1000 tokens", lines[1])
+        expected = " ".join(["answer"] * 128)[-30:]
+        self.assertTrue(lines[1].endswith(f"text={expected!r}"))
+        expected = (" ".join(["answer"] * 127) + " [UNK]")[-30:]
+        self.assertTrue(lines[2].endswith(f"text={expected!r}"))
+        self.assertLessEqual(len(progress.recent_tokens), 128)
 
     def test_python_harness(self):
         """Accepts direct answers while preserving per-turn generation limits."""

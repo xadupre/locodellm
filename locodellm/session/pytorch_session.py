@@ -18,6 +18,7 @@ class GenerationProgress:
         self.max_new_tokens = max_new_tokens
         self.tokenizer = tokenizer
         self.preview_tokens: list[int] = []
+        self.recent_tokens: list[int] = []
         self.preview_reported = False
         self.token_count = 0
         self.skip_prompt = True
@@ -31,8 +32,10 @@ class GenerationProgress:
             print("[generate] waiting for first token", file=sys.stderr, flush=True)
             return
         self.token_count += tokens.numel()
+        token_ids = tokens.reshape(-1).tolist()
+        self.recent_tokens = [*self.recent_tokens, *token_ids][-128:]
         if not self.preview_reported:
-            self.preview_tokens.extend(tokens.reshape(-1).tolist())
+            self.preview_tokens.extend(token_ids)
             preview = self.tokenizer.decode(self.preview_tokens, skip_special_tokens=False)
             if len(preview) >= 30:
                 print(f"[generate] response start: {preview[:30]!r}", file=sys.stderr, flush=True)
@@ -40,9 +43,12 @@ class GenerationProgress:
                 self.preview_tokens.clear()
         now = time.monotonic()
         if self.token_count == 1 or now - self.last_report >= 1:
+            recent_text = self.tokenizer.decode(self.recent_tokens, skip_special_tokens=False)[
+                -30:
+            ]
             print(
                 f"[generate] generated {self.token_count}/{self.max_new_tokens} tokens "
-                f"({now - self.started_at:.1f}s)",
+                f"({now - self.started_at:.1f}s) text={recent_text!r}",
                 file=sys.stderr,
                 flush=True,
             )
