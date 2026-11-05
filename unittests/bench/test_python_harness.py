@@ -2,15 +2,21 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from locodellm.__main__ import _compute_case_stats, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
-from locodellm.bench.python_harness import PythonHarness, extract_python_calls
+from locodellm.bench.python_harness import (
+    PythonHarness,
+    extract_python_calls,
+    extract_script_calls,
+)
 from locodellm.generate.repository import GitRepository
 from locodellm.utils import extract_code, strip_thinking
 
@@ -77,6 +83,98 @@ def create_repository(directory):
 
 
 class TestPythonHarness(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_mixed_bash_and_python_requests(self):
+        """Executes mixed scripts in order and returns every result to the next turn."""
+        session = ScriptedSession(
+            [
+                (
+                    "<think><bash>exit 99</bash></think>\n"
+                    "```bash\nexit 98\n```\n"
+                    "<bash>printf 41 > value.txt</bash>\n"
+                    "<python>from pathlib import Path\n"
+                    "value = int(Path('value.txt').read_text()) + 1\n"
+                    "Path('value.txt').write_text(str(value))\n"
+                    "print(value)</python>\n"
+                    "<bash>cat value.txt; printf diagnostic >&2; exit 7</bash>"
+                ),
+                "```python\ndef answer():\n    return 42\n```",
+            ]
+        )
+        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+            session, harness=PythonHarness(max_tool_calls=3)
+        )
+        self.assertEqual(result.passed, 1)
+        case = result.results[0]
+        self.assertEqual([call.tool for call in case.tool_calls], ["bash", "python", "bash"])
+        self.assertEqual([call.stdout for call in case.tool_calls], ["", "42\n", "42"])
+        self.assertEqual([call.returncode for call in case.tool_calls], [0, 0, 7])
+        self.assertEqual(case.tool_calls[2].stderr, "diagnostic")
+        self.assertEqual(case.function_call_count, 0)
+        self.assertEqual(len({call.cwd for call in case.tool_calls}), 1)
+        feedback = session.children[0].turns[1][0]
+        self.assertIn("Bash tool result 1/3", feedback)
+        self.assertIn("Python tool result 2/3", feedback)
+        self.assertIn("Bash tool result 3/3", feedback)
+        self.assertIn("stderr:\ndiagnostic", feedback)
+        self.assertIn("exit code: 7", feedback)
+        self.assertIn("Remaining Python/Bash tool calls: 0", feedback)
+        exported = result.to_json()[0]
+        self.assertEqual(
+            [call["tool"] for call in exported["tool_calls"]], ["bash", "python", "bash"]
+        )
+        self.assertEqual(
+            [event["tool"] for event in exported["events"] if event["type"] == "command"],
+            ["bash", "python", "bash"],
+        )
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_bash_failure_timeout_and_truncation(self):
+        """Captures pipeline failures and bounds Bash outputs and execution time."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = PythonHarness(timeout=0.1)
+            failed = harness.execute("false | cat", directory, tool="bash")
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(failed.function_call_count, 0)
+            large = harness.execute(
+                "printf '%020000d' 0; printf '%020000d' 0 >&2", directory, tool="bash"
+            )
+            self.assertTrue(large.stdout.endswith("[output truncated]"))
+            self.assertTrue(large.stderr.endswith("[output truncated]"))
+            timed_out = harness.execute(
+                "sleep 0.4; printf should-not-run > late.txt", directory, tool="bash"
+            )
+            self.assertTrue(timed_out.timed_out)
+            self.assertIsNone(timed_out.returncode)
+            time.sleep(0.5)
+            self.assertFalse((Path(directory) / "late.txt").exists())
+
+    def test_bash_budget_and_incomplete_requests(self):
+        """Rejects mixed over-budget batches and malformed requests without execution."""
+        result = PythonHarness(max_tool_calls=1).run(
+            ScriptedSession(["<bash>exit 99</bash><python>raise AssertionError()</python>"]),
+            "Problem.",
+            100,
+        )
+        self.assertEqual(result.tool_calls, [])
+        self.assertIn("budget exhausted", result.error)
+        for response in ("Some prose.\n<bash>ls", "Some prose.\n</bash>"):
+            with self.subTest(response=response):
+                result = PythonHarness().run(ScriptedSession([response]), "Problem.", 100)
+                self.assertIn("Malformed Bash", result.error)
+                self.assertEqual(result.tool_calls, [])
+        final = '```bash\nprintf "<bash>"\n```'
+        result = PythonHarness().run(ScriptedSession([final]), "Problem.", 100)
+        self.assertEqual(result.text, final)
+        self.assertIsNone(result.error)
+
+    def test_bash_literals_do_not_become_nested_tools_or_thinking(self):
+        """Preserves literal Python and thinking tags inside a Bash request."""
+        bash = """printf '%s\\n' '<python>print(99)</python>' '</think>'"""
+        response = f"<think>Hidden.</think><bash>{bash}</bash>"
+        self.assertEqual(extract_script_calls(response), [("bash", bash)])
+        self.assertEqual(extract_python_calls(response), [])
+
     def test_verbose_response_previews(self):
         """Reports exactly the first thirty response characters on every model turn."""
         responses = [

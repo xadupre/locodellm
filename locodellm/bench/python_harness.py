@@ -1,8 +1,11 @@
-"""Runs a model-driven conversation with a bounded Python execution tool."""
+"""Runs a model-driven conversation with bounded Python and Bash execution tools."""
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,13 +22,16 @@ _PYTHON_CALL = re.compile(
     r"|\A<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>\Z",
     re.DOTALL,
 )
+_SCRIPT_CALL = re.compile(_PYTHON_CALL.pattern + r"|<bash>\s*(.*?)\s*</bash>", re.DOTALL)
 _TOOL_MARKER = re.compile(
-    r"```.*?```|(?P<python></?python\b)|(?P<native></?tool_call\b)", re.DOTALL
+    r"```.*?```|(?P<python></?python\b)|(?P<bash></?bash\b)|(?P<native></?tool_call\b)", re.DOTALL
 )
-_INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
+_INSTRUCTIONS = """You may use the Python and Bash tools to solve the task before answering.
 You may execute up to {max_tool_calls} scripts to solve this problem.
 To call it, reply with one or more <python>...</python> blocks, each containing
-a complete Python script. Blocks execute in order, and their results are returned
+a complete Python script, or <bash>...</bash> blocks containing Bash commands.
+Python and Bash share the same execution budget and working directory.
+Blocks execute in order, and their results are returned
 together before your next response. Each block consumes one execution.
 Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
@@ -34,6 +40,8 @@ When finished, {final_answer_instructions}
 The hidden benchmark tests are
 not available to the tool.
 Every <python>...</python> block is an execution request, never a final answer.
+Every <bash>...</bash> block is also an execution request, never a final answer.
+Bash uses pipefail; shell variables do not persist between scripts.
 A function definition alone does not call the function or print anything.
 Include calls and print or assert statements to check your solution.
 
@@ -70,7 +78,7 @@ with open(counter_path, "r+b") as counter_file:
 
 @dataclass
 class PythonToolResult:
-    """Records one Python tool execution, including failed executions."""
+    """Records one Python or Bash execution, including failed executions."""
 
     code: str
     stdout: str
@@ -80,6 +88,7 @@ class PythonToolResult:
     command: list[str]
     cwd: str
     function_call_count: int = 0
+    tool: str = "python"
 
 
 @dataclass
@@ -95,10 +104,15 @@ class HarnessResult:
 
 def extract_python_calls(text: str) -> list[str]:
     """Extracts explicit Python requests outside thinking and Markdown fences."""
+    return [code for tool, code in extract_script_calls(text) if tool == "python"]
+
+
+def extract_script_calls(text: str) -> list[tuple[str, str]]:
+    """Extracts ordered Python and Bash requests outside thinking and Markdown."""
     return [
-        code
-        for match in _PYTHON_CALL.finditer(strip_thinking(text))
-        for code in match.groups()
+        ("bash" if index == 3 else "python", code)
+        for match in _SCRIPT_CALL.finditer(strip_thinking(text))
+        for index, code in enumerate(match.groups())
         if code is not None
     ]
 
@@ -123,7 +137,7 @@ def generate_with_trace(
 
 
 class PythonHarness:
-    """Provides a configurable budget of Python executions per problem.
+    """Provides a shared configurable budget of Python and Bash executions.
 
     Scripts run with the current user's permissions; this is not a sandbox.
     """
@@ -142,30 +156,48 @@ class PythonHarness:
         self.verbose = verbose
 
     def execute(
-        self, code: str, directory: str, *, script_directory: str | None = None
+        self,
+        code: str,
+        directory: str,
+        *,
+        script_directory: str | None = None,
+        tool: str = "python",
     ) -> PythonToolResult:
         """Executes a script and captures bounded output and execution status."""
-        script = Path(script_directory or directory) / "tool_script.py"
+        if tool not in {"python", "bash"}:
+            raise ValueError(f"Unsupported execution tool: {tool!r}")
+        script = Path(script_directory or directory) / (
+            "tool_script.sh" if tool == "bash" else "tool_script.py"
+        )
         script.write_text(code, encoding="utf-8")
         counter = script.parent / "tool_function_calls.bin"
         counter.write_bytes(b"\0" * 8)
         command = [sys.executable, "-u", "-c", _TOOL_RUNNER, str(counter), str(script)]
+        if tool == "bash":
+            bash = shutil.which("bash")
+            if bash is None:
+                raise FileNotFoundError("Bash execution requires the 'bash' executable on PATH.")
+            command = [bash, "--noprofile", "--norc", "-o", "pipefail", str(script)]
         timed_out = False
         returncode = None
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=directory,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    timeout=self.timeout,
-                    check=False,
-                )
-                returncode = completed.returncode
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            with subprocess.Popen(
+                command,
+                cwd=directory,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=os.name == "posix",
+            ) as process:
+                try:
+                    returncode = process.wait(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.wait()
 
             outputs = []
             for stream in (stdout, stderr):
@@ -185,6 +217,7 @@ class PythonHarness:
             command,
             directory,
             int.from_bytes(counter.read_bytes(), sys.byteorder),
+            tool,
         )
 
     def run(
@@ -215,10 +248,10 @@ class PythonHarness:
                 max_tool_calls=self.max_tool_calls,
                 final_answer_instructions=final_answer_instructions,
                 working_directory_instructions=(
-                    "Each script runs in a fresh Python process in the same temporary directory."
+                    "Each script runs in a fresh process in the same temporary directory."
                     if directory is None
                     else (
-                        "Each script runs in a fresh Python process in the repository "
+                        "Each script runs in a fresh process in the repository "
                         f"working directory {directory!r}. Relative file paths refer to this "
                         "directory. File modifications persist after execution."
                     )
@@ -252,7 +285,13 @@ class PythonHarness:
                     )
                 result.token_count += session.generated_token_count
                 response = strip_thinking(session.text)
-                calls = extract_python_calls(response)
+                calls = extract_script_calls(response)
+                budget_label = (
+                    "Python/Bash"
+                    if any(tool == "bash" for tool, _ in calls)
+                    or any(call.tool == "bash" for call in result.tool_calls)
+                    else "Python"
+                )
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
                 if not calls:
                     marker = next(
@@ -271,29 +310,31 @@ class PythonHarness:
                         )
                     elif marker is not None and marker.lastgroup == "native":
                         result.error = "Unsupported or malformed native Python tool call."
+                    elif marker is not None and marker.lastgroup == "bash":
+                        result.error = "Malformed Bash tool call; expected <bash>...</bash>."
                     else:
                         result.text = response
                     return result
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 if len(calls) > remaining:
                     result.error = (
-                        f"Python tool budget exhausted ({self.max_tool_calls} "
+                        f"{budget_label} tool budget exhausted ({self.max_tool_calls} "
                         "executions per problem; "
                         f"requested {len(calls)} with {remaining} remaining)."
                     )
                     return result
                 feedback = []
-                for index, code in enumerate(calls, 1):
+                for index, (tool, code) in enumerate(calls, 1):
                     script_index = len(result.tool_calls) + 1
                     if self.verbose:
                         print(
                             f"[harness] executing script {script_index}/{self.max_tool_calls} "
-                            f"(timeout={self.timeout}s)",
+                            f"(tool={tool}, timeout={self.timeout}s)",
                             file=sys.stderr,
                             flush=True,
                         )
                     execution = self.execute(
-                        code, working_directory, script_directory=script_directory
+                        code, working_directory, script_directory=script_directory, tool=tool
                     )
                     result.tool_calls.append(execution)
                     if self.verbose:
@@ -307,6 +348,7 @@ class PythonHarness:
                         [
                             {
                                 "type": "command",
+                                "tool": tool,
                                 "argv": execution.command,
                                 "cwd": execution.cwd,
                                 "code": code,
@@ -321,11 +363,10 @@ class PythonHarness:
                             },
                         ]
                     )
-                    heading = (
-                        "Python tool result"
-                        if len(calls) == 1
-                        else f"Python tool result {index}/{len(calls)}"
-                    )
+                    label = "Bash" if tool == "bash" else "Python"
+                    heading = f"{label} tool result"
+                    if len(calls) > 1:
+                        heading += f" {index}/{len(calls)}"
                     feedback.append(
                         f"{heading}:\n"
                         f"stdout:\n{execution.stdout}\n"
@@ -337,13 +378,15 @@ class PythonHarness:
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 message = "\n\n".join(feedback) + (
                     "\n"
-                    f"Remaining Python tool calls: {remaining}.\n"
-                    "The preceding Python tool requests were executed, not accepted as a final "
+                    f"Remaining {budget_label} tool calls: {remaining}.\n"
+                    "The preceding tool requests were executed, not accepted as a final "
                     "answer. An empty stdout means the script printed nothing; defining "
                     "a function does not call it.\n"
                     f"To finish, {final_answer_instructions}\n"
                     "Answer WITHOUT <python> or </python> tags. Otherwise make "
-                    "another allowed tool call with your own checks."
+                    "another allowed tool call with your own checks. "
+                    "Do not include <bash> or </bash> tags in the final answer. "
+                    "Python and Bash share the remaining execution budget."
                 )
         result.error = "The model did not return a final answer within the conversation budget."
         return result

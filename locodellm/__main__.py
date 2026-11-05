@@ -523,7 +523,7 @@ def main(args: list[str] | None = None) -> None:
         "--input",
         default=None,
         metavar="JSON",
-        help="JSON file containing prompts and a local repo path; enables the Python harness.",
+        help="JSON prompts and local repo path; enables the Python/Bash harness.",
     )
     gen_parser.add_argument(
         "--precision",
@@ -551,13 +551,16 @@ def main(args: list[str] | None = None) -> None:
         help="Maximum token length (default: 200); with --harness, new tokens per turn (1024).",
     )
     gen_parser.add_argument(
-        "--harness", choices=["python"], default=None, help="Enables Python script execution."
+        "--harness",
+        choices=["python"],
+        default=None,
+        help="Enables Python and Bash script execution.",
     )
     gen_parser.add_argument(
         "--max-tool-calls",
         type=int,
         default=10,
-        help="Maximum Python script executions with --harness (default: 10).",
+        help="Maximum Python and Bash script executions with --harness (default: 10).",
     )
     gen_parser.add_argument(
         "--output", "-o", default=None, help="Writes the conversation and tool events as JSON."
@@ -648,13 +651,13 @@ def main(args: list[str] | None = None) -> None:
         "--harness",
         choices=["python"],
         default=None,
-        help="Enables model-requested Python executions per built-in problem.",
+        help="Enables model-requested Python and Bash scripts per built-in problem.",
     )
     bench_parser.add_argument(
         "--max-tool-calls",
         type=int,
         default=10,
-        help="Maximum Python script executions per problem with --harness (default: 10).",
+        help="Maximum Python and Bash scripts per problem with --harness (default: 10).",
     )
     bench_parser.add_argument(
         "--chat-template",

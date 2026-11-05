@@ -62,15 +62,21 @@ Options
     maximum new tokens per model turn (default: 1024).
 
 ``--harness python``
-    Executes model-requested Python scripts and returns their output to the model.
-    Scripts can read and write files. Each script starts a fresh Python process
+    Executes model-requested Python and Bash scripts and returns their output to the model.
+    The historical option name ``python`` enables both tools.
+    Requests use ``<python>...</python>`` or ``<bash>...</bash>`` outside thinking
+    and Markdown fences. Mixed requests execute sequentially in message order,
+    share a working directory and budget, and return their results together.
+    Bash runs with ``pipefail`` enabled, without profile or rc files, and requires
+    ``bash`` on PATH. Shell variables do not persist between executions.
+    Scripts can read and write files. Each script starts a fresh process
     in a temporary directory shared across this prompt's calls and deleted at
     the end, unless ``--input`` selects a persistent repository directory.
     Internal harness scripts and counters always remain in temporary storage.
     Execution uses the current user's permissions: this is not a sandbox.
 
 ``--max-tool-calls``
-    Maximum number of scripts with ``--harness python`` (default: 10).
+    Maximum combined number of Python and Bash scripts (default: 10).
     Each script in a grouped request consumes one execution.
     A request must include its closing tool tag before it can execute.
     An incomplete request, including one preceded by explanatory prose, is
@@ -91,6 +97,8 @@ Options
     Records are saved after every prompt, before any subsequent cleanup.
     Execution stops at the first harness error, retaining the completed
     records, the failing record, and its diff; subsequent prompts are not executed.
+    Each executed tool record and command event includes ``tool`` (``python``
+    or ``bash``). Bash scripts contribute zero to Python function-call counts.
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).

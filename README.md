@@ -28,7 +28,7 @@ pip install -e .
 python -m locodellm version
 ```
 
-Run a prompt with up to 100 Python script executions and export conversation
+Run a prompt with up to 100 Python or Bash script executions and export conversation
 and execution events:
 
 ```bash
@@ -56,7 +56,7 @@ python -m locodellm generate path/to/model --input tasks.json \
   --output events.json
 ```
 
-The JSON input enables the Python harness. Prompts run in order, each in an
+The JSON input enables the Python/Bash harness. Prompts run in order, each in an
 independent conversation with its own script budget, against the same directory.
 Relative `repo` paths are resolved from the JSON file's directory and must point
 to the root of an existing Git working tree with a commit. Keep `tasks.json` and
@@ -92,6 +92,17 @@ With `--verbose 1`, progress is flushed immediately to stderr: model loading
 stages, prompt and model-turn numbers, Python script execution, diff capture,
 and saving. PyTorch generation also reports first-token waiting, periodic token
 counts, and completion, rather than remaining silent until the answer is ready.
+
+The model can request shell commands with `<bash>...</bash>` as well as Python
+with `<python>...</python>`, outside Markdown fences. For example:
+
+```xml
+<bash>git status --short; find . -name '*.py' -print</bash>
+```
+
+Both tools share the script budget and working directory. Bash runs with
+`pipefail` enabled; outputs and exit status are sent back to the model and saved
+with `tool: "bash"` in the JSON trace. Bash must be available on PATH.
 
 ### Python API
 
