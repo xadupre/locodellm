@@ -50,6 +50,34 @@ class TestMain(ExtTestCase):
 class TestMainGenerate(ExtTestCase):
     """Tests for the generate subcommand."""
 
+    @requires_onnxruntime_genai()
+    def test_generate_onnx_live_log(self):
+        """Streams ONNX model output into a retained transcript without verbose."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with (
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                main(
+                    [
+                        "generate",
+                        "mock/generate",
+                        'write a python function which returns "hello"',
+                        "--chat-template",
+                        "chatml",
+                        "--live-log",
+                        str(path),
+                    ]
+                )
+            text = path.read_text()
+            self.assertIn("def hello", stdout.getvalue())
+            self.assertIn("def hello", text)
+            self.assertIn("[model response complete]", text)
+
     def test_invalid_json_input(self):
         """Rejects malformed prompt lists and missing repositories before loading."""
         import json

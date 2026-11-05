@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from locodellm.generate.live_log import LiveLog
 
 
 class SessionState:
@@ -35,6 +38,7 @@ class SessionState:
         self.text: str = ""
         self.generated_token_count: int = 0
         self.verbose = verbose
+        self.live_log: LiveLog | None = None
         self._model_path = model_path
         self._eos_ids: set[int] | None = None
         self._chat_template = chat_template
@@ -172,10 +176,14 @@ class SessionState:
         generator.append_tokens(context)
 
         new_tokens: list[int] = []
+        decoder = self.tokenizer.create_stream() if self.live_log is not None else None
         while not generator.is_done():
             generator.generate_next_token()
             token = generator.get_next_tokens()
             new_tokens.extend(token.tolist())
+            if self.live_log is not None and decoder is not None:
+                for token_id in token.tolist():
+                    self.live_log.model_text(decoder.decode(token_id))
 
         # Strip trailing EOS tokens so the next turn doesn't start with them.
         # When the model finishes via EOS (not max_length), these tokens would

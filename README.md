@@ -115,6 +115,20 @@ python -m locodellm generate Qwen/Qwen3.5-0.8B \
 The initial instructions advertise only Bash. Python tool requests are rejected;
 this is not isolation, since Bash commands can still launch Python.
 
+Add `--live-log` to create a retained temporary transcript, or choose its path:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.5-0.8B \
+  --backend pytorch --device cuda --input tasks.json --harness bash \
+  --max-tool-calls 100 --max-length 4096 --output events.json \
+  --live-log live.log --verbose 1
+```
+
+In another terminal, `tail -f live.log` shows model text as it is generated and
+tool stdout/stderr while scripts run, followed by their exit status. Logging
+flushes immediately and also works without verbose. Keep this file outside the
+target repository. Temporary logs are retained after the run for inspection.
+
 ### Python API
 
 #### `create_session` and `session.generate`

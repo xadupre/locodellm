@@ -4,17 +4,27 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy
 
 from locodellm.session.session_state import SessionState
 
+if TYPE_CHECKING:
+    from locodellm.generate.live_log import LiveLog
+
 
 class GenerationProgress:
     """Reports token progress and a bounded response prefix without starting threads."""
 
-    def __init__(self, max_new_tokens: int, tokenizer: Any) -> None:
+    def __init__(
+        self,
+        max_new_tokens: int,
+        tokenizer: Any,
+        *,
+        verbose: bool = True,
+        live_log: LiveLog | None = None,
+    ) -> None:
         self.max_new_tokens = max_new_tokens
         self.tokenizer = tokenizer
         self.preview_tokens: list[int] = []
@@ -24,9 +34,15 @@ class GenerationProgress:
         self.skip_prompt = True
         self.started_at = time.monotonic()
         self.last_report = self.started_at
+        self.verbose = verbose
+        self.log_streamer = live_log.model_streamer(tokenizer) if live_log is not None else None
 
     def put(self, tokens: Any) -> None:
         """Reports the prefill phase and periodically reports generated token counts."""
+        if self.log_streamer is not None:
+            self.log_streamer.put(tokens)
+        if not self.verbose:
+            return
         if self.skip_prompt:
             self.skip_prompt = False
             print("[generate] waiting for first token", file=sys.stderr, flush=True)
@@ -56,6 +72,10 @@ class GenerationProgress:
 
     def end(self) -> None:
         """Reports generation completion."""
+        if self.log_streamer is not None:
+            self.log_streamer.end()
+        if not self.verbose:
+            return
         print(
             f"[generate] generation finished: {self.token_count} tokens "
             f"({time.monotonic() - self.started_at:.1f}s)",
@@ -137,8 +157,12 @@ class PyTorchSessionState(SessionState):
         options = {"do_sample": False, **search_options}
         if self.tokenizer.pad_token_id is not None:
             options.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        if self.verbose and "streamer" not in options:
-            options["streamer"] = GenerationProgress(max_new_tokens, self.tokenizer)
+        if self.live_log is not None and "streamer" in options:
+            raise ValueError("A live log cannot be combined with a custom generation streamer.")
+        if (self.verbose or self.live_log is not None) and "streamer" not in options:
+            options["streamer"] = GenerationProgress(
+                max_new_tokens, self.tokenizer, verbose=bool(self.verbose), live_log=self.live_log
+            )
         with torch.inference_mode():
             output = self.model.generate(
                 input_ids=input_ids,

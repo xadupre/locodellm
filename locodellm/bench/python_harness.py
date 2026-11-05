@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import re
 import shutil
@@ -9,11 +10,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from locodellm.utils import strip_thinking
+from locodellm.generate.live_log import LiveLog
 
 _PYTHON_CALL = re.compile(
     r"```.*?```|<python>\s*(.*?)\s*</python>"
@@ -118,7 +121,16 @@ def generate_with_trace(
     interactions.append(
         {"type": "prompt", "content": prompt, "generation_options": search_options}
     )
+    live_log = getattr(session, "live_log", None)
+    if live_log is not None:
+        live_log.section("prompt", prompt)
+        live_log.section("model response")
+        live_log.model_streamed = False
     session.generate(prompt, **search_options)
+    if live_log is not None:
+        if not live_log.model_streamed:
+            live_log.model_text(session.text)
+        live_log.section("model response complete")
     if getattr(session, "verbose", 0):
         print(f"[generate] response preview: {session.text[:30]!r}", file=sys.stderr, flush=True)
     interactions.append(
@@ -144,6 +156,7 @@ class PythonHarness:
         max_tool_calls: int = 10,
         verbose: int = 0,
         bash_only: bool = False,
+        live_log: LiveLog | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("The Python tool timeout must be positive.")
@@ -155,6 +168,7 @@ class PythonHarness:
         self.max_tool_calls = max_tool_calls
         self.verbose = verbose
         self.bash_only = bash_only
+        self.live_log = live_log
 
     def execute(
         self,
@@ -183,7 +197,34 @@ class PythonHarness:
             command = [bash, "--noprofile", "--norc", "-o", "pipefail", str(script)]
         timed_out = False
         returncode = None
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        if self.live_log is not None:
+            self.live_log.section(f"{tool} command", code)
+        with (
+            tempfile.TemporaryDirectory(prefix="locodellm-output-") as output_directory,
+            (Path(output_directory) / "stdout").open("w+b") as stdout,
+            (Path(output_directory) / "stderr").open("w+b") as stderr,
+            (Path(output_directory) / "stdout").open("rb") as stdout_reader,
+            (Path(output_directory) / "stderr").open("rb") as stderr_reader,
+        ):
+            decoders = [codecs.getincrementaldecoder("utf-8")(errors="replace") for _ in range(2)]
+
+            def log_output(final: bool = False) -> None:
+                if self.live_log is None:
+                    return
+                for label, reader, decoder in zip(
+                    ("stdout", "stderr"), (stdout_reader, stderr_reader), decoders
+                ):
+                    while data := reader.read(4096):
+                        text = decoder.decode(data)
+                        if text:
+                            self.live_log.section(f"{tool} {label}", text)
+                        if not final:
+                            break
+                    if final:
+                        text = decoder.decode(b"", final=True)
+                        if text:
+                            self.live_log.section(f"{tool} {label}", text)
+
             with subprocess.Popen(
                 command,
                 cwd=directory,
@@ -192,8 +233,22 @@ class PythonHarness:
                 stderr=stderr,
                 start_new_session=os.name == "posix",
             ) as process:
+                deadline = time.monotonic() + self.timeout
                 try:
-                    returncode = process.wait(timeout=self.timeout)
+                    if self.live_log is None:
+                        returncode = process.wait(timeout=self.timeout)
+                    else:
+                        while True:
+                            log_output()
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(command, self.timeout)
+                            try:
+                                returncode = process.wait(timeout=min(0.05, remaining))
+                                break
+                            except subprocess.TimeoutExpired:
+                                if time.monotonic() >= deadline:
+                                    raise
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     if os.name == "posix":
@@ -201,6 +256,13 @@ class PythonHarness:
                     else:
                         process.kill()
                     process.wait()
+                finally:
+                    log_output(final=True)
+
+            if self.live_log is not None:
+                self.live_log.section(
+                    f"{tool} exit", f"returncode={returncode}, timed_out={timed_out}"
+                )
 
             outputs = []
             for stream in (stdout, stderr):
@@ -246,6 +308,8 @@ class PythonHarness:
                 raise ValueError(f"Working directory does not exist: {path}")
             directory = str(path)
         result = HarnessResult()
+        if self.live_log is not None:
+            session.live_log = self.live_log
         message = (
             _INSTRUCTIONS.format(
                 tool_instructions=(

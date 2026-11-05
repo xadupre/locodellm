@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy
 
@@ -315,6 +316,67 @@ class TestPyTorchSession(unittest.TestCase):
         expected = (" ".join(["answer"] * 127) + " [UNK]")[-30:]
         self.assertTrue(lines[2].endswith(f"text={expected!r}"))
         self.assertLessEqual(len(progress.recent_tokens), 128)
+
+    def test_live_model_log_flushes_before_generation_finishes(self):
+        """Writes decoded fragments before streamer completion even without verbose."""
+        import torch
+
+        from locodellm.generate.live_log import LiveLog
+        from locodellm.session.pytorch_session import GenerationProgress
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with LiveLog(str(path)) as log:
+                progress = GenerationProgress(10, session.tokenizer, verbose=False, live_log=log)
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    progress.put(torch.tensor([[1]]))
+                    progress.put(torch.tensor([0]))
+                    progress.put(torch.tensor([0]))
+                    self.assertEqual(path.read_text(), "answer ")
+                    progress.end()
+                self.assertEqual(path.read_text(), "answer answer")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_generate_cli_retains_temporary_live_log(self):
+        """Creates a readable temporary transcript and references it in the final JSON."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "events.json"
+            log_path = None
+            try:
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            self.model_path,
+                            "hello",
+                            "--backend",
+                            "pytorch",
+                            "--device",
+                            "cpu",
+                            "--harness",
+                            "python",
+                            "--max-length",
+                            "2",
+                            "--output",
+                            str(output),
+                            "--live-log",
+                        ]
+                    )
+                document = json.loads(output.read_text())
+                log_path = Path(document["live_log"])
+                self.assertIn(f"[generate] live log: {log_path}", stderr.getvalue())
+                self.assertEqual(stdout.getvalue(), "answer answer\n")
+                text = log_path.read_text()
+                self.assertIn("[prompt]", text)
+                self.assertIn("[model response]\n\nanswer answer", text)
+                self.assertIn("[model response complete]", text)
+            finally:
+                if log_path is not None:
+                    log_path.unlink()
 
     def test_python_harness(self):
         """Accepts direct answers while preserving per-turn generation limits."""

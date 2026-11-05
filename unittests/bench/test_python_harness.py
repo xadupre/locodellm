@@ -18,6 +18,7 @@ from locodellm.bench.python_harness import (
     extract_script_calls,
 )
 from locodellm.generate.repository import GitRepository
+from locodellm.generate.live_log import LiveLog
 from locodellm.utils import extract_code, strip_thinking
 
 
@@ -83,6 +84,45 @@ def create_repository(directory):
 
 
 class TestPythonHarness(unittest.TestCase):
+    def test_live_tool_output_is_visible_before_execution_finishes(self):
+        """Checks flushed stdout and stderr from inside a still-running real script."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with LiveLog(str(path)) as log:
+                code = (
+                    "import sys, time\nfrom pathlib import Path\n"
+                    "print('live_stdout_42', flush=True)\n"
+                    "print('live_stderr_17', file=sys.stderr, flush=True)\n"
+                    "time.sleep(0.3)\n"
+                    f"text = Path({str(path)!r}).read_text()\n"
+                    "assert '[python stdout]\\nlive_stdout_42' in text\n"
+                    "assert '[python stderr]\\nlive_stderr_17' in text\n"
+                    "assert '\\n[python exit]\\n' not in text\n"
+                    "print('confirmed_before_exit', flush=True)\n"
+                )
+                result = PythonHarness(timeout=3, live_log=log).execute(code, directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("confirmed_before_exit", result.stdout)
+                text = path.read_text()
+                self.assertIn("[python command]", text)
+                self.assertIn("[python exit]\nreturncode=0, timed_out=False", text)
+            self.assertTrue(path.exists())
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_live_bash_log_and_timeout(self):
+        """Saves Bash output and timeout status while retaining partial diagnostics."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with LiveLog(str(path)) as log:
+                result = PythonHarness(timeout=0.2, live_log=log).execute(
+                    "printf live_bash; printf diagnostic >&2; sleep 2", directory, tool="bash"
+                )
+                self.assertTrue(result.timed_out)
+                text = path.read_text()
+                self.assertIn("[bash stdout]\nlive_bash", text)
+                self.assertIn("[bash stderr]\ndiagnostic", text)
+                self.assertIn("timed_out=True", text)
+
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_bash_only_cli_json_input(self):
         """Preserves explicit Bash-only mode for JSON batches and executes real commands."""
@@ -492,6 +532,41 @@ class TestPythonHarness(unittest.TestCase):
             before = index.read_bytes()
             self.assertEqual(target.diff(), "")
             self.assertEqual(index.read_bytes(), before)
+
+    def test_live_log_paths_are_validated_before_cleanup(self):
+        """Rejects log paths that would be deleted or corrupt input/output artifacts."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            create_repository(repository)
+            (repository / "tracked.txt").write_text("preserve dirty content")
+            source = root / "tasks.json"
+            source.write_text(
+                json.dumps({"repo": str(repository), "prompts": ["Prompt."]}), encoding="utf-8"
+            )
+            output = root / "events.json"
+            for path, error in [
+                (repository / "live.log", "outside the target repository"),
+                (source, "must differ"),
+                (output, "must differ"),
+            ]:
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(ValueError, error):
+                        main(
+                            [
+                                "generate",
+                                "unused/model",
+                                "--input",
+                                str(source),
+                                "--output",
+                                str(output),
+                                "--live-log",
+                                str(path),
+                            ]
+                        )
+                    self.assertEqual(
+                        (repository / "tracked.txt").read_text(), "preserve dirty content"
+                    )
 
     def test_missing_working_directory(self):
         """Rejects a missing working directory before starting the model."""

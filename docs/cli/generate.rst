@@ -110,6 +110,18 @@ Options
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
 
+``--live-log [PATH]``
+    Appends a human-readable live transcript to PATH. Without a path, creates a
+    temporary ``locodellm-live-*.log`` file and prints its full path on stderr.
+    The file is retained after completion or failure and can be followed with
+    ``tail -f PATH``. Prompts, streamed model text, executed scripts, tool stdout,
+    stderr, exit status, and harness errors are flushed as they become available,
+    independently of ``--verbose``. Tool output is polled every 50 ms; a tool must
+    flush its own output to make it visible immediately.
+    Transformers text is emitted in decoded fragments, not necessarily every token.
+    The path is included as ``live_log`` in saved results. Keep it outside the
+    target repository and separate from the input/output JSON files.
+
 ``--verbose, -v``
     Verbosity level (default: 0). Level 1 immediately flushes progress messages
     to stderr: startup, input validation, loading, prompt number, repository

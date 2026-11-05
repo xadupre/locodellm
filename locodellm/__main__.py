@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import ExitStack
 
 
 def _parse_provider_option(value: str) -> tuple[str, str]:
@@ -151,6 +152,12 @@ def _load_generate_input(filename: str) -> tuple[list[str], str]:
 
 def _cmd_generate(args: argparse.Namespace) -> None:
     """Generates answers for a prompt or a JSON list of independent prompts."""
+    with ExitStack() as stack:
+        _run_generate(args, stack)
+
+
+def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
+    """Runs generation while keeping the optional live transcript open."""
     if args.verbose:
         print(
             f"[generate] starting: backend={args.backend}, model={args.model!r}",
@@ -163,6 +170,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
 
     from locodellm.bench.python_harness import HarnessResult, PythonHarness, generate_with_trace
     from locodellm.generate.generate_from_model import get_session
+    from locodellm.generate.live_log import LiveLog
     from locodellm.generate.repository import GitRepository
 
     if args.verbose:
@@ -171,12 +179,21 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         _load_generate_input(args.input) if args.input is not None else ([args.prompt], None)
     )
     target = GitRepository(repository) if repository is not None else None
+    if args.live_log and any(
+        filename is not None and Path(args.live_log).resolve() == Path(filename).resolve()
+        for filename in (args.input, args.output)
+    ):
+        raise ValueError("The live log must differ from the input and output JSON files.")
     if target is not None:
-        for filename in (args.input, args.output):
+        for filename in (args.input, args.output, args.live_log or None):
             if filename is not None and Path(filename).resolve().is_relative_to(target.path):
                 raise ValueError(
-                    "Input and output JSON files must be outside the target repository."
+                    "Input/output JSON and live log files must be outside the target repository."
                 )
+    live_log = stack.enter_context(LiveLog(args.live_log)) if args.live_log is not None else None
+    if live_log is not None:
+        print(f"[generate] live log: {live_log.path}", file=sys.stderr, flush=True)
+        live_log.section("loading model", f"backend={args.backend}, model={args.model}")
     if args.verbose:
         print("[generate] loading model", file=sys.stderr, flush=True)
     loaded = get_session(
@@ -198,16 +215,20 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         if args.verbose:
             print(f"[generate] prompt {prompt_index}/{len(prompts)}", file=sys.stderr, flush=True)
         if target is not None:
+            if live_log is not None:
+                live_log.section("resetting repository", str(target.path))
             if args.verbose:
                 print("[generate] resetting repository", file=sys.stderr, flush=True)
             target.clean()
         session = loaded.new_session()
         session.verbose = args.verbose
+        session.live_log = live_log
         if args.harness:
             result = PythonHarness(
                 max_tool_calls=args.max_tool_calls,
                 verbose=args.verbose,
                 bash_only=args.harness == "bash",
+                live_log=live_log,
             ).run(
                 session,
                 prompt,
@@ -236,6 +257,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             if args.verbose:
                 print("[generate] collecting repository diff", file=sys.stderr, flush=True)
             document["diff"] = target.diff()
+        if live_log is not None:
+            document["live_log"] = str(live_log.path)
         documents.append(document)
         if args.output:
             if args.verbose:
@@ -249,6 +272,8 @@ def _cmd_generate(args: argparse.Namespace) -> None:
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
         if result.error:
+            if live_log is not None:
+                live_log.section("harness error", result.error)
             raise RuntimeError(result.error)
         print(result.text, flush=True)
 
@@ -572,6 +597,14 @@ def main(args: list[str] | None = None) -> None:
     )
     gen_parser.add_argument(
         "--output", "-o", default=None, help="Writes the conversation and tool events as JSON."
+    )
+    gen_parser.add_argument(
+        "--live-log",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Streams model text and tool output to PATH, or a retained temporary file.",
     )
     gen_parser.add_argument("--chat-template", default=None, help="Chat template (e.g. chatml).")
     gen_parser.add_argument(
