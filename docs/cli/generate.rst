@@ -49,6 +49,8 @@ Options
 ``--backend``
     Generation backend: ``onnx`` (default) or ``pytorch``. The PyTorch backend
     requires the optional ``pytorch`` dependencies.
+    Generation stops at either the model's configured EOS tokens or the
+    tokenizer's EOS token, including chat turn endings when they differ.
 
 ``--device``
     Device for the PyTorch backend: ``cpu`` (default), ``cuda``, ``cuda:0``,

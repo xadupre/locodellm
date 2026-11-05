@@ -148,6 +148,44 @@ class TestPyTorchSession(unittest.TestCase):
         numpy.testing.assert_array_equal(fresh.tokens[: len(history)], history)
         self.assertEqual(fresh.text, "answer")
 
+    def test_model_and_tokenizer_end_tokens_both_stop_generation(self):
+        """Honors tokenizer turn endings as well as configured model end tokens."""
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class ForcedEnding(LogitsProcessor):
+            """Emits one answer token followed by a selected termination token."""
+
+            def __init__(self, end):
+                self.end = end
+                self.calls = 0
+
+            def __call__(self, input_ids, scores):
+                token = self.end if self.calls == 1 else 0
+                self.calls += 1
+                scores.fill_(-float("inf"))
+                scores[:, token] = 0
+                return scores
+
+        loaded = get_session(self.model_path, backend="pytorch", device="cpu")
+        original_eos = loaded.model.generation_config.eos_token_id
+        try:
+            for configured, emitted in [(None, 3), (2, 3), ([2, 6], 3), (2, 2)]:
+                with self.subTest(configured=configured, emitted=emitted):
+                    loaded.model.generation_config.eos_token_id = configured
+                    session = loaded.new_session()
+                    processor = ForcedEnding(emitted)
+                    session.generate(
+                        "hello",
+                        max_new_tokens=8,
+                        logits_processor=LogitsProcessorList([processor]),
+                    )
+                    self.assertEqual(processor.calls, 2)
+                    self.assertEqual(session.text, "answer")
+                    self.assertEqual(session.generated_token_count, 1)
+                    self.assertEqual(session.messages[-1]["content"], "answer")
+        finally:
+            loaded.model.generation_config.eos_token_id = original_eos
+
     def test_automatic_device_placement(self):
         """Loads and generates with Accelerate's automatic device mapping."""
         session = get_session(self.model_path, backend="pytorch", device="auto")
@@ -431,7 +469,7 @@ class TestPyTorchSession(unittest.TestCase):
                 n_embd=8,
                 n_layer=1,
                 n_head=1,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.pad_token_id,
                 pad_token_id=tokenizer.pad_token_id,
                 bos_token_id=None,
             )

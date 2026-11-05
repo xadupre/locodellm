@@ -155,6 +155,19 @@ class PyTorchSessionState(SessionState):
         device = self.model.get_input_embeddings().weight.device
         input_ids = torch.tensor([context.tolist()], dtype=torch.long, device=device)
         options = {"do_sample": False, **search_options}
+        if "eos_token_id" not in options:
+            generation_config = options.get("generation_config", self.model.generation_config)
+            configured_eos = generation_config.eos_token_id
+            stop_ids = (
+                list(configured_eos)
+                if isinstance(configured_eos, (list, tuple))
+                else ([] if configured_eos is None else [configured_eos])
+            )
+            tokenizer_eos = self.tokenizer.eos_token_id
+            if tokenizer_eos is not None and tokenizer_eos not in stop_ids:
+                stop_ids.append(tokenizer_eos)
+            if stop_ids:
+                options["eos_token_id"] = stop_ids
         if self.tokenizer.pad_token_id is not None:
             options.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         if self.live_log is not None and "streamer" in options:
@@ -172,7 +185,7 @@ class PyTorchSessionState(SessionState):
                 **options,
             )
         new_tokens = output[0, len(context) :].tolist()
-        eos = search_options.get("eos_token_id", self.model.generation_config.eos_token_id)
+        eos = options.get("eos_token_id", self.model.generation_config.eos_token_id)
         eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         while new_tokens and new_tokens[-1] in eos_ids:
             new_tokens.pop()
