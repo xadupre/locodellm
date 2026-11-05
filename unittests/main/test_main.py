@@ -50,6 +50,22 @@ class TestMain(ExtTestCase):
 class TestMainGenerate(ExtTestCase):
     """Tests for the generate subcommand."""
 
+    def test_invalid_harness_options(self):
+        """Rejects invalid budgets and lengths before loading a model."""
+        for command, positional in [("generate", ["Prompt."]), ("bench", ["basic"])]:
+            for options in [
+                ["--harness", "python", "--max-tool-calls", "0"],
+                ["--max-tool-calls", "100"],
+                ["--max-length", "0"],
+            ]:
+                with self.subTest(command=command, options=options):
+                    with (
+                        contextlib.redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit) as error,
+                    ):
+                        main([command, "unused/model", *positional, *options])
+                    self.assertEqual(error.exception.code, 2)
+
     @requires_onnxruntime_genai()
     def test_generate_mock_model(self):
         """Checks that generate subcommand produces output."""
@@ -96,6 +112,8 @@ class TestMainBench(ExtTestCase):
                         "basic",
                         "--harness",
                         "python",
+                        "--max-tool-calls",
+                        "100",
                         "--max-length",
                         "200",
                         "--chat-template",
@@ -115,6 +133,7 @@ class TestMainBench(ExtTestCase):
         self.assertEqual(stats["tool_call_count"].tolist(), [0] * 10)
         self.assertEqual([case["tool_call_count"] for case in detailed], [0] * 10)
         self.assertEqual([case["tool_calls"] for case in detailed], [[] for _ in range(10)])
+        self.assertTrue(all("up to 100 scripts" in case["initial_prompt"] for case in detailed))
 
     @requires_onnxruntime_genai()
     def test_bench_mock_model(self):

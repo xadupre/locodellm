@@ -142,6 +142,10 @@ Runs the same built-in problems with Python execution and feedback:
         --harness python --chat-template chatml --max-length 1024 \
         --output results.xlsx --verbose 1
 
+The execution budget defaults to ten scripts per problem and can be increased,
+for example with ``--max-tool-calls 100``. Instruction text, remaining-budget
+feedback, and budget errors reflect the configured limit.
+
 The model can request one or more executions per turn using
 ``<python>...script...</python>`` blocks. The application executes the scripts and
 returns stdout, stderr, exit code, timeout status, and the remaining budget.
@@ -160,8 +164,8 @@ scripts can depend on files in their shared working directory. All results are
 returned together before the next model response, even if a script fails.
 Each block consumes one execution; a batch exceeding the remaining budget is
 rejected in full without executing any of its scripts.
-After the tenth execution the model can still provide its final function,
-but an eleventh request is refused and the problem is marked failed.
+After the last allowed execution the model can still provide its final function,
+but any further request is refused and the problem is marked failed.
 Hidden test inputs and expected results are not supplied to the tool.
 
 Final-answer extraction prefers Markdown blocks labelled ``python`` or ``py``

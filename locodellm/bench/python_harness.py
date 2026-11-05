@@ -20,15 +20,15 @@ _PYTHON_CALL = re.compile(
     re.DOTALL,
 )
 _INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
-You may execute up to 10 scripts to solve this problem.
+You may execute up to {max_tool_calls} scripts to solve this problem.
 To call it, reply with one or more <python>...</python> blocks, each containing
 a complete Python script. Blocks execute in order, and their results are returned
 together before your next response. Each block consumes one execution.
 Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
 Each script runs in a fresh Python process in the same temporary directory.
-When finished, return your final function in a Python markdown code block,
-without a tool call. The hidden benchmark tests are
+When finished, {final_answer_instructions}
+The hidden benchmark tests are
 not available to the tool.
 Every <python>...</python> block is an execution request, never a final answer.
 A function definition alone does not call the function or print anything.
@@ -118,17 +118,22 @@ def generate_with_trace(
 
 
 class PythonHarness:
-    """Provides at most ten Python executions per problem.
+    """Provides a configurable budget of Python executions per problem.
 
     Scripts run with the current user's permissions; this is not a sandbox.
     """
 
     max_tool_calls = 10
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(self, timeout: float = 10.0, max_tool_calls: int = 10) -> None:
         if timeout <= 0:
             raise ValueError("The Python tool timeout must be positive.")
+        if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int):
+            raise ValueError("The Python tool budget must be a positive integer.")
+        if max_tool_calls <= 0:
+            raise ValueError("The Python tool budget must be a positive integer.")
         self.timeout = timeout
+        self.max_tool_calls = max_tool_calls
 
     def execute(self, code: str, directory: str) -> PythonToolResult:
         """Executes a script and captures bounded output and execution status."""
@@ -175,14 +180,27 @@ class PythonHarness:
         )
 
     def run(
-        self, session: Any, prompt: str, max_length: int, **search_options: Any
+        self,
+        session: Any,
+        prompt: str,
+        max_length: int,
+        final_answer_instructions: str = (
+            "return your final function in a Python markdown code block, without a tool call."
+        ),
+        **search_options: Any,
     ) -> HarnessResult:
         """Runs tool calls until the model answers or exhausts its budget.
 
         ``max_length`` is the maximum number of new tokens per model turn.
         """
         result = HarnessResult()
-        message = _INSTRUCTIONS + prompt
+        message = (
+            _INSTRUCTIONS.format(
+                max_tool_calls=self.max_tool_calls,
+                final_answer_instructions=final_answer_instructions,
+            )
+            + prompt
+        )
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as directory:
             for _ in range(self.max_tool_calls + 1):
                 generate_with_trace(
@@ -211,7 +229,8 @@ class PythonHarness:
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 if len(calls) > remaining:
                     result.error = (
-                        "Python tool budget exhausted (10 executions per problem; "
+                        f"Python tool budget exhausted ({self.max_tool_calls} "
+                        "executions per problem; "
                         f"requested {len(calls)} with {remaining} remaining)."
                     )
                     return result
@@ -257,8 +276,8 @@ class PythonHarness:
                     "The preceding Python tool requests were executed, not accepted as a final "
                     "answer. An empty stdout means the script printed nothing; defining "
                     "a function does not call it.\n"
-                    "To finish, return your final function in a ```python markdown "
-                    "code block, WITHOUT <python> or </python> tags. Otherwise make "
+                    f"To finish, {final_answer_instructions}\n"
+                    "Answer WITHOUT <python> or </python> tags. Otherwise make "
                     "another allowed tool call with your own checks."
                 )
         result.error = "The model did not return a final answer within the conversation budget."

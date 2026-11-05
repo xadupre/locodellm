@@ -1,10 +1,12 @@
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
 
-from locodellm.__main__ import _compute_case_stats
+from locodellm.__main__ import _compute_case_stats, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
 from locodellm.bench.python_harness import PythonHarness, extract_python_calls
 from locodellm.utils import extract_code, strip_thinking
@@ -34,6 +36,101 @@ class ScriptedSession:
 
 
 class TestPythonHarness(unittest.TestCase):
+    def test_generate_cli_events_and_configurable_budget(self):
+        """Exports real file operations, all turns, and exhausted-budget errors."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/scripted-harness-cli"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        write = "<python>from pathlib import Path\nPath('value.txt').write_text('42')</python>"
+        read = "<python>from pathlib import Path\nprint(Path('value.txt').read_text())</python>"
+        for harness, budget, responses, failed in [
+            (True, 100, [write] + [read] * 99 + ["The value is 42."], False),
+            (
+                True,
+                2,
+                [write, read, "<python>raise AssertionError('not executed')</python>"],
+                True,
+            ),
+            (False, 10, ["Plain answer."], False),
+        ]:
+            with self.subTest(harness=harness, budget=budget):
+                session = ScriptedSession(responses)
+                _session_cache[key] = session
+                try:
+                    with tempfile.TemporaryDirectory() as directory:
+                        output = os.path.join(directory, "events.json")
+                        args = ["generate", model_id, "Read and write a file.", "-o", output]
+                        if harness:
+                            args += ["--harness", "python", "--max-tool-calls", str(budget)]
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            if failed:
+                                with self.assertRaisesRegex(RuntimeError, "2 executions"):
+                                    main(args)
+                            else:
+                                main(args)
+                        with open(output, encoding="utf-8") as stream:
+                            document = json.load(stream)
+                finally:
+                    del _session_cache[key]
+                turns = session.children[0].turns
+                self.assertEqual(document["initial_prompt"], turns[0][0])
+                self.assertEqual(
+                    [
+                        event["content"]
+                        for event in document["events"]
+                        if event["type"] == "prompt"
+                    ],
+                    [turn[0] for turn in turns[1:]],
+                )
+                self.assertEqual(
+                    [
+                        event["content"]
+                        for event in document["events"]
+                        if event["type"] == "model_response"
+                    ],
+                    responses,
+                )
+                self.assertEqual(document["token_count"], 5 * len(responses))
+                if harness:
+                    self.assertIn(f"up to {budget} scripts", turns[0][0])
+                    self.assertNotIn("final function", turns[0][0])
+                    self.assertEqual(document["tool_call_count"], budget)
+                    self.assertEqual(document["tool_calls"][1]["stdout"], "42\n")
+                    self.assertEqual(
+                        len(
+                            [
+                                event
+                                for event in document["events"]
+                                if event["type"] == "process_exit"
+                            ]
+                        ),
+                        budget,
+                    )
+                    self.assertIn("Remaining Python tool calls: 0", turns[-1][0])
+                    self.assertEqual(turns[0][1]["max_new_tokens"], 1024)
+                else:
+                    self.assertEqual(document["tool_calls"], [])
+                    self.assertEqual(turns[0][1]["max_length"], 200)
+                if failed:
+                    self.assertIn("budget exhausted", document["error"])
+                    self.assertEqual(stdout.getvalue(), "")
+                else:
+                    self.assertIsNone(document["error"])
+                    self.assertEqual(document["text"], responses[-1])
+                    self.assertEqual(stdout.getvalue().strip(), responses[-1])
+
+    def test_invalid_budget(self):
+        """Rejects nonpositive and noninteger script budgets."""
+        for budget in (0, -1, 1.5, True):
+            with (
+                self.subTest(budget=budget),
+                self.assertRaisesRegex(ValueError, "positive integer"),
+            ):
+                PythonHarness(max_tool_calls=budget)
+
     def test_tool_feedback_and_benchmark_exports(self):
         """Checks real script execution, feedback, scoring, and exported counts."""
         session = ScriptedSession(

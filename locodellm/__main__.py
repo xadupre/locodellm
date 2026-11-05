@@ -123,18 +123,53 @@ def _cmd_models(args: argparse.Namespace) -> None:  # noqa: ARG001
 
 def _cmd_generate(args: argparse.Namespace) -> None:
     """Generates text from a prompt using a model."""
-    from locodellm.generate.generate_from_model import generate_from_model
+    import json
+    from dataclasses import asdict
+    from pathlib import Path
 
-    session = generate_from_model(
+    from locodellm.bench.python_harness import HarnessResult, PythonHarness, generate_with_trace
+    from locodellm.generate.generate_from_model import get_session
+
+    session = get_session(
         model_id=args.model,
-        prompt=args.prompt,
         precision=args.precision,
         provider=args.provider,
-        max_length=args.max_length,
         chat_template=args.chat_template,
         verbose=args.verbose,
+    ).new_session()
+    max_length = (
+        args.max_length if args.max_length is not None else (1024 if args.harness else 200)
     )
-    print(session.text)
+    if args.harness:
+        result = PythonHarness(max_tool_calls=args.max_tool_calls).run(
+            session,
+            args.prompt,
+            max_length=max_length,
+            final_answer_instructions="return your final answer without a tool call.",
+        )
+    else:
+        result = HarnessResult()
+        generate_with_trace(session, args.prompt, result.interactions, max_length=max_length)
+        result.text = session.text
+        result.token_count = session.generated_token_count
+    if args.output:
+        initial = result.interactions[0]
+        document = {
+            "initial_prompt": initial["content"],
+            "events": result.interactions[1:],
+            "initial_generation_options": initial["generation_options"],
+            "text": result.text,
+            "token_count": result.token_count,
+            "tool_call_count": len(result.tool_calls),
+            "tool_calls": [asdict(call) for call in result.tool_calls],
+            "error": result.error,
+        }
+        Path(args.output).write_text(
+            json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    if result.error:
+        raise RuntimeError(result.error)
+    print(result.text)
 
 
 def _cmd_chat(args: argparse.Namespace) -> None:
@@ -230,7 +265,7 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         session,
         verbose=args.verbose,
         json_output=json_output,
-        harness=PythonHarness() if args.harness else None,
+        harness=PythonHarness(max_tool_calls=args.max_tool_calls) if args.harness else None,
     )
     df = result.to_dataframe()
 
@@ -414,7 +449,22 @@ def main(args: list[str] | None = None) -> None:
         "--provider", default=None, help="Execution provider (e.g. CUDAExecutionProvider)."
     )
     gen_parser.add_argument(
-        "--max-length", type=int, default=200, help="Maximum token length (default: 200)."
+        "--max-length",
+        type=int,
+        default=None,
+        help="Maximum token length (default: 200); with --harness, new tokens per turn (1024).",
+    )
+    gen_parser.add_argument(
+        "--harness", choices=["python"], default=None, help="Enables Python script execution."
+    )
+    gen_parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=10,
+        help="Maximum Python script executions with --harness (default: 10).",
+    )
+    gen_parser.add_argument(
+        "--output", "-o", default=None, help="Writes the conversation and tool events as JSON."
     )
     gen_parser.add_argument("--chat-template", default=None, help="Chat template (e.g. chatml).")
     gen_parser.add_argument(
@@ -502,7 +552,13 @@ def main(args: list[str] | None = None) -> None:
         "--harness",
         choices=["python"],
         default=None,
-        help="Enables up to ten model-requested Python executions per built-in problem.",
+        help="Enables model-requested Python executions per built-in problem.",
+    )
+    bench_parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=10,
+        help="Maximum Python script executions per problem with --harness (default: 10).",
     )
     bench_parser.add_argument(
         "--chat-template",
@@ -551,8 +607,14 @@ def main(args: list[str] | None = None) -> None:
 
     if parsed.command == "chat" and parsed.max_length < 1:
         chat_parser.error("--max-length must be positive")
-    if parsed.command == "bench" and parsed.max_length is not None and parsed.max_length < 1:
-        bench_parser.error("--max-length must be positive")
+    if parsed.command in {"generate", "bench"}:
+        command_parser = gen_parser if parsed.command == "generate" else bench_parser
+        if parsed.max_length is not None and parsed.max_length < 1:
+            command_parser.error("--max-length must be positive")
+        if parsed.max_tool_calls < 1:
+            command_parser.error("--max-tool-calls must be positive")
+        if not parsed.harness and parsed.max_tool_calls != 10:
+            command_parser.error("--max-tool-calls requires --harness python")
     if parsed.command == "bench":
         if parsed.backend == "pytorch":
             if parsed.provider or parsed.provider_option or parsed.session_option:

@@ -30,7 +30,26 @@ Options
     Execution provider (e.g. ``CUDAExecutionProvider``).
 
 ``--max-length``
-    Maximum token length for generation (default: 200).
+    Maximum token length for generation (default: 200). With ``--harness``,
+    maximum new tokens per model turn (default: 1024).
+
+``--harness python``
+    Executes model-requested Python scripts and returns their output to the model.
+    Scripts can read and write files. Each script starts a fresh Python process
+    in a temporary directory shared across this prompt's calls and deleted at
+    the end. Execution uses the current user's permissions: this is not a sandbox.
+
+``--max-tool-calls``
+    Maximum number of scripts with ``--harness python`` (default: 10).
+    Each script in a grouped request consumes one execution.
+
+``--output, -o``
+    Writes a JSON document containing ``initial_prompt``, ordered ``events``,
+    ``initial_generation_options``, the final ``text``, ``token_count``,
+    ``tool_call_count``, ``tool_calls``, and ``error``. Events include model
+    responses, subsequent prompts, executed commands, stdout, stderr, and exit
+    status. The file is written when the conversation ends, including on harness
+    failure; a harness failure then raises an error instead of reporting success.
 
 ``--chat-template``
     Chat template to use (e.g. ``chatml``).
@@ -68,3 +87,16 @@ Using a HuggingFace model (automatically downloaded and converted):
     python -m locodellm generate Qwen/Qwen2.5-Coder-0.5B-Instruct \
         'write a python function which returns "hello"' \
         --chat-template chatml --precision fp32 --verbose 1
+
+Running a custom prompt with up to 100 Python scripts and collecting events:
+
+.. code-block:: bash
+
+    python -m locodellm generate ./model \
+        'Write 42 to value.txt, read it back, and report its contents.' \
+        --chat-template chatml --harness python --max-tool-calls 100 \
+        --max-length 1024 --output evenements.json
+
+The final answer is printed to stdout; it need not be a Python function.
+To keep generated files after the run, the prompt must specify an absolute
+output path outside the temporary directory.
