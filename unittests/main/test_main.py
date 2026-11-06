@@ -343,14 +343,17 @@ class TestMainBench(ExtTestCase):
 
         import pandas
 
+        from locodellm.test_models import create_mock_generate_model
+
         with tempfile.TemporaryDirectory() as directory:
+            model_path = create_mock_generate_model(os.path.join(directory, "model"))
             output_path = os.path.join(directory, "results.csv")
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 main(
                     [
                         "bench",
-                        "mock/generate",
+                        model_path,
                         "basic",
                         "--harness",
                         "python",
