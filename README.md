@@ -38,6 +38,11 @@ python -m locodellm generate path/to/model \
   --output events.json
 ```
 
+`generate --temperature 0.7` enables sampling with either backend, including
+all harness turns. The default, `--temperature 0`, uses greedy decoding.
+Temperatures must be finite and nonnegative. The effective sampling options
+are recorded in the exported conversation events.
+
 For changes in an existing local repository, create `tasks.json`:
 
 ```json
@@ -149,6 +154,20 @@ PyTorch and public export correctly reject it.
 Verification records the source revision, dependency versions, and relevant
 pre-existing source edits; the recorded embedding-bag value mismatches require
 that edit, while unmodified sources reject the same inputs during conversion.
+
+Both datasets record the current `xadupre/yet-another-onnx-builder` commit,
+`2156c18e935b6ded3f73ba6e59c64f7f0f1119d9`, in every record's
+`verification.revision`. To replay the problems at that revision without
+changing an existing working tree, use a fresh clone:
+
+```bash
+git clone https://github.com/xadupre/yet-another-onnx-builder.git yobx-replay
+git -C yobx-replay checkout --detach 2156c18e935b6ded3f73ba6e59c64f7f0f1119d9
+```
+
+Use the dependency versions in `verification.environment` and account for
+`verification.relevant_preexisting_source_changes` before running the examples;
+the commit alone does not reproduce the embedding-bag value mismatches.
 
 Only send `prompt` to the model; keep `expected_answer` and issue links with the
 evaluator. These JSONL files are evaluation data, not executable task files.

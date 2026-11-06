@@ -51,6 +51,45 @@ class TestMainGenerate(ExtTestCase):
     """Tests for the generate subcommand."""
 
     @requires_onnxruntime_genai()
+    def test_generate_onnx_temperature(self):
+        """Runs greedy and sampled ONNX decoding with locally generated model files."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from locodellm.test_models import create_tiny_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = create_tiny_model(str(Path(directory) / "model"))
+            output = Path(directory) / "events.json"
+            for temperature in (0.0, 0.7):
+                with (
+                    self.subTest(temperature=temperature),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    main(
+                        [
+                            "generate",
+                            model,
+                            "<s>",
+                            "--max-length",
+                            "8",
+                            "--temperature",
+                            str(temperature),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+                document = json.loads(output.read_text())
+                options = document["initial_generation_options"]
+                self.assertEqual(options["do_sample"], temperature > 0)
+                if temperature > 0:
+                    self.assertEqual(options["temperature"], temperature)
+                else:
+                    self.assertNotIn("temperature", options)
+                self.assertIsNone(document["error"])
+
+    @requires_onnxruntime_genai()
     def test_generate_onnx_live_log(self):
         """Streams ONNX model output into a retained transcript without verbose."""
         import tempfile
@@ -119,6 +158,18 @@ class TestMainGenerate(ExtTestCase):
                 ):
                     main(["generate", "unused/model", *options])
                 self.assertEqual(error.exception.code, 2)
+
+    def test_invalid_temperature(self):
+        """Rejects negative and nonfinite temperatures before loading a model."""
+        for temperature in ["-1", "nan", "inf", "-inf"]:
+            with (
+                self.subTest(temperature=temperature),
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit) as error,
+            ):
+                main(["generate", "unused/model", "Prompt.", f"--temperature={temperature}"])
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("--temperature must be finite and nonnegative", stderr.getvalue())
 
     def test_invalid_harness_options(self):
         """Rejects invalid budgets and lengths before loading a model."""
