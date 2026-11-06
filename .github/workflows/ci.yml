@@ -24,6 +24,11 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install ONNX light wheels
+        run: >-
+          python -m pip install
+          https://github.com/xadupre/onnx-light/releases/download/0.2.6/onnx_light-0.2.6-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+          https://github.com/xadupre/onnx-light-cpu/releases/download/0.2.6/onnx_light_cpu-0.2.6-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - name: Install
         run: pip install -e ".[dev]"
       - name: Pip freeze
