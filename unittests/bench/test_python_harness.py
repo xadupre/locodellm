@@ -1612,6 +1612,44 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(strip_thinking(prefix + fenced), fenced)
         self.assertEqual(extract_code("<think>```python\nraise AssertionError()\n```"), "")
 
+    def test_tool_tag_mentions_in_thinking_do_not_hide_the_answer(self):
+        """Preserves the answer when reasoning mentions a tool's opening tag."""
+        for opening, closing in [
+            ("<bash>", "</bash>"),
+            ("<python>", "</python>"),
+            ("<tool_call>", "</tool_call>"),
+            ("<parameter=code>", "</parameter>"),
+        ]:
+            with self.subTest(opening=opening):
+                answer = f"{opening}print('literal </think>'){closing}"
+                prefix = f"<think>I need to use the {opening} tag format.</think>\n\n"
+                self.assertEqual(strip_thinking(prefix + answer), answer)
+                self.assertEqual(
+                    strip_thinking(f"<think>Use {opening}.\n{opening}print(42){closing}"), ""
+                )
+        answer = "Final answer."
+        thinking = "<think>```python\nprint('</think>')\n```\nFinish.</think>\n"
+        self.assertEqual(strip_thinking(thinking + answer), answer)
+
+    def test_malformed_bash_after_thinking_is_not_reported_as_empty(self):
+        """Reports the observed malformed call as a protocol error instead of an empty answer."""
+        call = "<tool_call>\n<bash>\ncd . && pwd && ls -la\n</parameter>\n</bash>\n</tool_call>"
+        response = (
+            "<think>\nI need to use the <bash> tag format, not the tool call format. "
+            "Let me reissue.\n</think>\n\n" + call
+        )
+        self.assertEqual(strip_thinking(response), call)
+        result = PythonHarness(bash_only=True).run(
+            ScriptedSession([response] * 3), "Inspect.", max_length=100
+        )
+        self.assertTrue(result.protocol_error)
+        self.assertIn("native tool call", result.error)
+        self.assertNotIn("empty answer", result.error)
+        self.assertEqual(result.tool_calls, [])
+        self.assertEqual(
+            sum(event["type"] == "tool_call_rejected" for event in result.interactions), 3
+        )
+
     def test_failed_evaluation_is_logged_without_feedback(self):
         """Records errors without revealing test outcomes to the model."""
         for response, error in [
