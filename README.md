@@ -323,6 +323,33 @@ session.generate("<s>", max_length=10)
 
 ## Benchmarks
 
+### Export-failure reward
+
+`export_failure_reward` scores one clearly extracted example using four
+independently verified boolean criteria. Each satisfied criterion adds `0.25`;
+the score is maximized and ranges from `0` to `1`, without penalties or gating.
+Setting `answer_extractable=True` grants a floor of `0.05` for a final answer
+containing a clearly extractable code example, even if unverified. It is not an
+extra bonus: `reward = max(0.05, 0.25 * satisfied_criteria)` in that case.
+Rejected tool requests without such a final answer receive no extraction credit.
+
+```python
+from locodellm.bench import export_failure_reward
+
+reward = export_failure_reward(
+    reference_valid=True,       # PyTorch runs on the concrete inputs
+    export_call_valid=True,     # to_onnx follows the required protocol
+    failure_valid=True,         # an admissible failure is actually observed
+    reproduction_valid=False,  # independent replay, route and stage not yet verified
+    answer_extractable=True,   # final answer contains a clearly extractable code example
+)
+assert reward == 0.75
+```
+
+The function only computes the reward. Extracting examples and verifying these
+criteria must happen separately; model assertions or a successful harness exit
+are not verification. Non-boolean criteria are rejected.
+
 ### Built-in benchmark
 
 Run the built-in `basic` benchmark against a local ONNX model:

@@ -11,6 +11,7 @@ from locodellm.bench.prompt_test import (
     load_prompt_tests,
 )
 from locodellm.bench.run_code import UNDEFINED, RunStatus, run_function
+from locodellm.bench.rewards import export_failure_reward
 
 __all__ = [
     "BenchPromptTest",
@@ -21,6 +22,7 @@ __all__ = [
     "RunStatus",
     "UNDEFINED",
     "dump_prompt_tests",
+    "export_failure_reward",
     "get_available_benchmarks",
     "load_prompt_tests",
     "run_function",
