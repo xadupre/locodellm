@@ -30,7 +30,7 @@ pytorch = [
     "transformers>=5.3",
 ]
 style = [
-    "black==26.5.1",
+    "black==26.10.1",
     "ruff==0.15.20",
 ]
 typing = [
