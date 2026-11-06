@@ -259,7 +259,59 @@ class TestPyTorchSession(unittest.TestCase):
                 self.assertIsNone(document["error"])
                 self.assertEqual(document["tool_calls"], [])
                 option = "max_new_tokens" if harness else "max_length"
-                self.assertEqual(document["initial_generation_options"], {option: limit})
+                self.assertEqual(
+                    document["initial_generation_options"], {option: limit, "do_sample": False}
+                )
+
+    def test_generate_cli_temperature(self):
+        """Applies greedy or sampled decoding with and without the harness."""
+        import torch
+
+        loaded = get_session(self.model_path, backend="pytorch", device="cpu")
+        for temperature in (0.0, 0.7):
+            search_options = {"do_sample": temperature > 0}
+            if temperature > 0:
+                search_options["temperature"] = temperature
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(0)
+                expected = loaded.new_session().generate(
+                    "hello", max_new_tokens=6, **search_options
+                )
+            for harness in (False, True):
+                with (
+                    self.subTest(temperature=temperature, harness=harness),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    output = Path(directory) / "events.json"
+                    limit = 6 if harness else loaded.get_prompt_length("hello") + 6
+                    args = [
+                        "generate",
+                        self.model_path,
+                        "hello",
+                        "--backend",
+                        "pytorch",
+                        "--max-length",
+                        str(limit),
+                        "--temperature",
+                        str(temperature),
+                        "--output",
+                        str(output),
+                    ]
+                    if harness:
+                        args += ["--harness", "python"]
+                    with (
+                        torch.random.fork_rng(devices=[]),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        torch.manual_seed(0)
+                        main(args)
+                    document = json.loads(output.read_text())
+                    self.assertEqual(document["text"], expected.text)
+                    self.assertEqual(document["token_count"], expected.generated_token_count)
+                    option = "max_new_tokens" if harness else "max_length"
+                    self.assertEqual(
+                        document["initial_generation_options"], {option: limit, **search_options}
+                    )
 
     def test_verbose_generation_progress_and_cached_sessions(self):
         """Reports flushed loading, model-turn, and token progress with a real model."""

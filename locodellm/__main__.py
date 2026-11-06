@@ -53,6 +53,7 @@ bench
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from contextlib import ExitStack
@@ -210,6 +211,9 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
     max_length = (
         args.max_length if args.max_length is not None else (1024 if args.harness else 200)
     )
+    search_options: dict[str, bool | float] = {"do_sample": args.temperature > 0}
+    if args.temperature > 0:
+        search_options["temperature"] = args.temperature
     documents = []
     for prompt_index, prompt in enumerate(prompts, 1):
         if args.verbose:
@@ -235,10 +239,13 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
                 max_length=max_length,
                 final_answer_instructions="return your final answer without a tool call.",
                 directory=repository,
+                **search_options,
             )
         else:
             result = HarnessResult()
-            generate_with_trace(session, prompt, result.interactions, max_length=max_length)
+            generate_with_trace(
+                session, prompt, result.interactions, max_length=max_length, **search_options
+            )
             result.text = session.text
             result.token_count = session.generated_token_count
         initial = result.interactions[0]
@@ -584,6 +591,12 @@ def main(args: list[str] | None = None) -> None:
         help="Maximum token length (default: 200); with --harness, new tokens per turn (1024).",
     )
     gen_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperature (default: 0, greedy decoding; positive values enable sampling).",
+    )
+    gen_parser.add_argument(
         "--harness",
         choices=["python", "bash"],
         default=None,
@@ -748,6 +761,8 @@ def main(args: list[str] | None = None) -> None:
     if parsed.command == "chat" and parsed.max_length < 1:
         chat_parser.error("--max-length must be positive")
     if parsed.command == "generate":
+        if not math.isfinite(parsed.temperature) or parsed.temperature < 0:
+            gen_parser.error("--temperature must be finite and nonnegative")
         if (parsed.prompt is None) == (parsed.input is None):
             gen_parser.error("provide either PROMPT or --input JSON, but not both")
         if parsed.input is not None:
