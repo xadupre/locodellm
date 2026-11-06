@@ -226,6 +226,21 @@ class TestPyTorchSession(unittest.TestCase):
             session.generate("hello", max_length=session.get_prompt_length("hello"))
         self.assertEqual(session.messages, [])
 
+    def test_native_template_options_are_copied_to_fresh_sessions(self):
+        """Disables native thinking without mutating the shared tokenizer or parent."""
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        original_template = session.tokenizer.chat_template
+        session.tokenizer.chat_template = (
+            original_template
+            + "{% if enable_thinking %}<think>{% else %}<think></think>{% endif %}"
+        )
+        session.chat_template_kwargs = {"enable_thinking": True}
+        child = session.new_session()
+        child.chat_template_kwargs["enable_thinking"] = False
+        self.assertTrue(child._wrap_prompt("Judge.").endswith("<think></think>"))
+        self.assertTrue(session._wrap_prompt("Solve.").endswith("<think>"))
+        self.assertEqual(child.tools, [])
+
     def test_eos_and_untemplated_history(self):
         """Strips terminal EOS tokens and preserves history without a chat template."""
         session = get_session(self.model_path, backend="pytorch")

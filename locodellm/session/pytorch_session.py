@@ -93,6 +93,7 @@ class PyTorchSessionState(SessionState):
         super().__init__(model, tokenizer, verbose=verbose, chat_template=chat_template)
         self.messages: list[dict[str, str]] = []
         self.tools: list[dict[str, Any]] = []
+        self.chat_template_kwargs: dict[str, Any] = {}
 
     def configure_tools(self, tools: list[dict[str, Any]]) -> bool:
         """Enables declared tools for native Qwen3-Coder-compatible templates."""
@@ -113,19 +114,24 @@ class PyTorchSessionState(SessionState):
 
     def new_session(self) -> PyTorchSessionState:
         """Returns an empty conversation sharing the loaded model and tokenizer."""
-        return PyTorchSessionState(
+        session = PyTorchSessionState(
             self.model, self.tokenizer, verbose=self.verbose, chat_template=self._chat_template
         )
+        session.chat_template_kwargs = dict(self.chat_template_kwargs)
+        return session
 
     def _wrap_prompt(self, prompt: str) -> str:
         """Applies the tokenizer's native template unless ChatML is requested."""
         if self._chat_template is not None or not self.tokenizer.chat_template:
             return super()._wrap_prompt(prompt)
+        options = dict(self.chat_template_kwargs)
+        if self.tools:
+            options["tools"] = self.tools
         return self.tokenizer.apply_chat_template(
             [*self.messages, {"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
-            **({"tools": self.tools} if self.tools else {}),
+            **options,
         )
 
     def _encode_context(self, prompt: str) -> numpy.ndarray:

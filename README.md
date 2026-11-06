@@ -369,6 +369,42 @@ The function only computes the reward. Extracting examples and verifying these
 criteria must happen separately; model assertions or a successful harness exit
 are not verification. Non-boolean criteria are rejected.
 
+### Semantic answer judging
+
+The deterministic factual reward remains the default. Semantic judging is an
+opt-in diagnostic and is not included in that reward.
+
+`judge_export_answer` compares a generated report with the `expected_answer`
+object of a failure-discovery dataset record. It returns the best semantic match
+to one reference example, independently of the factual reward:
+
+```python
+from locodellm.bench import export_failure_reward, judge_export_answer
+
+factual = export_failure_reward(
+    reference_valid=True,
+    export_call_valid=True,
+    failure_valid=False,
+    reproduction_valid=False,
+)
+semantic = judge_export_answer(
+    session, generated_answer, record["expected_answer"], task=record["prompt"]
+)
+print(factual, semantic.similarity, semantic.closest_reference, semantic.reason)
+```
+
+The judge uses a fresh PyTorch conversation sharing the loaded weights, without
+the solving history or tools. Native thinking is disabled and decoding is greedy.
+It compares causes, triggering conditions, observations, conversion routes and
+failure stages, not prose similarity. References are evaluator-only data.
+One format-correction turn is allowed within the same time budget by default
+(`max_format_retries=0` disables it). Judgments that remain malformed, out-of-range
+or refer to unknown examples raise `JudgeProtocolError` with the raw completion
+attached; they never become a default numeric score.
+Schema-valid self-judgments can still contradict the candidate or references.
+They require calibration before use as training rewards and do not replace
+independent execution checks.
+
 ### Built-in benchmark
 
 Run the built-in `basic` benchmark against a local ONNX model:
