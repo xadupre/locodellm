@@ -35,7 +35,7 @@ style = [
 ]
 typing = [
     "mypy==2.1.0",
-    "pyrefly==1.1.1",
+    "pyrefly==1.4.0",
 ]
 dev = [
     "locodellm[style]",
