@@ -43,6 +43,13 @@ all harness turns. The default, `--temperature 0`, uses greedy decoding.
 Temperatures must be finite and nonnegative. The effective sampling options
 are recorded in the exported conversation events.
 
+With `--harness`, each problem gets six minutes to explore, followed by a
+request to write the final answer without further tool calls. At eight
+minutes, generation stops and the command exports the partial trace and
+repository diff before reporting a timeout. The budget starts after model
+loading and repository cleanup, and resets for each problem. Generation
+stops at token boundaries; script timeouts are capped by the remaining budget.
+
 For changes in an existing local repository, create `tasks.json`:
 
 ```json

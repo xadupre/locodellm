@@ -305,6 +305,8 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
                 max_length=max_length,
                 final_answer_instructions="return your final answer without a tool call.",
                 directory=repository,
+                final_answer_after=360,
+                max_duration=480,
                 **search_options,
             )
         else:

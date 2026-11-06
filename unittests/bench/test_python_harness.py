@@ -84,6 +84,99 @@ def create_repository(directory):
 
 
 class TestPythonHarness(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_time_budget_requests_final_answer_and_stops_tools(self):
+        """Interrupts exploration scripts and requests a final answer without more tools."""
+        for final_response, expected_error in [
+            ("Confirmed result.", None),
+            ("<bash>touch forbidden.txt</bash>", "further tool calls are disabled"),
+        ]:
+            with (
+                self.subTest(final_response=final_response),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                session = ScriptedSession(["<bash>sleep 2</bash>", final_response])
+                with LiveLog(str(Path(root) / "live.log")) as log:
+                    result = PythonHarness(timeout=3, bash_only=True, live_log=log).run(
+                        session,
+                        "Find failures.",
+                        max_length=100,
+                        directory=root,
+                        final_answer_after=0.2,
+                        max_duration=1,
+                    )
+                    self.assertEqual(len(result.tool_calls), 1)
+                    self.assertTrue(result.tool_calls[0].timed_out)
+                    self.assertIn("write your final answer now", session.turns[-1][0])
+                    self.assertIn("timed out: True", session.turns[-1][0])
+                    self.assertLessEqual(session.turns[0][1]["max_time"], 0.2)
+                    self.assertLessEqual(session.turns[-1][1]["max_time"], 1)
+                    self.assertTrue(
+                        any(
+                            event["type"] == "final_answer_requested"
+                            for event in result.interactions
+                        )
+                    )
+                    self.assertIn("[final answer requested]", log.path.read_text())
+                if expected_error is None:
+                    self.assertIsNone(result.error)
+                    self.assertEqual(result.text, final_response)
+                else:
+                    self.assertIn(expected_error, result.error)
+                    self.assertFalse((Path(root) / "forbidden.txt").exists())
+
+    def test_time_budget_interrupts_generation(self):
+        """Requests finalization after a slow turn and records an overdue partial answer."""
+
+        class SlowSession(ScriptedSession):
+            def generate(self, prompt, **options):
+                time.sleep(options["max_time"] + 0.01)
+                super().generate(prompt, **options)
+
+        session = SlowSession(["Partial exploration.", "Partial final answer."])
+        started_at = time.monotonic()
+        result = PythonHarness().run(
+            session, "Find failures.", max_length=100, final_answer_after=0.03, max_duration=0.15
+        )
+        self.assertLess(time.monotonic() - started_at, 1)
+        self.assertEqual(len(session.turns), 2)
+        self.assertIn("write your final answer now", session.turns[1][0])
+        self.assertIn("Problem time limit reached", result.error)
+        self.assertEqual(result.text, "Partial final answer.")
+        self.assertEqual(result.token_count, 10)
+        self.assertEqual(result.tool_calls, [])
+        self.assertEqual(result.interactions[-1]["type"], "time_limit")
+        self.assertTrue(
+            any(
+                event["type"] == "model_response" and event["content"] == result.text
+                for event in result.interactions
+            )
+        )
+
+    def test_invalid_problem_time_budget(self):
+        """Rejects invalid or inconsistent limits without generating."""
+        for final_after, duration in [
+            (None, 0),
+            (None, float("inf")),
+            (None, float("nan")),
+            (0, 1),
+            (-1, 1),
+            (2, 1),
+            (1, None),
+            (float("nan"), 1),
+        ]:
+            with self.subTest(final_after=final_after, duration=duration):
+                session = ScriptedSession([])
+                with self.assertRaises(ValueError):
+                    PythonHarness().run(
+                        session,
+                        "Prompt.",
+                        max_length=100,
+                        final_answer_after=final_after,
+                        max_duration=duration,
+                    )
+                self.assertEqual(session.turns, [])
+
     def test_live_tool_output_is_visible_before_execution_finishes(self):
         """Checks flushed stdout and stderr from inside a still-running real script."""
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import math
 import os
 import re
 import shutil
@@ -177,12 +178,16 @@ class PythonHarness:
         *,
         script_directory: str | None = None,
         tool: str = "python",
+        timeout: float | None = None,
     ) -> PythonToolResult:
         """Executes a script and captures bounded output and execution status."""
         if tool not in {"python", "bash"}:
             raise ValueError(f"Unsupported execution tool: {tool!r}")
         if self.bash_only and tool != "bash":
             raise ValueError("Python tool requests are disabled in Bash-only mode.")
+        timeout = self.timeout if timeout is None else timeout
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("The script timeout must be finite and positive.")
         script = Path(script_directory or directory) / (
             "tool_script.sh" if tool == "bash" else "tool_script.py"
         )
@@ -233,16 +238,16 @@ class PythonHarness:
                 stderr=stderr,
                 start_new_session=os.name == "posix",
             ) as process:
-                deadline = time.monotonic() + self.timeout
+                deadline = time.monotonic() + timeout
                 try:
                     if self.live_log is None:
-                        returncode = process.wait(timeout=self.timeout)
+                        returncode = process.wait(timeout=timeout)
                     else:
                         while True:
                             log_output()
                             remaining = deadline - time.monotonic()
                             if remaining <= 0:
-                                raise subprocess.TimeoutExpired(command, self.timeout)
+                                raise subprocess.TimeoutExpired(command, timeout)
                             try:
                                 returncode = process.wait(timeout=min(0.05, remaining))
                                 break
@@ -294,6 +299,8 @@ class PythonHarness:
             "return your final function in a Python markdown code block, without a tool call."
         ),
         directory: str | None = None,
+        final_answer_after: float | None = None,
+        max_duration: float | None = None,
         **search_options: Any,
     ) -> HarnessResult:
         """Runs tool calls until the model answers or exhausts its budget.
@@ -301,13 +308,53 @@ class PythonHarness:
         ``max_length`` is the maximum number of new tokens per model turn.
         ``directory`` selects a persistent working directory instead of a
         temporary one. Internal scripts and counters remain in temporary storage.
+        ``final_answer_after`` requests a final answer without further tools.
+        ``max_duration`` bounds the problem, including generation and scripts.
         """
+        if max_duration is not None and (not math.isfinite(max_duration) or max_duration <= 0):
+            raise ValueError("max_duration must be finite and positive.")
+        if final_answer_after is not None and (
+            not math.isfinite(final_answer_after)
+            or final_answer_after <= 0
+            or max_duration is None
+            or final_answer_after >= max_duration
+        ):
+            raise ValueError("final_answer_after must be positive and less than max_duration.")
         if directory is not None:
             path = Path(directory).resolve()
             if not path.is_dir():
                 raise ValueError(f"Working directory does not exist: {path}")
             directory = str(path)
         result = HarnessResult()
+        started_at = time.monotonic()
+        deadline = started_at + max_duration if max_duration is not None else None
+        final_deadline = (
+            started_at + final_answer_after if final_answer_after is not None else None
+        )
+        finalizing = False
+        final_message = (
+            "The exploration time limit has been reached. Stop exploring and write "
+            "your final answer now. Do not request or execute any more tools. "
+            "Report only confirmed results; do not invent unexecuted failures. "
+            f"To finish, {final_answer_instructions}"
+        )
+
+        def stop_for_timeout() -> HarnessResult:
+            result.error = f"Problem time limit reached ({max_duration:g}s)."
+            result.text = strip_thinking(session.text)
+            result.interactions.append(
+                {
+                    "type": "time_limit",
+                    "elapsed_seconds": time.monotonic() - started_at,
+                    "error": result.error,
+                }
+            )
+            if self.live_log is not None:
+                self.live_log.section("time limit", result.error)
+            if self.verbose:
+                print(f"[harness] {result.error}", file=sys.stderr, flush=True)
+            return result
+
         if self.live_log is not None:
             session.live_log = self.live_log
         message = (
@@ -350,7 +397,29 @@ class PythonHarness:
         )
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as script_directory:
             working_directory = directory or script_directory
-            for turn in range(1, self.max_tool_calls + 2):
+            for turn in range(1, self.max_tool_calls + 2 + (max_duration is not None)):
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    return stop_for_timeout()
+                if not finalizing and final_deadline is not None and now >= final_deadline:
+                    finalizing = True
+                    message = message + "\n\n" + final_message
+                    result.interactions.append(
+                        {"type": "final_answer_requested", "elapsed_seconds": now - started_at}
+                    )
+                    if self.live_log is not None:
+                        self.live_log.section("final answer requested", final_message)
+                    if self.verbose:
+                        print("[harness] requesting final answer", file=sys.stderr, flush=True)
+                phase_deadline = deadline if finalizing else (final_deadline or deadline)
+                generation_options = dict(search_options)
+                if phase_deadline is not None:
+                    remaining_time = phase_deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        continue
+                    generation_options["max_time"] = min(
+                        generation_options.get("max_time", remaining_time), remaining_time
+                    )
                 if self.verbose:
                     print(
                         f"[harness] model turn {turn}; "
@@ -363,7 +432,7 @@ class PythonHarness:
                     message,
                     result.interactions,
                     max_new_tokens=max_length,
-                    **search_options,
+                    **generation_options,
                 )
                 if self.verbose:
                     print(
@@ -373,6 +442,11 @@ class PythonHarness:
                         flush=True,
                     )
                 result.token_count += session.generated_token_count
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    return stop_for_timeout()
+                if not finalizing and final_deadline is not None and now >= final_deadline:
+                    continue
                 response = strip_thinking(session.text)
                 calls = extract_script_calls(response)
                 budget_label = (
@@ -386,6 +460,9 @@ class PythonHarness:
                     )
                 )
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
+                if finalizing and calls:
+                    result.error = "A final answer is required; further tool calls are disabled."
+                    return result
                 if self.bash_only and any(tool != "bash" for tool, _ in calls):
                     result.error = "Python tool requests are disabled in Bash-only mode."
                     return result
@@ -421,16 +498,28 @@ class PythonHarness:
                     return result
                 feedback = []
                 for index, (tool, code) in enumerate(calls, 1):
+                    now = time.monotonic()
+                    if deadline is not None and now >= deadline:
+                        return stop_for_timeout()
+                    if final_deadline is not None and now >= final_deadline:
+                        break
+                    script_timeout = self.timeout
+                    if phase_deadline is not None:
+                        script_timeout = min(script_timeout, phase_deadline - now)
                     script_index = len(result.tool_calls) + 1
                     if self.verbose:
                         print(
                             f"[harness] executing script {script_index}/{self.max_tool_calls} "
-                            f"(tool={tool}, timeout={self.timeout}s)",
+                            f"(tool={tool}, timeout={script_timeout}s)",
                             file=sys.stderr,
                             flush=True,
                         )
                     execution = self.execute(
-                        code, working_directory, script_directory=script_directory, tool=tool
+                        code,
+                        working_directory,
+                        script_directory=script_directory,
+                        tool=tool,
+                        timeout=script_timeout,
                     )
                     result.tool_calls.append(execution)
                     if self.verbose:
@@ -448,7 +537,7 @@ class PythonHarness:
                                 "argv": execution.command,
                                 "cwd": execution.cwd,
                                 "code": code,
-                                "timeout": self.timeout,
+                                "timeout": script_timeout,
                             },
                             {"type": "stdout", "content": execution.stdout},
                             {"type": "stderr", "content": execution.stderr},

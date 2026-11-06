@@ -51,6 +51,26 @@ class TestMainGenerate(ExtTestCase):
     """Tests for the generate subcommand."""
 
     @requires_onnxruntime_genai()
+    def test_onnx_generation_max_time(self):
+        """Stops ONNX decoding before the next token without dropping prompt history."""
+        import tempfile
+        from pathlib import Path
+
+        from locodellm.generate.generate_from_model import get_session
+        from locodellm.test_models import create_tiny_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = create_tiny_model(str(Path(directory) / "model"))
+            session = get_session(model).new_session()
+            session.generate("<s>", max_new_tokens=100, max_time=1e-9)
+            self.assertEqual(session.generated_token_count, 0)
+            self.assertEqual(session.text, "")
+            self.assertEqual(session.tokens.size, len(session.tokenizer.encode("<s>")))
+            for value in (0, -1, float("nan"), float("inf")):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_time"):
+                    session.generate("<s>", max_time=value)
+
+    @requires_onnxruntime_genai()
     def test_generate_onnx_temperature(self):
         """Runs greedy and sampled ONNX decoding with locally generated model files."""
         import json

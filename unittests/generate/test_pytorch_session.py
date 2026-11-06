@@ -259,6 +259,11 @@ class TestPyTorchSession(unittest.TestCase):
                 self.assertIsNone(document["error"])
                 self.assertEqual(document["tool_calls"], [])
                 option = "max_new_tokens" if harness else "max_length"
+                if harness:
+                    self.assertGreater(document["initial_generation_options"]["max_time"], 0)
+                    self.assertLessEqual(
+                        document["initial_generation_options"].pop("max_time"), 360
+                    )
                 self.assertEqual(
                     document["initial_generation_options"], {option: limit, "do_sample": False}
                 )
@@ -309,9 +314,35 @@ class TestPyTorchSession(unittest.TestCase):
                     self.assertEqual(document["text"], expected.text)
                     self.assertEqual(document["token_count"], expected.generated_token_count)
                     option = "max_new_tokens" if harness else "max_length"
+                    if harness:
+                        self.assertGreater(document["initial_generation_options"]["max_time"], 0)
+                        self.assertLessEqual(
+                            document["initial_generation_options"].pop("max_time"), 360
+                        )
                     self.assertEqual(
                         document["initial_generation_options"], {option: limit, **search_options}
                     )
+
+    def test_generation_max_time(self):
+        """Stops a real PyTorch generation at a token boundary and retains its response."""
+        import time
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class SlowTokens(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                time.sleep(0.02)
+                return scores
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        session.generate(
+            "hello",
+            max_new_tokens=20,
+            max_time=0.001,
+            logits_processor=LogitsProcessorList([SlowTokens()]),
+        )
+        self.assertEqual(session.generated_token_count, 1)
+        self.assertEqual(session.text, "answer")
+        self.assertEqual(session.messages[-1]["content"], "answer")
 
     def test_verbose_generation_progress_and_cached_sessions(self):
         """Reports flushed loading, model-turn, and token progress with a real model."""
