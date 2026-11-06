@@ -7,7 +7,7 @@ import re
 _FENCED_CODE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 _PYTHON_CODE_RE = re.compile(r"\s*<python>\s*(.*?)\s*</python>\s*", re.DOTALL)
 _THINKING_MARKER_RE = re.compile(
-    r"```.*?```|<python>.*?</python>|<tool_call>.*?</tool_call>"
+    r"```.*?```|<python>.*?</python>|<bash>.*?</bash>|<tool_call>.*?</tool_call>"
     r"|<parameter=code>.*?</parameter>|</?think>",
     re.DOTALL,
 )

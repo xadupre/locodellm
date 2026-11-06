@@ -28,6 +28,107 @@ pip install -e .
 python -m locodellm version
 ```
 
+Run a prompt with up to 100 Python or Bash script executions and export conversation
+and execution events:
+
+```bash
+python -m locodellm generate path/to/model \
+  "Write 42 to value.txt, read it back, and report its contents." \
+  --chat-template chatml --harness python --max-tool-calls 100 \
+  --output events.json
+```
+
+For changes in an existing local repository, create `tasks.json`:
+
+```json
+{
+  "repo": "../my-project",
+  "prompts": [
+    "Update the README to explain the installation steps.",
+    "Add a test for the behavior described in the README."
+  ]
+}
+```
+
+```bash
+python -m locodellm generate path/to/model --input tasks.json \
+  --chat-template chatml --max-tool-calls 100 --max-length 1024 \
+  --output events.json
+```
+
+The JSON input enables the Python/Bash harness. Prompts run in order, each in an
+independent conversation with its own script budget, against the same directory.
+Relative `repo` paths are resolved from the JSON file's directory and must point
+to the root of an existing Git working tree with a commit. Keep `tasks.json` and
+`events.json` outside that working tree.
+
+**Destructive cleanup:** before every prompt, the harness resets tracked files
+to the run's starting revision and removes nonignored untracked files and
+directories. This also discards any initial local modifications. Ignored files
+are preserved. Changes persist between Python calls within a prompt, but are
+cleared before the next prompt.
+
+Output contains the resolved `repo`, `base_revision`, and a `results` list with
+each prompt's events, final answer, and `diff`, saved before the next cleanup.
+The patch includes modified, deleted, staged, and new nonignored files, including
+binary changes. Execution stops at the first harness error after exporting its
+events and diff. The last prompt's changes remain on disk. No clone or commit
+is performed. Scripts run with your permissions, without a sandbox.
+
+For native Transformers weights instead of ONNX, add ``--backend pytorch``
+and choose a device:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.5-35B-A3B-FP8 \
+  --backend pytorch --device auto --input tasks.json \
+  --max-tool-calls 100 --max-length 1024 --output events.json --verbose 1
+```
+
+This requires the optional `pytorch` dependencies and compatible FP8 hardware.
+Use a Hugging Face model id (missing files will be downloaded), or a complete
+local checkpoint directory, not the `models--OWNER--NAME` cache root.
+
+With `--verbose 1`, progress is flushed immediately to stderr: model loading
+stages, prompt and model-turn numbers, Python script execution, diff capture,
+and saving. PyTorch generation also reports first-token waiting, periodic token
+counts, and completion, rather than remaining silent until the answer is ready.
+
+The model can request shell commands with `<bash>...</bash>` as well as Python
+with `<python>...</python>`, outside Markdown fences. For example:
+
+```xml
+<bash>git status --short; find . -name '*.py' -print</bash>
+```
+
+Both tools share the script budget and working directory. Bash runs with
+`pipefail` enabled; outputs and exit status are sent back to the model and saved
+with `tool: "bash"` in the JSON trace. Bash must be available on PATH.
+
+To expose only the Bash tool, use `--harness bash`, including with JSON input:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.5-0.8B \
+  --backend pytorch --device cuda --input tasks.json --harness bash \
+  --max-tool-calls 100 --max-length 4096 --output events.json --verbose 1
+```
+
+The initial instructions advertise only Bash. Python tool requests are rejected;
+this is not isolation, since Bash commands can still launch Python.
+
+Add `--live-log` to create a retained temporary transcript, or choose its path:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.5-0.8B \
+  --backend pytorch --device cuda --input tasks.json --harness bash \
+  --max-tool-calls 100 --max-length 4096 --output events.json \
+  --live-log live.log --verbose 1
+```
+
+In another terminal, `tail -f live.log` shows model text as it is generated and
+tool stdout/stderr while scripts run, followed by their exit status. Logging
+flushes immediately and also works without verbose. Keep this file outside the
+target repository. Temporary logs are retained after the run for inspection.
+
 ### ATen failure-discovery datasets
 
 `datasets/aten_failures_set_1.jsonl` and `datasets/aten_failures_set_2.jsonl`

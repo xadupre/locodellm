@@ -1,16 +1,22 @@
-"""Runs a model-driven conversation with a bounded Python execution tool."""
+"""Runs a model-driven conversation with bounded Python and Bash execution tools."""
 
 from __future__ import annotations
 
+import codecs
+import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from locodellm.utils import strip_thinking
+from locodellm.generate.live_log import LiveLog
 
 _PYTHON_CALL = re.compile(
     r"```.*?```|<python>\s*(.*?)\s*</python>"
@@ -19,20 +25,22 @@ _PYTHON_CALL = re.compile(
     r"|\A<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>\Z",
     re.DOTALL,
 )
-_INSTRUCTIONS = """You may use the Python tool to check your solution before answering.
-You may execute up to 10 scripts to solve this problem.
-To call it, reply with one or more <python>...</python> blocks, each containing
-a complete Python script. Blocks execute in order, and their results are returned
+_SCRIPT_CALL = re.compile(_PYTHON_CALL.pattern + r"|<bash>\s*(.*?)\s*</bash>", re.DOTALL)
+_TOOL_MARKER = re.compile(
+    r"```.*?```|(?P<python></?python\b)|(?P<bash></?bash\b)|(?P<native></?tool_call\b)", re.DOTALL
+)
+_INSTRUCTIONS = """{tool_instructions}
+You may execute up to {max_tool_calls} scripts to solve this problem.
+Blocks execute in order, and their results are returned
 together before your next response. Each block consumes one execution.
 Print the values you want to inspect. You will receive stdout,
 stderr, the exit code, and whether execution timed out.
-Each script runs in a fresh Python process in the same temporary directory.
-When finished, return your final function in a Python markdown code block,
-without a tool call. The hidden benchmark tests are
+{working_directory_instructions}
+When finished, {final_answer_instructions}
+The hidden benchmark tests are
 not available to the tool.
-Every <python>...</python> block is an execution request, never a final answer.
-A function definition alone does not call the function or print anything.
-Include calls and print or assert statements to check your solution.
+{tool_rules}
+Bash uses pipefail; shell variables do not persist between scripts.
 
 Problem:
 """
@@ -67,7 +75,7 @@ with open(counter_path, "r+b") as counter_file:
 
 @dataclass
 class PythonToolResult:
-    """Records one Python tool execution, including failed executions."""
+    """Records one Python or Bash execution, including failed executions."""
 
     code: str
     stdout: str
@@ -77,6 +85,7 @@ class PythonToolResult:
     command: list[str]
     cwd: str
     function_call_count: int = 0
+    tool: str = "python"
 
 
 @dataclass
@@ -92,10 +101,15 @@ class HarnessResult:
 
 def extract_python_calls(text: str) -> list[str]:
     """Extracts explicit Python requests outside thinking and Markdown fences."""
+    return [code for tool, code in extract_script_calls(text) if tool == "python"]
+
+
+def extract_script_calls(text: str) -> list[tuple[str, str]]:
+    """Extracts ordered Python and Bash requests outside thinking and Markdown."""
     return [
-        code
-        for match in _PYTHON_CALL.finditer(strip_thinking(text))
-        for code in match.groups()
+        ("bash" if index == 3 else "python", code)
+        for match in _SCRIPT_CALL.finditer(strip_thinking(text))
+        for index, code in enumerate(match.groups())
         if code is not None
     ]
 
@@ -107,7 +121,18 @@ def generate_with_trace(
     interactions.append(
         {"type": "prompt", "content": prompt, "generation_options": search_options}
     )
+    live_log = getattr(session, "live_log", None)
+    if live_log is not None:
+        live_log.section("prompt", prompt)
+        live_log.section("model response")
+        live_log.model_streamed = False
     session.generate(prompt, **search_options)
+    if live_log is not None:
+        if not live_log.model_streamed:
+            live_log.model_text(session.text)
+        live_log.section("model response complete")
+    if getattr(session, "verbose", 0):
+        print(f"[generate] response preview: {session.text[:30]!r}", file=sys.stderr, flush=True)
     interactions.append(
         {
             "type": "model_response",
@@ -118,41 +143,126 @@ def generate_with_trace(
 
 
 class PythonHarness:
-    """Provides at most ten Python executions per problem.
+    """Provides a shared configurable budget of Python and Bash executions.
 
     Scripts run with the current user's permissions; this is not a sandbox.
     """
 
     max_tool_calls = 10
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        timeout: float = 10.0,
+        max_tool_calls: int = 10,
+        verbose: int = 0,
+        bash_only: bool = False,
+        live_log: LiveLog | None = None,
+    ) -> None:
         if timeout <= 0:
             raise ValueError("The Python tool timeout must be positive.")
+        if isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int):
+            raise ValueError("The Python tool budget must be a positive integer.")
+        if max_tool_calls <= 0:
+            raise ValueError("The Python tool budget must be a positive integer.")
         self.timeout = timeout
+        self.max_tool_calls = max_tool_calls
+        self.verbose = verbose
+        self.bash_only = bash_only
+        self.live_log = live_log
 
-    def execute(self, code: str, directory: str) -> PythonToolResult:
+    def execute(
+        self,
+        code: str,
+        directory: str,
+        *,
+        script_directory: str | None = None,
+        tool: str = "python",
+    ) -> PythonToolResult:
         """Executes a script and captures bounded output and execution status."""
-        script = Path(directory) / "tool_script.py"
+        if tool not in {"python", "bash"}:
+            raise ValueError(f"Unsupported execution tool: {tool!r}")
+        if self.bash_only and tool != "bash":
+            raise ValueError("Python tool requests are disabled in Bash-only mode.")
+        script = Path(script_directory or directory) / (
+            "tool_script.sh" if tool == "bash" else "tool_script.py"
+        )
         script.write_text(code, encoding="utf-8")
-        counter = Path(directory) / "tool_function_calls.bin"
+        counter = script.parent / "tool_function_calls.bin"
         counter.write_bytes(b"\0" * 8)
         command = [sys.executable, "-u", "-c", _TOOL_RUNNER, str(counter), str(script)]
+        if tool == "bash":
+            bash = shutil.which("bash")
+            if bash is None:
+                raise FileNotFoundError("Bash execution requires the 'bash' executable on PATH.")
+            command = [bash, "--noprofile", "--norc", "-o", "pipefail", str(script)]
         timed_out = False
         returncode = None
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=directory,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    timeout=self.timeout,
-                    check=False,
+        if self.live_log is not None:
+            self.live_log.section(f"{tool} command", code)
+        with (
+            tempfile.TemporaryDirectory(prefix="locodellm-output-") as output_directory,
+            (Path(output_directory) / "stdout").open("w+b") as stdout,
+            (Path(output_directory) / "stderr").open("w+b") as stderr,
+            (Path(output_directory) / "stdout").open("rb") as stdout_reader,
+            (Path(output_directory) / "stderr").open("rb") as stderr_reader,
+        ):
+            decoders = [codecs.getincrementaldecoder("utf-8")(errors="replace") for _ in range(2)]
+
+            def log_output(final: bool = False) -> None:
+                if self.live_log is None:
+                    return
+                for label, reader, decoder in zip(
+                    ("stdout", "stderr"), (stdout_reader, stderr_reader), decoders
+                ):
+                    while data := reader.read(4096):
+                        text = decoder.decode(data)
+                        if text:
+                            self.live_log.section(f"{tool} {label}", text)
+                        if not final:
+                            break
+                    if final:
+                        text = decoder.decode(b"", final=True)
+                        if text:
+                            self.live_log.section(f"{tool} {label}", text)
+
+            with subprocess.Popen(
+                command,
+                cwd=directory,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=os.name == "posix",
+            ) as process:
+                deadline = time.monotonic() + self.timeout
+                try:
+                    if self.live_log is None:
+                        returncode = process.wait(timeout=self.timeout)
+                    else:
+                        while True:
+                            log_output()
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(command, self.timeout)
+                            try:
+                                returncode = process.wait(timeout=min(0.05, remaining))
+                                break
+                            except subprocess.TimeoutExpired:
+                                if time.monotonic() >= deadline:
+                                    raise
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.wait()
+                finally:
+                    log_output(final=True)
+
+            if self.live_log is not None:
+                self.live_log.section(
+                    f"{tool} exit", f"returncode={returncode}, timed_out={timed_out}"
                 )
-                returncode = completed.returncode
-            except subprocess.TimeoutExpired:
-                timed_out = True
 
             outputs = []
             for stream in (stdout, stderr):
@@ -172,19 +282,82 @@ class PythonHarness:
             command,
             directory,
             int.from_bytes(counter.read_bytes(), sys.byteorder),
+            tool,
         )
 
     def run(
-        self, session: Any, prompt: str, max_length: int, **search_options: Any
+        self,
+        session: Any,
+        prompt: str,
+        max_length: int,
+        final_answer_instructions: str = (
+            "return your final function in a Python markdown code block, without a tool call."
+        ),
+        directory: str | None = None,
+        **search_options: Any,
     ) -> HarnessResult:
         """Runs tool calls until the model answers or exhausts its budget.
 
         ``max_length`` is the maximum number of new tokens per model turn.
+        ``directory`` selects a persistent working directory instead of a
+        temporary one. Internal scripts and counters remain in temporary storage.
         """
+        if directory is not None:
+            path = Path(directory).resolve()
+            if not path.is_dir():
+                raise ValueError(f"Working directory does not exist: {path}")
+            directory = str(path)
         result = HarnessResult()
-        message = _INSTRUCTIONS + prompt
-        with tempfile.TemporaryDirectory(prefix="locodellm-python-") as directory:
-            for _ in range(self.max_tool_calls + 1):
+        if self.live_log is not None:
+            session.live_log = self.live_log
+        message = (
+            _INSTRUCTIONS.format(
+                tool_instructions=(
+                    "You may use only the Bash tool to solve the task before answering.\n"
+                    "To call it, reply with one or more <bash>...</bash> blocks "
+                    "containing Bash commands.\nPython tool requests are disabled."
+                    if self.bash_only
+                    else (
+                        "You may use Python and Bash tools to solve the task before answering.\n"
+                        "Reply with one or more <python>...</python> blocks containing "
+                        "Python scripts, or <bash>...</bash> blocks containing Bash commands.\n"
+                        "Python and Bash share the same execution budget and working directory."
+                    )
+                ),
+                tool_rules=(
+                    "Every <bash>...</bash> block is an execution request, never a final answer."
+                    if self.bash_only
+                    else (
+                        "Every <python>...</python> or <bash>...</bash> block is an execution "
+                        "request, never a final answer.\n"
+                        "A function definition alone does not call it or print anything.\n"
+                        "Include calls and print or assert statements to check your solution."
+                    )
+                ),
+                max_tool_calls=self.max_tool_calls,
+                final_answer_instructions=final_answer_instructions,
+                working_directory_instructions=(
+                    "Each script runs in a fresh process in the same temporary directory."
+                    if directory is None
+                    else (
+                        "Each script runs in a fresh process in the repository "
+                        f"working directory {directory!r}. Relative file paths refer to this "
+                        "directory. File modifications persist after execution."
+                    )
+                ),
+            )
+            + prompt
+        )
+        with tempfile.TemporaryDirectory(prefix="locodellm-python-") as script_directory:
+            working_directory = directory or script_directory
+            for turn in range(1, self.max_tool_calls + 2):
+                if self.verbose:
+                    print(
+                        f"[harness] model turn {turn}; "
+                        f"{self.max_tool_calls - len(result.tool_calls)} scripts remaining",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 generate_with_trace(
                     session,
                     message,
@@ -192,37 +365,86 @@ class PythonHarness:
                     max_new_tokens=max_length,
                     **search_options,
                 )
+                if self.verbose:
+                    print(
+                        f"[harness] model turn {turn} finished: "
+                        f"{session.generated_token_count} tokens",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 result.token_count += session.generated_token_count
                 response = strip_thinking(session.text)
-                calls = extract_python_calls(response)
+                calls = extract_script_calls(response)
+                budget_label = (
+                    "Bash"
+                    if self.bash_only
+                    else (
+                        "Python/Bash"
+                        if any(tool == "bash" for tool, _ in calls)
+                        or any(call.tool == "bash" for call in result.tool_calls)
+                        else "Python"
+                    )
+                )
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
+                if self.bash_only and any(tool != "bash" for tool, _ in calls):
+                    result.error = "Python tool requests are disabled in Bash-only mode."
+                    return result
                 if not calls:
+                    marker = next(
+                        (
+                            match
+                            for match in _TOOL_MARKER.finditer(response)
+                            if match.lastgroup is not None
+                        ),
+                        None,
+                    )
                     if not response:
                         result.error = "The model returned an empty answer."
-                    elif response.startswith("<python") or response.endswith("</python>"):
+                    elif marker is not None and marker.lastgroup == "python":
                         result.error = (
                             "Malformed Python tool call; expected <python>...</python>."
                         )
-                    elif response.startswith("<tool_call") or response.endswith("</tool_call>"):
+                    elif marker is not None and marker.lastgroup == "native":
                         result.error = "Unsupported or malformed native Python tool call."
+                    elif marker is not None and marker.lastgroup == "bash":
+                        result.error = "Malformed Bash tool call; expected <bash>...</bash>."
                     else:
                         result.text = response
                     return result
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 if len(calls) > remaining:
                     result.error = (
-                        "Python tool budget exhausted (10 executions per problem; "
+                        f"{budget_label} tool budget exhausted ({self.max_tool_calls} "
+                        "executions per problem; "
                         f"requested {len(calls)} with {remaining} remaining)."
                     )
                     return result
                 feedback = []
-                for index, code in enumerate(calls, 1):
-                    execution = self.execute(code, directory)
+                for index, (tool, code) in enumerate(calls, 1):
+                    script_index = len(result.tool_calls) + 1
+                    if self.verbose:
+                        print(
+                            f"[harness] executing script {script_index}/{self.max_tool_calls} "
+                            f"(tool={tool}, timeout={self.timeout}s)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    execution = self.execute(
+                        code, working_directory, script_directory=script_directory, tool=tool
+                    )
                     result.tool_calls.append(execution)
+                    if self.verbose:
+                        print(
+                            f"[harness] script {script_index}/{self.max_tool_calls} finished: "
+                            f"exit={execution.returncode}, timed_out={execution.timed_out}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     result.interactions.extend(
                         [
                             {
                                 "type": "command",
+                                "tool": tool,
                                 "argv": execution.command,
                                 "cwd": execution.cwd,
                                 "code": code,
@@ -237,11 +459,10 @@ class PythonHarness:
                             },
                         ]
                     )
-                    heading = (
-                        "Python tool result"
-                        if len(calls) == 1
-                        else f"Python tool result {index}/{len(calls)}"
-                    )
+                    label = "Bash" if tool == "bash" else "Python"
+                    heading = f"{label} tool result"
+                    if len(calls) > 1:
+                        heading += f" {index}/{len(calls)}"
                     feedback.append(
                         f"{heading}:\n"
                         f"stdout:\n{execution.stdout}\n"
@@ -253,13 +474,19 @@ class PythonHarness:
                 remaining = self.max_tool_calls - len(result.tool_calls)
                 message = "\n\n".join(feedback) + (
                     "\n"
-                    f"Remaining Python tool calls: {remaining}.\n"
-                    "The preceding Python tool requests were executed, not accepted as a final "
+                    f"Remaining {budget_label} tool calls: {remaining}.\n"
+                    "The preceding tool requests were executed, not accepted as a final "
                     "answer. An empty stdout means the script printed nothing; defining "
                     "a function does not call it.\n"
-                    "To finish, return your final function in a ```python markdown "
-                    "code block, WITHOUT <python> or </python> tags. Otherwise make "
-                    "another allowed tool call with your own checks."
+                    f"To finish, {final_answer_instructions}\n"
+                    "Answer WITHOUT <python> or </python> tags. Otherwise make "
+                    "another allowed tool call with your own checks. "
+                    "Do not include <bash> or </bash> tags in the final answer. "
+                    + (
+                        "Only Bash tool requests are allowed."
+                        if self.bash_only
+                        else "Python and Bash share the remaining execution budget."
+                    )
                 )
         result.error = "The model did not return a final answer within the conversation budget."
         return result

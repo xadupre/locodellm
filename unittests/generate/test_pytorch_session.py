@@ -5,11 +5,24 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy
 
 from locodellm.__main__ import main
 from locodellm.generate.generate_from_model import _model_path_cache, _session_cache, get_session
+
+
+class FlushedOutput(io.StringIO):
+    """Records the text made visible by each explicit flush."""
+
+    def __init__(self):
+        super().__init__()
+        self.flushed_texts = []
+
+    def flush(self):
+        self.flushed_texts.append(self.getvalue())
+        super().flush()
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
@@ -135,6 +148,44 @@ class TestPyTorchSession(unittest.TestCase):
         numpy.testing.assert_array_equal(fresh.tokens[: len(history)], history)
         self.assertEqual(fresh.text, "answer")
 
+    def test_model_and_tokenizer_end_tokens_both_stop_generation(self):
+        """Honors tokenizer turn endings as well as configured model end tokens."""
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class ForcedEnding(LogitsProcessor):
+            """Emits one answer token followed by a selected termination token."""
+
+            def __init__(self, end):
+                self.end = end
+                self.calls = 0
+
+            def __call__(self, input_ids, scores):
+                token = self.end if self.calls == 1 else 0
+                self.calls += 1
+                scores.fill_(-float("inf"))
+                scores[:, token] = 0
+                return scores
+
+        loaded = get_session(self.model_path, backend="pytorch", device="cpu")
+        original_eos = loaded.model.generation_config.eos_token_id
+        try:
+            for configured, emitted in [(None, 3), (2, 3), ([2, 6], 3), (2, 2)]:
+                with self.subTest(configured=configured, emitted=emitted):
+                    loaded.model.generation_config.eos_token_id = configured
+                    session = loaded.new_session()
+                    processor = ForcedEnding(emitted)
+                    session.generate(
+                        "hello",
+                        max_new_tokens=8,
+                        logits_processor=LogitsProcessorList([processor]),
+                    )
+                    self.assertEqual(processor.calls, 2)
+                    self.assertEqual(session.text, "answer")
+                    self.assertEqual(session.generated_token_count, 1)
+                    self.assertEqual(session.messages[-1]["content"], "answer")
+        finally:
+            loaded.model.generation_config.eos_token_id = original_eos
+
     def test_automatic_device_placement(self):
         """Loads and generates with Accelerate's automatic device mapping."""
         session = get_session(self.model_path, backend="pytorch", device="auto")
@@ -176,6 +227,195 @@ class TestPyTorchSession(unittest.TestCase):
             self.assertGreater(trace[0]["token_count"], 0)
             self.assertIn("Statistics", stdout.getvalue())
 
+    def test_generate_cli_and_harness_exports(self):
+        """Generates and exports real native-model answers with and without the harness."""
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        for harness in (False, True):
+            with self.subTest(harness=harness), tempfile.TemporaryDirectory() as directory:
+                output = os.path.join(directory, "events.json")
+                limit = 2 if harness else session.get_prompt_length("hello") + 2
+                args = [
+                    "generate",
+                    self.model_path,
+                    "hello",
+                    "--backend",
+                    "pytorch",
+                    "--device",
+                    "cpu",
+                    "--max-length",
+                    str(limit),
+                    "--output",
+                    output,
+                ]
+                if harness:
+                    args += ["--harness", "python"]
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    main(args)
+                with open(output, encoding="utf-8") as stream:
+                    document = json.load(stream)
+                self.assertEqual(stdout.getvalue().strip(), "answer answer")
+                self.assertEqual(document["text"], "answer answer")
+                self.assertEqual(document["token_count"], 2)
+                self.assertIsNone(document["error"])
+                self.assertEqual(document["tool_calls"], [])
+                option = "max_new_tokens" if harness else "max_length"
+                self.assertEqual(document["initial_generation_options"], {option: limit})
+
+    def test_verbose_generation_progress_and_cached_sessions(self):
+        """Reports flushed loading, model-turn, and token progress with a real model."""
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                _session_cache.clear()
+                if cached:
+                    get_session(self.model_path, backend="pytorch", device="cpu", verbose=0)
+                stderr = FlushedOutput()
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    main(
+                        [
+                            "generate",
+                            self.model_path,
+                            "hello",
+                            "--backend",
+                            "pytorch",
+                            "--device",
+                            "cpu",
+                            "--harness",
+                            "python",
+                            "--max-length",
+                            "8",
+                            "--verbose",
+                            "1",
+                        ]
+                    )
+                answer = " ".join(["answer"] * 8)
+                self.assertEqual(stdout.getvalue(), answer + "\n")
+                self.assertIn("[generate] starting:", stderr.flushed_texts[0])
+                self.assertNotIn("model ready", stderr.flushed_texts[0])
+                self.assertIn("[generate] model ready", stderr.getvalue())
+                self.assertIn("[harness] model turn 1;", stderr.getvalue())
+                self.assertIn("[generate] waiting for first token", stderr.getvalue())
+                self.assertIn("[generate] generated 1/8 tokens", stderr.getvalue())
+                first_progress = next(
+                    line
+                    for line in stderr.getvalue().splitlines()
+                    if "[generate] generated 1/8 tokens" in line
+                )
+                self.assertIn("text='answer'", first_progress)
+                self.assertIn("[generate] generation finished: 8 tokens", stderr.getvalue())
+                self.assertIn(f"[generate] response preview: {answer[:30]!r}", stderr.getvalue())
+                self.assertIn("[harness] model turn 1 finished: 8 tokens", stderr.getvalue())
+                live_preview = next(
+                    text for text in stderr.flushed_texts if "[generate] response start:" in text
+                )
+                self.assertIn(f"[generate] response start: {answer[:30]!r}", live_preview)
+                self.assertNotIn("generation finished", live_preview)
+                self.assertNotIn("model turn 1 finished", live_preview)
+                self.assertEqual(stderr.getvalue().count("[generate] response start:"), 1)
+                waiting = next(
+                    text for text in stderr.flushed_texts if "waiting for first token" in text
+                )
+                self.assertNotIn("generation finished", waiting)
+                if not cached:
+                    for phase in (
+                        "importing Transformers",
+                        "loading configuration",
+                        "loading weights",
+                        "loading tokenizer",
+                    ):
+                        self.assertIn(phase, stderr.getvalue())
+
+    def test_progress_reports_current_generated_text(self):
+        """Includes a changing thirty-character suffix in periodic token reports."""
+        import torch
+
+        from locodellm.session.pytorch_session import GenerationProgress
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        progress = GenerationProgress(1000, session.tokenizer)
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            progress.put(torch.tensor([[1]]))
+            progress.put(torch.tensor([0]))
+            progress.last_report = 0
+            progress.put(torch.tensor([0] * 200))
+            progress.last_report = 0
+            progress.put(torch.tensor([1]))
+        lines = [
+            line for line in stderr.getvalue().splitlines() if "[generate] generated " in line
+        ]
+        self.assertEqual(len(lines), 3)
+        self.assertIn("generated 1/1000 tokens", lines[0])
+        self.assertTrue(lines[0].endswith("text='answer'"))
+        self.assertIn("generated 201/1000 tokens", lines[1])
+        expected = " ".join(["answer"] * 128)[-30:]
+        self.assertTrue(lines[1].endswith(f"text={expected!r}"))
+        expected = (" ".join(["answer"] * 127) + " [UNK]")[-30:]
+        self.assertTrue(lines[2].endswith(f"text={expected!r}"))
+        self.assertLessEqual(len(progress.recent_tokens), 128)
+
+    def test_live_model_log_flushes_before_generation_finishes(self):
+        """Writes decoded fragments before streamer completion even without verbose."""
+        import torch
+
+        from locodellm.generate.live_log import LiveLog
+        from locodellm.session.pytorch_session import GenerationProgress
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with LiveLog(str(path)) as log:
+                progress = GenerationProgress(10, session.tokenizer, verbose=False, live_log=log)
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    progress.put(torch.tensor([[1]]))
+                    progress.put(torch.tensor([0]))
+                    progress.put(torch.tensor([0]))
+                    self.assertEqual(path.read_text(), "answer ")
+                    progress.end()
+                self.assertEqual(path.read_text(), "answer answer")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_generate_cli_retains_temporary_live_log(self):
+        """Creates a readable temporary transcript and references it in the final JSON."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "events.json"
+            log_path = None
+            try:
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            self.model_path,
+                            "hello",
+                            "--backend",
+                            "pytorch",
+                            "--device",
+                            "cpu",
+                            "--harness",
+                            "python",
+                            "--max-length",
+                            "2",
+                            "--output",
+                            str(output),
+                            "--live-log",
+                        ]
+                    )
+                document = json.loads(output.read_text())
+                log_path = Path(document["live_log"])
+                self.assertIn(f"[generate] live log: {log_path}", stderr.getvalue())
+                self.assertEqual(stdout.getvalue(), "answer answer\n")
+                text = log_path.read_text()
+                self.assertIn("[prompt]", text)
+                self.assertIn("[model response]\n\nanswer answer", text)
+                self.assertIn("[model response complete]", text)
+            finally:
+                if log_path is not None:
+                    log_path.unlink()
+
     def test_python_harness(self):
         """Accepts direct answers while preserving per-turn generation limits."""
         from locodellm.bench.python_harness import PythonHarness
@@ -186,6 +426,120 @@ class TestPyTorchSession(unittest.TestCase):
         self.assertEqual(result.token_count, 2)
         self.assertEqual(result.tool_calls, [])
         self.assertIsNone(result.error)
+
+    def test_harness_feedback_reaches_model_input_without_replaying_script(self):
+        """Checks actual model inputs after execution with all supported chat modes."""
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+        from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        from locodellm.bench.python_harness import PythonHarness
+        from locodellm.session.pytorch_session import PyTorchSessionState
+
+        script = (
+            "<python>import sys\n"
+            "print('unique_stdout_42')\n"
+            "print('unique_stderr_17', file=sys.stderr)\n"
+            "sys.exit(3)</python>"
+        )
+        final = "The script returned unique_stdout_42 with exit code 3."
+        raw = Tokenizer(models.BPE())
+        raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        raw.decoder = decoders.ByteLevel()
+        raw.train_from_iterator(
+            [script, final],
+            trainers.BpeTrainer(
+                vocab_size=300,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                special_tokens=["[EOS]", "[PAD]"],
+            ),
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=raw, eos_token="[EOS]", pad_token="[PAD]"
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{ '<|' + message['role'] + '|>\\n' + message['content'] + '<|end|>\\n' }}"
+            "{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
+        )
+        model = GPT2LMHeadModel(
+            GPT2Config(
+                vocab_size=len(tokenizer),
+                n_positions=4096,
+                n_embd=8,
+                n_layer=1,
+                n_head=1,
+                eos_token_id=tokenizer.pad_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                bos_token_id=None,
+            )
+        ).eval()
+
+        class RecordedResponses(LogitsProcessor):
+            """Forces two responses while recording actual Transformers input tokens."""
+
+            def __init__(self):
+                self.responses = [
+                    [*tokenizer.encode(text, add_special_tokens=False), tokenizer.eos_token_id]
+                    for text in (script, final)
+                ]
+                self.contexts = []
+                self.turn = 0
+                self.step = 0
+
+            def __call__(self, input_ids, scores):
+                if self.step == 0:
+                    self.contexts.append(
+                        tokenizer.decode(input_ids[0], skip_special_tokens=False)
+                    )
+                token = self.responses[self.turn][self.step]
+                scores.fill_(-float("inf"))
+                scores[:, token] = 0
+                self.step += 1
+                if self.step == len(self.responses[self.turn]):
+                    self.turn += 1
+                    self.step = 0
+                return scores
+
+        for mode in ("native", "chatml", "plain"):
+            with self.subTest(mode=mode):
+                tokenizer.chat_template = tokenizer.chat_template if mode != "plain" else None
+                session = PyTorchSessionState(
+                    model, tokenizer, chat_template="chatml" if mode == "chatml" else None
+                )
+                processor = RecordedResponses()
+                result = PythonHarness(max_tool_calls=2).run(
+                    session,
+                    "Inspect the script result and then answer.",
+                    max_length=256,
+                    logits_processor=LogitsProcessorList([processor]),
+                )
+                self.assertIsNone(result.error)
+                self.assertEqual(result.text, final)
+                self.assertEqual(len(result.tool_calls), 1)
+                self.assertEqual(result.tool_calls[0].stdout, "unique_stdout_42\n")
+                self.assertEqual(result.tool_calls[0].stderr, "unique_stderr_17\n")
+                self.assertEqual(result.tool_calls[0].returncode, 3)
+                self.assertEqual(len(processor.contexts), 2)
+                feedback = next(
+                    event["content"]
+                    for event in result.interactions[2:]
+                    if event["type"] == "prompt"
+                )
+                context = processor.contexts[1]
+                self.assertIn(feedback, context)
+                self.assertIn("stdout:\nunique_stdout_42\n", context)
+                self.assertIn("stderr:\nunique_stderr_17\n", context)
+                self.assertIn("exit code: 3", context)
+                self.assertIn("Remaining Python tool calls: 1", context)
+                self.assertEqual(context.count(script), 1)
+                self.assertEqual(context.count("Inspect the script result and then answer."), 1)
+                self.assertEqual(context.count(feedback), 1)
+                self.assertEqual(processor.contexts[0].count(feedback), 0)
+                self.assertEqual(
+                    [message["role"] for message in session.messages],
+                    ["user", "assistant", "user", "assistant"],
+                )
 
     def test_qwen35_text_generation(self):
         """Loads a tiny multimodal Qwen3.5 checkpoint and generates text offline."""

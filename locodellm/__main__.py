@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from contextlib import ExitStack
 
 
 def _parse_provider_option(value: str) -> tuple[str, str]:
@@ -121,20 +122,160 @@ def _cmd_models(args: argparse.Namespace) -> None:  # noqa: ARG001
         print(f"{model_id:<{width}}  {description}")
 
 
-def _cmd_generate(args: argparse.Namespace) -> None:
-    """Generates text from a prompt using a model."""
-    from locodellm.generate.generate_from_model import generate_from_model
+def _load_generate_input(filename: str) -> tuple[list[str], str]:
+    """Loads independent prompts and resolves their repository directory."""
+    import json
+    from pathlib import Path
 
-    session = generate_from_model(
+    source = Path(filename).resolve()
+    document = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or set(document) != {"prompts", "repo"}:
+        raise ValueError("JSON input must contain exactly 'prompts' and 'repo'.")
+    prompts = document["prompts"]
+    if (
+        not isinstance(prompts, list)
+        or not prompts
+        or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)
+    ):
+        raise ValueError("'prompts' must be a nonempty list of nonempty strings.")
+    repository = document["repo"]
+    if not isinstance(repository, str) or not repository.strip():
+        raise ValueError("'repo' must be a nonempty local directory path.")
+    path = Path(repository).expanduser()
+    if not path.is_absolute():
+        path = source.parent / path
+    path = path.resolve()
+    if not path.is_dir():
+        raise ValueError(f"Repository directory does not exist: {path}")
+    return prompts, str(path)
+
+
+def _cmd_generate(args: argparse.Namespace) -> None:
+    """Generates answers for a prompt or a JSON list of independent prompts."""
+    with ExitStack() as stack:
+        _run_generate(args, stack)
+
+
+def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
+    """Runs generation while keeping the optional live transcript open."""
+    if args.verbose:
+        print(
+            f"[generate] starting: backend={args.backend}, model={args.model!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+    import json
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from locodellm.bench.python_harness import HarnessResult, PythonHarness, generate_with_trace
+    from locodellm.generate.generate_from_model import get_session
+    from locodellm.generate.live_log import LiveLog
+    from locodellm.generate.repository import GitRepository
+
+    if args.verbose:
+        print("[generate] reading prompts and validating repository", file=sys.stderr, flush=True)
+    prompts, repository = (
+        _load_generate_input(args.input) if args.input is not None else ([args.prompt], None)
+    )
+    target = GitRepository(repository) if repository is not None else None
+    if args.live_log and any(
+        filename is not None and Path(args.live_log).resolve() == Path(filename).resolve()
+        for filename in (args.input, args.output)
+    ):
+        raise ValueError("The live log must differ from the input and output JSON files.")
+    if target is not None:
+        for filename in (args.input, args.output, args.live_log or None):
+            if filename is not None and Path(filename).resolve().is_relative_to(target.path):
+                raise ValueError(
+                    "Input/output JSON and live log files must be outside the target repository."
+                )
+    live_log = stack.enter_context(LiveLog(args.live_log)) if args.live_log is not None else None
+    if live_log is not None:
+        print(f"[generate] live log: {live_log.path}", file=sys.stderr, flush=True)
+        live_log.section("loading model", f"backend={args.backend}, model={args.model}")
+    if args.verbose:
+        print("[generate] loading model", file=sys.stderr, flush=True)
+    loaded = get_session(
         model_id=args.model,
-        prompt=args.prompt,
         precision=args.precision,
         provider=args.provider,
-        max_length=args.max_length,
         chat_template=args.chat_template,
         verbose=args.verbose,
+        backend=args.backend,
+        device=args.device,
     )
-    print(session.text)
+    if args.verbose:
+        print("[generate] model ready", file=sys.stderr, flush=True)
+    max_length = (
+        args.max_length if args.max_length is not None else (1024 if args.harness else 200)
+    )
+    documents = []
+    for prompt_index, prompt in enumerate(prompts, 1):
+        if args.verbose:
+            print(f"[generate] prompt {prompt_index}/{len(prompts)}", file=sys.stderr, flush=True)
+        if target is not None:
+            if live_log is not None:
+                live_log.section("resetting repository", str(target.path))
+            if args.verbose:
+                print("[generate] resetting repository", file=sys.stderr, flush=True)
+            target.clean()
+        session = loaded.new_session()
+        session.verbose = args.verbose
+        session.live_log = live_log
+        if args.harness:
+            result = PythonHarness(
+                max_tool_calls=args.max_tool_calls,
+                verbose=args.verbose,
+                bash_only=args.harness == "bash",
+                live_log=live_log,
+            ).run(
+                session,
+                prompt,
+                max_length=max_length,
+                final_answer_instructions="return your final answer without a tool call.",
+                directory=repository,
+            )
+        else:
+            result = HarnessResult()
+            generate_with_trace(session, prompt, result.interactions, max_length=max_length)
+            result.text = session.text
+            result.token_count = session.generated_token_count
+        initial = result.interactions[0]
+        document = {
+            "initial_prompt": initial["content"],
+            "events": result.interactions[1:],
+            "initial_generation_options": initial["generation_options"],
+            "prompt": prompt,
+            "text": result.text,
+            "token_count": result.token_count,
+            "tool_call_count": len(result.tool_calls),
+            "tool_calls": [asdict(call) for call in result.tool_calls],
+            "error": result.error,
+        }
+        if target is not None:
+            if args.verbose:
+                print("[generate] collecting repository diff", file=sys.stderr, flush=True)
+            document["diff"] = target.diff()
+        if live_log is not None:
+            document["live_log"] = str(live_log.path)
+        documents.append(document)
+        if args.output:
+            if args.verbose:
+                print(f"[generate] saving {args.output!r}", file=sys.stderr, flush=True)
+            exported = (
+                {"repo": repository, "base_revision": target.revision, "results": documents}
+                if target is not None
+                else document
+            )
+            Path(args.output).write_text(
+                json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
+            )
+        if result.error:
+            if live_log is not None:
+                live_log.section("harness error", result.error)
+            raise RuntimeError(result.error)
+        print(result.text, flush=True)
 
 
 def _cmd_chat(args: argparse.Namespace) -> None:
@@ -230,7 +371,11 @@ def _cmd_builtin_bench(args: argparse.Namespace) -> None:
         session,
         verbose=args.verbose,
         json_output=json_output,
-        harness=PythonHarness() if args.harness else None,
+        harness=(
+            PythonHarness(max_tool_calls=args.max_tool_calls, bash_only=args.harness == "bash")
+            if args.harness
+            else None
+        ),
     )
     df = result.to_dataframe()
 
@@ -406,15 +551,60 @@ def main(args: list[str] | None = None) -> None:
             "or a HuggingFace id like Qwen/Qwen2.5-Coder-0.5B-Instruct."
         ),
     )
-    gen_parser.add_argument("prompt", help="The prompt to send to the model.")
+    gen_parser.add_argument("prompt", nargs="?", help="The prompt to send to the model.")
     gen_parser.add_argument(
-        "--precision", default=None, help="Precision qualifier (e.g. fp16, int4)."
+        "--input",
+        default=None,
+        metavar="JSON",
+        help="JSON prompts and local repo path; enables the Python/Bash harness.",
+    )
+    gen_parser.add_argument(
+        "--precision",
+        default=None,
+        help="ONNX conversion precision, or PyTorch loading dtype (auto, fp32, fp16, bf16).",
+    )
+    gen_parser.add_argument(
+        "--backend",
+        choices=["onnx", "pytorch"],
+        default="onnx",
+        help="Generation backend (default: onnx). PyTorch loads Transformers weights directly.",
+    )
+    gen_parser.add_argument(
+        "--device",
+        default=None,
+        help="PyTorch device (cpu, cuda, cuda:0, auto). Defaults to cpu.",
     )
     gen_parser.add_argument(
         "--provider", default=None, help="Execution provider (e.g. CUDAExecutionProvider)."
     )
     gen_parser.add_argument(
-        "--max-length", type=int, default=200, help="Maximum token length (default: 200)."
+        "--max-length",
+        type=int,
+        default=None,
+        help="Maximum token length (default: 200); with --harness, new tokens per turn (1024).",
+    )
+    gen_parser.add_argument(
+        "--harness",
+        choices=["python", "bash"],
+        default=None,
+        help="Enables Python/Bash script execution, or Bash only with --harness bash.",
+    )
+    gen_parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=10,
+        help="Maximum Python and Bash script executions with --harness (default: 10).",
+    )
+    gen_parser.add_argument(
+        "--output", "-o", default=None, help="Writes the conversation and tool events as JSON."
+    )
+    gen_parser.add_argument(
+        "--live-log",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Streams model text and tool output to PATH, or a retained temporary file.",
     )
     gen_parser.add_argument("--chat-template", default=None, help="Chat template (e.g. chatml).")
     gen_parser.add_argument(
@@ -500,9 +690,15 @@ def main(args: list[str] | None = None) -> None:
     )
     bench_parser.add_argument(
         "--harness",
-        choices=["python"],
+        choices=["python", "bash"],
         default=None,
-        help="Enables up to ten model-requested Python executions per built-in problem.",
+        help="Enables Python/Bash scripts per problem, or Bash only with --harness bash.",
+    )
+    bench_parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=10,
+        help="Maximum Python and Bash scripts per problem with --harness (default: 10).",
     )
     bench_parser.add_argument(
         "--chat-template",
@@ -551,22 +747,37 @@ def main(args: list[str] | None = None) -> None:
 
     if parsed.command == "chat" and parsed.max_length < 1:
         chat_parser.error("--max-length must be positive")
-    if parsed.command == "bench" and parsed.max_length is not None and parsed.max_length < 1:
-        bench_parser.error("--max-length must be positive")
-    if parsed.command == "bench":
+    if parsed.command == "generate":
+        if (parsed.prompt is None) == (parsed.input is None):
+            gen_parser.error("provide either PROMPT or --input JSON, but not both")
+        if parsed.input is not None:
+            parsed.harness = parsed.harness or "python"
+    if parsed.command in {"generate", "bench"}:
+        command_parser = gen_parser if parsed.command == "generate" else bench_parser
+        if parsed.max_length is not None and parsed.max_length < 1:
+            command_parser.error("--max-length must be positive")
+        if parsed.max_tool_calls < 1:
+            command_parser.error("--max-tool-calls must be positive")
+        if not parsed.harness and parsed.max_tool_calls != 10:
+            command_parser.error("--max-tool-calls requires --harness python or bash")
         if parsed.backend == "pytorch":
-            if parsed.provider or parsed.provider_option or parsed.session_option:
-                bench_parser.error(
+            onnx_options = bool(parsed.provider)
+            if parsed.command == "bench":
+                onnx_options = onnx_options or bool(
+                    parsed.provider_option or parsed.session_option
+                )
+            if onnx_options:
+                command_parser.error(
                     "--provider, --provider-option and --session-option are ONNX-only; "
                     "use --device with --backend pytorch"
                 )
             if parsed.precision not in {None, "auto", "fp32", "fp16", "bf16"}:
-                bench_parser.error(
+                command_parser.error(
                     "PyTorch --precision must be auto, fp32, fp16, or bf16; "
                     "load pre-quantized weights by model id"
                 )
         elif parsed.device is not None:
-            bench_parser.error("--device requires --backend pytorch")
+            command_parser.error("--device requires --backend pytorch")
 
     dispatch = {
         "version": _cmd_version,

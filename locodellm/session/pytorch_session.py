@@ -2,11 +2,86 @@
 
 from __future__ import annotations
 
-from typing import Any
+import sys
+import time
+from typing import TYPE_CHECKING, Any
 
 import numpy
 
 from locodellm.session.session_state import SessionState
+
+if TYPE_CHECKING:
+    from locodellm.generate.live_log import LiveLog
+
+
+class GenerationProgress:
+    """Reports token progress and a bounded response prefix without starting threads."""
+
+    def __init__(
+        self,
+        max_new_tokens: int,
+        tokenizer: Any,
+        *,
+        verbose: bool = True,
+        live_log: LiveLog | None = None,
+    ) -> None:
+        self.max_new_tokens = max_new_tokens
+        self.tokenizer = tokenizer
+        self.preview_tokens: list[int] = []
+        self.recent_tokens: list[int] = []
+        self.preview_reported = False
+        self.token_count = 0
+        self.skip_prompt = True
+        self.started_at = time.monotonic()
+        self.last_report = self.started_at
+        self.verbose = verbose
+        self.log_streamer = live_log.model_streamer(tokenizer) if live_log is not None else None
+
+    def put(self, tokens: Any) -> None:
+        """Reports the prefill phase and periodically reports generated token counts."""
+        if self.log_streamer is not None:
+            self.log_streamer.put(tokens)
+        if not self.verbose:
+            return
+        if self.skip_prompt:
+            self.skip_prompt = False
+            print("[generate] waiting for first token", file=sys.stderr, flush=True)
+            return
+        self.token_count += tokens.numel()
+        token_ids = tokens.reshape(-1).tolist()
+        self.recent_tokens = [*self.recent_tokens, *token_ids][-128:]
+        if not self.preview_reported:
+            self.preview_tokens.extend(token_ids)
+            preview = self.tokenizer.decode(self.preview_tokens, skip_special_tokens=False)
+            if len(preview) >= 30:
+                print(f"[generate] response start: {preview[:30]!r}", file=sys.stderr, flush=True)
+                self.preview_reported = True
+                self.preview_tokens.clear()
+        now = time.monotonic()
+        if self.token_count == 1 or now - self.last_report >= 1:
+            recent_text = self.tokenizer.decode(self.recent_tokens, skip_special_tokens=False)[
+                -30:
+            ]
+            print(
+                f"[generate] generated {self.token_count}/{self.max_new_tokens} tokens "
+                f"({now - self.started_at:.1f}s) text={recent_text!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.last_report = now
+
+    def end(self) -> None:
+        """Reports generation completion."""
+        if self.log_streamer is not None:
+            self.log_streamer.end()
+        if not self.verbose:
+            return
+        print(
+            f"[generate] generation finished: {self.token_count} tokens "
+            f"({time.monotonic() - self.started_at:.1f}s)",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class PyTorchSessionState(SessionState):
@@ -71,13 +146,36 @@ class PyTorchSessionState(SessionState):
                 f"The prompt has {len(context)} tokens and exceeds max_length={max_length}."
             )
 
+        if self.verbose:
+            print(
+                f"[generate] context: {len(context)} tokens, max_new_tokens={max_new_tokens}",
+                file=sys.stderr,
+                flush=True,
+            )
         device = self.model.get_input_embeddings().weight.device
         input_ids = torch.tensor([context.tolist()], dtype=torch.long, device=device)
         options = {"do_sample": False, **search_options}
+        if "eos_token_id" not in options:
+            generation_config = options.get("generation_config", self.model.generation_config)
+            configured_eos = generation_config.eos_token_id
+            stop_ids = (
+                list(configured_eos)
+                if isinstance(configured_eos, (list, tuple))
+                else ([] if configured_eos is None else [configured_eos])
+            )
+            tokenizer_eos = self.tokenizer.eos_token_id
+            if tokenizer_eos is not None and tokenizer_eos not in stop_ids:
+                stop_ids.append(tokenizer_eos)
+            if stop_ids:
+                options["eos_token_id"] = stop_ids
         if self.tokenizer.pad_token_id is not None:
             options.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        if self.verbose:
-            print(f"[generate] context: {len(context)} tokens, max_new_tokens={max_new_tokens}")
+        if self.live_log is not None and "streamer" in options:
+            raise ValueError("A live log cannot be combined with a custom generation streamer.")
+        if (self.verbose or self.live_log is not None) and "streamer" not in options:
+            options["streamer"] = GenerationProgress(
+                max_new_tokens, self.tokenizer, verbose=bool(self.verbose), live_log=self.live_log
+            )
         with torch.inference_mode():
             output = self.model.generate(
                 input_ids=input_ids,
@@ -87,7 +185,7 @@ class PyTorchSessionState(SessionState):
                 **options,
             )
         new_tokens = output[0, len(context) :].tolist()
-        eos = search_options.get("eos_token_id", self.model.generation_config.eos_token_id)
+        eos = options.get("eos_token_id", self.model.generation_config.eos_token_id)
         eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         while new_tokens and new_tokens[-1] in eos_ids:
             new_tokens.pop()
@@ -129,15 +227,28 @@ def create_pytorch_session(
         )
     if model_id.startswith("mock/"):
         raise ValueError("mock/ models are ONNX-only; use a Transformers model with PyTorch.")
+    if verbose:
+        print("[create_pytorch_session] importing Transformers", file=sys.stderr, flush=True)
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
     from transformers import AutoTokenizer
 
     if verbose:
-        print(f"[create_pytorch_session] loading {model_id!r} on {device or 'cpu'}")
+        print(
+            f"[create_pytorch_session] loading configuration for {model_id!r}",
+            file=sys.stderr,
+            flush=True,
+        )
     config = AutoConfig.from_pretrained(model_id, cache_dir=cache_dir)
     model_class = (
         AutoModelForImageTextToText if hasattr(config, "vision_config") else AutoModelForCausalLM
     )
+    if verbose:
+        print(
+            f"[create_pytorch_session] loading weights with {model_class.__name__} "
+            f"on {device or 'cpu'}",
+            file=sys.stderr,
+            flush=True,
+        )
     model = model_class.from_pretrained(
         model_id,
         config=config,
@@ -146,5 +257,7 @@ def create_pytorch_session(
         device_map=device or "cpu",
     )
     model.eval()
+    if verbose:
+        print("[create_pytorch_session] loading tokenizer", file=sys.stderr, flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=cache_dir)
     return PyTorchSessionState(model, tokenizer, verbose=verbose, chat_template=chat_template)

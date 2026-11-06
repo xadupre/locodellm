@@ -1,12 +1,24 @@
+import contextlib
+import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from pathlib import Path
 
-from locodellm.__main__ import _compute_case_stats
+from locodellm.__main__ import _compute_case_stats, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
-from locodellm.bench.python_harness import PythonHarness, extract_python_calls
+from locodellm.bench.python_harness import (
+    PythonHarness,
+    extract_python_calls,
+    extract_script_calls,
+)
+from locodellm.generate.repository import GitRepository
+from locodellm.generate.live_log import LiveLog
 from locodellm.utils import extract_code, strip_thinking
 
 
@@ -33,7 +45,632 @@ class ScriptedSession:
         self.generated_token_count = 5
 
 
+def create_repository(directory):
+    """Creates a real repository with committed files for cleanup and diff tests."""
+    directory.mkdir(exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(directory)], check=True, capture_output=True
+    )
+    for filename, content in {
+        ".gitignore": "ignored.txt\n",
+        "tracked.txt": "original\n",
+        "removed.txt": "remove me\n",
+        "tool_script.py": "Do not overwrite.",
+        "tool_function_calls.bin": "Do not overwrite.",
+    }.items():
+        (directory / filename).write_text(content, encoding="utf-8")
+    subprocess.run(["git", "-C", str(directory), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(directory),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "Initial files",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return GitRepository(str(directory))
+
+
 class TestPythonHarness(unittest.TestCase):
+    def test_live_tool_output_is_visible_before_execution_finishes(self):
+        """Checks flushed stdout and stderr from inside a still-running real script."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with LiveLog(str(path)) as log:
+                code = (
+                    "import sys, time\nfrom pathlib import Path\n"
+                    "print('live_stdout_42', flush=True)\n"
+                    "print('live_stderr_17', file=sys.stderr, flush=True)\n"
+                    "time.sleep(0.3)\n"
+                    f"text = Path({str(path)!r}).read_text()\n"
+                    "assert '[python stdout]\\nlive_stdout_42' in text\n"
+                    "assert '[python stderr]\\nlive_stderr_17' in text\n"
+                    "assert '\\n[python exit]\\n' not in text\n"
+                    "print('confirmed_before_exit', flush=True)\n"
+                )
+                result = PythonHarness(timeout=3, live_log=log).execute(code, directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("confirmed_before_exit", result.stdout)
+                text = path.read_text()
+                self.assertIn("[python command]", text)
+                self.assertIn("[python exit]\nreturncode=0, timed_out=False", text)
+            self.assertTrue(path.exists())
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_live_bash_log_and_timeout(self):
+        """Saves Bash output and timeout status while retaining partial diagnostics."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.log"
+            with LiveLog(str(path)) as log:
+                result = PythonHarness(timeout=0.2, live_log=log).execute(
+                    "printf live_bash; printf diagnostic >&2; sleep 2", directory, tool="bash"
+                )
+                self.assertTrue(result.timed_out)
+                text = path.read_text()
+                self.assertIn("[bash stdout]\nlive_bash", text)
+                self.assertIn("[bash stderr]\ndiagnostic", text)
+                self.assertIn("timed_out=True", text)
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_bash_only_cli_json_input(self):
+        """Preserves explicit Bash-only mode for JSON batches and executes real commands."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/bash-only-cli"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = ScriptedSession(
+            ["<bash>printf 42 > answer.txt; cat answer.txt</bash>", "Done."]
+        )
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--harness",
+                            "bash",
+                            "--max-tool-calls",
+                            "1",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(len(document["results"]), 2)
+                for result, child in zip(document["results"], session.children):
+                    self.assertIsNone(result["error"])
+                    self.assertIn("only the Bash tool", result["initial_prompt"])
+                    self.assertNotIn("<python>", result["initial_prompt"])
+                    self.assertIn("Remaining Bash tool calls: 0", child.turns[1][0])
+                    self.assertIn("Only Bash tool requests are allowed.", child.turns[1][0])
+                    self.assertEqual(result["tool_calls"][0]["tool"], "bash")
+                    self.assertEqual(result["tool_calls"][0]["stdout"], "42")
+                    self.assertIn("+42", result["diff"])
+        finally:
+            del _session_cache[key]
+
+    def test_bash_only_rejects_python_requests_before_any_execution(self):
+        """Rejects Python and mixed batches atomically in Bash-only mode."""
+        for request in [
+            "<python>print(42)</python>",
+            (
+                "<tool_call><function=python><parameter=code>print(42)</parameter>"
+                "</function></tool_call>"
+            ),
+            "<bash>exit 99</bash><python>print(42)</python>",
+        ]:
+            with self.subTest(request=request):
+                result = PythonHarness(bash_only=True).run(
+                    ScriptedSession([request]), "Problem.", 100
+                )
+                self.assertIn("disabled in Bash-only mode", result.error)
+                self.assertEqual(result.tool_calls, [])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "disabled in Bash-only mode"):
+                PythonHarness(bash_only=True).execute("print(42)", directory)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_mixed_bash_and_python_requests(self):
+        """Executes mixed scripts in order and returns every result to the next turn."""
+        session = ScriptedSession(
+            [
+                (
+                    "<think><bash>exit 99</bash></think>\n"
+                    "```bash\nexit 98\n```\n"
+                    "<bash>printf 41 > value.txt</bash>\n"
+                    "<python>from pathlib import Path\n"
+                    "value = int(Path('value.txt').read_text()) + 1\n"
+                    "Path('value.txt').write_text(str(value))\n"
+                    "print(value)</python>\n"
+                    "<bash>cat value.txt; printf diagnostic >&2; exit 7</bash>"
+                ),
+                "```python\ndef answer():\n    return 42\n```",
+            ]
+        )
+        result = BenchPromptTest([PromptTest("Problem.", [ExpectedResult((), 42)])]).run(
+            session, harness=PythonHarness(max_tool_calls=3)
+        )
+        self.assertEqual(result.passed, 1)
+        case = result.results[0]
+        self.assertEqual([call.tool for call in case.tool_calls], ["bash", "python", "bash"])
+        self.assertEqual([call.stdout for call in case.tool_calls], ["", "42\n", "42"])
+        self.assertEqual([call.returncode for call in case.tool_calls], [0, 0, 7])
+        self.assertEqual(case.tool_calls[2].stderr, "diagnostic")
+        self.assertEqual(case.function_call_count, 0)
+        self.assertEqual(len({call.cwd for call in case.tool_calls}), 1)
+        feedback = session.children[0].turns[1][0]
+        self.assertIn("Bash tool result 1/3", feedback)
+        self.assertIn("Python tool result 2/3", feedback)
+        self.assertIn("Bash tool result 3/3", feedback)
+        self.assertIn("stderr:\ndiagnostic", feedback)
+        self.assertIn("exit code: 7", feedback)
+        self.assertIn("Remaining Python/Bash tool calls: 0", feedback)
+        exported = result.to_json()[0]
+        self.assertEqual(
+            [call["tool"] for call in exported["tool_calls"]], ["bash", "python", "bash"]
+        )
+        self.assertEqual(
+            [event["tool"] for event in exported["events"] if event["type"] == "command"],
+            ["bash", "python", "bash"],
+        )
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_bash_failure_timeout_and_truncation(self):
+        """Captures pipeline failures and bounds Bash outputs and execution time."""
+        with tempfile.TemporaryDirectory() as directory:
+            harness = PythonHarness(timeout=0.1)
+            failed = harness.execute("false | cat", directory, tool="bash")
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(failed.function_call_count, 0)
+            large = harness.execute(
+                "printf '%020000d' 0; printf '%020000d' 0 >&2", directory, tool="bash"
+            )
+            self.assertTrue(large.stdout.endswith("[output truncated]"))
+            self.assertTrue(large.stderr.endswith("[output truncated]"))
+            timed_out = harness.execute(
+                "sleep 0.4; printf should-not-run > late.txt", directory, tool="bash"
+            )
+            self.assertTrue(timed_out.timed_out)
+            self.assertIsNone(timed_out.returncode)
+            time.sleep(0.5)
+            self.assertFalse((Path(directory) / "late.txt").exists())
+
+    def test_bash_budget_and_incomplete_requests(self):
+        """Rejects mixed over-budget batches and malformed requests without execution."""
+        result = PythonHarness(max_tool_calls=1).run(
+            ScriptedSession(["<bash>exit 99</bash><python>raise AssertionError()</python>"]),
+            "Problem.",
+            100,
+        )
+        self.assertEqual(result.tool_calls, [])
+        self.assertIn("budget exhausted", result.error)
+        for response in ("Some prose.\n<bash>ls", "Some prose.\n</bash>"):
+            with self.subTest(response=response):
+                result = PythonHarness().run(ScriptedSession([response]), "Problem.", 100)
+                self.assertIn("Malformed Bash", result.error)
+                self.assertEqual(result.tool_calls, [])
+        final = '```bash\nprintf "<bash>"\n```'
+        result = PythonHarness().run(ScriptedSession([final]), "Problem.", 100)
+        self.assertEqual(result.text, final)
+        self.assertIsNone(result.error)
+
+    def test_bash_literals_do_not_become_nested_tools_or_thinking(self):
+        """Preserves literal Python and thinking tags inside a Bash request."""
+        bash = """printf '%s\\n' '<python>print(99)</python>' '</think>'"""
+        response = f"<think>Hidden.</think><bash>{bash}</bash>"
+        self.assertEqual(extract_script_calls(response), [("bash", bash)])
+        self.assertEqual(extract_python_calls(response), [])
+
+    def test_verbose_response_previews(self):
+        """Reports exactly the first thirty response characters on every model turn."""
+        responses = [
+            "<python>print('a sufficiently long diagnostic message')</python>",
+            "A final answer that is longer than thirty characters.",
+        ]
+        session = ScriptedSession(responses)
+        session.verbose = 1
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = PythonHarness(verbose=1).run(session, "Problem.", 100)
+        self.assertIsNone(result.error)
+        previews = [
+            line for line in stderr.getvalue().splitlines() if "response preview:" in line
+        ]
+        self.assertEqual(
+            previews,
+            [f"[generate] response preview: {response[:30]!r}" for response in responses],
+        )
+        self.assertEqual(
+            [
+                event["content"]
+                for event in result.interactions
+                if event["type"] == "model_response"
+            ],
+            responses,
+        )
+
+    def test_generate_json_repository_and_independent_prompts(self):
+        """Cleans each prompt and saves applicable patches including new binary files."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/scripted-json-cli"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = ScriptedSession(
+            [
+                (
+                    "<python>from pathlib import Path\n"
+                    "assert Path('tracked.txt').read_text() == 'original\\n'\n"
+                    "assert not Path('initial_untracked').exists()\n"
+                    "assert not Path('initial_directory').exists()\n"
+                    "assert not Path('value.txt').exists()\n"
+                    "assert Path('ignored.txt').read_text() == 'keep'\n"
+                    "Path('tracked.txt').write_text('modified\\n')\n"
+                    "Path('removed.txt').unlink()\n"
+                    "Path('binary.bin').write_bytes(b'\\x00\\xffpayload')\n"
+                    "Path('non_utf8.txt').write_bytes(b'\\xff\\n')\n"
+                    "path = Path('value.txt')\n"
+                    "path.write_text(str(int(path.read_text()) + 1) if path.exists() else '1')\n"
+                    "</python>"
+                ),
+                (
+                    "<python>from pathlib import Path\nimport subprocess\n"
+                    "subprocess.run(['git', 'add', 'tracked.txt'], check=True)\n"
+                    "print(Path('value.txt').read_text())</python>"
+                ),
+                "Updated the repository.",
+            ]
+        )
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaisesRegex(RuntimeError, "Git rev-parse"):
+                    GitRepository(str(root))
+                repository = root / "repo"
+                target = create_repository(repository)
+                (repository / "tracked.txt").write_text("initial dirty content")
+                target.git("add", "tracked.txt")
+                (repository / "initial_untracked").write_text("discard")
+                (repository / "initial_directory").mkdir()
+                (repository / "initial_directory" / "file").write_text("discard")
+                (repository / "ignored.txt").write_text("keep")
+                source = root / "tasks.json"
+                prompts = ["Make the first change.", "Make the second change."]
+                source.write_text(
+                    json.dumps({"repo": "repo", "prompts": prompts}), encoding="utf-8"
+                )
+                output = root / "events.json"
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--max-tool-calls",
+                            "2",
+                            "--output",
+                            str(output),
+                            "--verbose",
+                            "1",
+                        ]
+                    )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(document["repo"], str(repository))
+                self.assertEqual(document["base_revision"], target.revision)
+                self.assertEqual((repository / "value.txt").read_text(), "1")
+                self.assertEqual((repository / "tracked.txt").read_text(), "modified\n")
+                self.assertFalse((repository / "removed.txt").exists())
+                for filename in ("tool_script.py", "tool_function_calls.bin"):
+                    self.assertEqual(
+                        (repository / filename).read_text(encoding="utf-8"), "Do not overwrite."
+                    )
+                self.assertEqual(stdout.getvalue(), "Updated the repository.\n" * 2)
+                for phase in (
+                    "[generate] prompt 1/2",
+                    "[generate] prompt 2/2",
+                    "[generate] resetting repository",
+                    "[harness] executing script 1/2",
+                    "[harness] script 2/2 finished: exit=0, timed_out=False",
+                    "[generate] collecting repository diff",
+                    "[generate] saving",
+                ):
+                    self.assertIn(phase, stderr.getvalue())
+                results = document["results"]
+                self.assertEqual(results[0]["diff"], results[1]["diff"])
+                self.assertEqual([entry["prompt"] for entry in results], prompts)
+                self.assertEqual([len(child.turns) for child in session.children], [3, 3])
+                for index, (entry, child) in enumerate(zip(results, session.children)):
+                    self.assertEqual(entry["tool_call_count"], 2)
+                    self.assertIsNone(entry["error"])
+                    self.assertIn(str(repository), child.turns[0][0])
+                    self.assertTrue(child.turns[0][0].endswith(prompts[index]))
+                    self.assertNotIn(prompts[1 - index], child.turns[0][0])
+                    self.assertIn("Remaining Python tool calls: 0", child.turns[-1][0])
+                    self.assertEqual(entry["tool_calls"][1]["stdout"], "1\n")
+                    self.assertIn("-original\n+modified\n", entry["diff"])
+                    self.assertIn("deleted file mode", entry["diff"])
+                    self.assertIn("new file mode", entry["diff"])
+                    self.assertIn("GIT binary patch", entry["diff"])
+                    self.assertNotIn("ignored.txt", entry["diff"])
+                    self.assertNotIn("initial dirty content", entry["diff"])
+                    for call in entry["tool_calls"]:
+                        self.assertEqual(call["cwd"], str(repository))
+                        self.assertNotEqual(Path(call["command"][-1]).parent, repository)
+                        self.assertFalse(Path(call["command"][-1]).exists())
+                self.assertEqual(
+                    target.git("diff", "--cached", "--name-only").strip(), "tracked.txt"
+                )
+                target.clean()
+                subprocess.run(
+                    ["git", "-C", str(repository), "apply", "--binary", "-"],
+                    input=results[0]["diff"].encode("utf-8", errors="surrogateescape"),
+                    check=True,
+                    capture_output=True,
+                )
+                self.assertEqual((repository / "tracked.txt").read_text(), "modified\n")
+                self.assertFalse((repository / "removed.txt").exists())
+                self.assertEqual((repository / "value.txt").read_text(), "1")
+                self.assertEqual((repository / "binary.bin").read_bytes(), b"\x00\xffpayload")
+                self.assertEqual((repository / "non_utf8.txt").read_bytes(), b"\xff\n")
+        finally:
+            del _session_cache[key]
+
+    def test_generate_json_exports_failure_before_stopping(self):
+        """Preserves changes and failure events without starting later prompts."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/scripted-json-failure"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = ScriptedSession(
+            [
+                (
+                    "<python>from pathlib import Path\n"
+                    "Path('changed.txt').write_text('kept')</python>"
+                ),
+                "<python>raise AssertionError('must not execute')</python>",
+            ]
+        )
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--max-tool-calls",
+                            "1",
+                            "-o",
+                            str(output),
+                        ]
+                    )
+                document = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(len(document["results"]), 1)
+                self.assertIn("budget exhausted", document["results"][0]["error"])
+                self.assertEqual(document["results"][0]["tool_call_count"], 1)
+                self.assertIn("+kept", document["results"][0]["diff"])
+                self.assertEqual(len(session.children), 1)
+                self.assertEqual((repository / "changed.txt").read_text(), "kept")
+        finally:
+            del _session_cache[key]
+
+    def test_repository_validation_before_cleanup(self):
+        """Protects input files, output files, and repository parents from cleanup."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            target = create_repository(repository)
+            (repository / "tracked.txt").write_text("must remain dirty")
+            for source, output in [
+                (repository / "tasks.json", root / "events.json"),
+                (root / "tasks.json", repository / "events.json"),
+            ]:
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["Prompt."]}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "outside the target repository"):
+                    main(["generate", "unused/model", "--input", str(source), "-o", str(output)])
+                self.assertEqual((repository / "tracked.txt").read_text(), "must remain dirty")
+            subdirectory = repository / "subdirectory"
+            subdirectory.mkdir()
+            with self.assertRaisesRegex(ValueError, "repository root"):
+                GitRepository(str(subdirectory))
+            target.git("checkout", "-b", "other")
+            with self.assertRaisesRegex(RuntimeError, "branch changed"):
+                target.clean()
+            self.assertEqual((repository / "tracked.txt").read_text(), "must remain dirty")
+
+    def test_repository_diff_without_changes(self):
+        """Returns an empty patch without changing the real Git index."""
+        with tempfile.TemporaryDirectory() as directory:
+            target = create_repository(Path(directory))
+            index = target.path / ".git" / "index"
+            before = index.read_bytes()
+            self.assertEqual(target.diff(), "")
+            self.assertEqual(index.read_bytes(), before)
+
+    def test_live_log_paths_are_validated_before_cleanup(self):
+        """Rejects log paths that would be deleted or corrupt input/output artifacts."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            create_repository(repository)
+            (repository / "tracked.txt").write_text("preserve dirty content")
+            source = root / "tasks.json"
+            source.write_text(
+                json.dumps({"repo": str(repository), "prompts": ["Prompt."]}), encoding="utf-8"
+            )
+            output = root / "events.json"
+            for path, error in [
+                (repository / "live.log", "outside the target repository"),
+                (source, "must differ"),
+                (output, "must differ"),
+            ]:
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(ValueError, error):
+                        main(
+                            [
+                                "generate",
+                                "unused/model",
+                                "--input",
+                                str(source),
+                                "--output",
+                                str(output),
+                                "--live-log",
+                                str(path),
+                            ]
+                        )
+                    self.assertEqual(
+                        (repository / "tracked.txt").read_text(), "preserve dirty content"
+                    )
+
+    def test_missing_working_directory(self):
+        """Rejects a missing working directory before starting the model."""
+        with tempfile.TemporaryDirectory() as directory:
+            session = ScriptedSession([])
+            with self.assertRaisesRegex(ValueError, "Working directory does not exist"):
+                PythonHarness().run(session, "Problem.", 100, directory=f"{directory}/missing")
+            self.assertEqual(session.turns, [])
+
+    def test_generate_cli_events_and_configurable_budget(self):
+        """Exports real file operations, all turns, and exhausted-budget errors."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        model_id = "test/scripted-harness-cli"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        write = "<python>from pathlib import Path\nPath('value.txt').write_text('42')</python>"
+        read = "<python>from pathlib import Path\nprint(Path('value.txt').read_text())</python>"
+        for harness, budget, responses, failed in [
+            (True, 100, [write] + [read] * 99 + ["The value is 42."], False),
+            (
+                True,
+                2,
+                [write, read, "<python>raise AssertionError('not executed')</python>"],
+                True,
+            ),
+            (False, 10, ["Plain answer."], False),
+        ]:
+            with self.subTest(harness=harness, budget=budget):
+                session = ScriptedSession(responses)
+                _session_cache[key] = session
+                try:
+                    with tempfile.TemporaryDirectory() as directory:
+                        output = os.path.join(directory, "events.json")
+                        args = ["generate", model_id, "Read and write a file.", "-o", output]
+                        if harness:
+                            args += ["--harness", "python", "--max-tool-calls", str(budget)]
+                        stdout = io.StringIO()
+                        with contextlib.redirect_stdout(stdout):
+                            if failed:
+                                with self.assertRaisesRegex(RuntimeError, "2 executions"):
+                                    main(args)
+                            else:
+                                main(args)
+                        with open(output, encoding="utf-8") as stream:
+                            document = json.load(stream)
+                finally:
+                    del _session_cache[key]
+                turns = session.children[0].turns
+                self.assertEqual(document["initial_prompt"], turns[0][0])
+                self.assertEqual(
+                    [
+                        event["content"]
+                        for event in document["events"]
+                        if event["type"] == "prompt"
+                    ],
+                    [turn[0] for turn in turns[1:]],
+                )
+                self.assertEqual(
+                    [
+                        event["content"]
+                        for event in document["events"]
+                        if event["type"] == "model_response"
+                    ],
+                    responses,
+                )
+                self.assertEqual(document["token_count"], 5 * len(responses))
+                if harness:
+                    self.assertIn(f"up to {budget} scripts", turns[0][0])
+                    self.assertNotIn("final function", turns[0][0])
+                    self.assertEqual(document["tool_call_count"], budget)
+                    self.assertEqual(document["tool_calls"][1]["stdout"], "42\n")
+                    self.assertEqual(
+                        len(
+                            [
+                                event
+                                for event in document["events"]
+                                if event["type"] == "process_exit"
+                            ]
+                        ),
+                        budget,
+                    )
+                    self.assertIn("Remaining Python tool calls: 0", turns[-1][0])
+                    self.assertEqual(turns[0][1]["max_new_tokens"], 1024)
+                else:
+                    self.assertEqual(document["tool_calls"], [])
+                    self.assertEqual(turns[0][1]["max_length"], 200)
+                if failed:
+                    self.assertIn("budget exhausted", document["error"])
+                    self.assertEqual(stdout.getvalue(), "")
+                else:
+                    self.assertIsNone(document["error"])
+                    self.assertEqual(document["text"], responses[-1])
+                    self.assertEqual(stdout.getvalue().strip(), responses[-1])
+
+    def test_invalid_budget(self):
+        """Rejects nonpositive and noninteger script budgets."""
+        for budget in (0, -1, 1.5, True):
+            with (
+                self.subTest(budget=budget),
+                self.assertRaisesRegex(ValueError, "positive integer"),
+            ):
+                PythonHarness(max_tool_calls=budget)
+
     def test_tool_feedback_and_benchmark_exports(self):
         """Checks real script execution, feedback, scoring, and exported counts."""
         session = ScriptedSession(
@@ -501,6 +1138,11 @@ class TestPythonHarness(unittest.TestCase):
         """Reports malformed and empty turns without executing incomplete scripts."""
         for response, error in [
             ("<python>print(42)", "Malformed"),
+            (
+                "I will inspect the repository.\n<python>\n" + "print('files')\n" * 1000,
+                "Malformed",
+            ),
+            ("Here is a request.\n<tool_call><function=python>", "native Python tool call"),
             ("<think><python>print(42)</python>", "empty answer"),
             ("", "empty answer"),
         ]:
@@ -510,6 +1152,14 @@ class TestPythonHarness(unittest.TestCase):
                 )
                 self.assertEqual(len(result.tool_calls), 0)
                 self.assertIn(error, result.error)
+                self.assertEqual(result.text, "")
+
+    def test_literal_tool_tags_in_final_markdown_are_not_requests(self):
+        """Accepts a final code block containing literal tool markers."""
+        final = '```python\nprint("<python>")\n```'
+        result = PythonHarness().run(ScriptedSession([final]), "Problem.", 100)
+        self.assertEqual(result.text, final)
+        self.assertIsNone(result.error)
 
     def test_script_error_and_output_truncation(self):
         """Captures script failures and bounds the output sent to the model."""
