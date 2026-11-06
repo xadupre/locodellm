@@ -137,6 +137,27 @@ python -m locodellm generate Qwen/Qwen3.5-0.8B \
 The initial instructions advertise only Bash. Python tool requests are rejected;
 this is not isolation, since Bash commands can still launch Python.
 
+With PyTorch and a native Qwen3-Coder-compatible chat template (including
+Nemotron), the harness automatically declares the allowed functions and uses
+native `<tool_call>` requests instead of advertising custom script tags:
+
+```xml
+<tool_call>
+<function=bash>
+<parameter=command>git status --short</parameter>
+</function>
+</tool_call>
+```
+
+Bash takes the required string parameter `command`; Python takes `code`.
+Execution results are returned as native tool messages and recorded in the trace.
+Unknown functions, extra or duplicate parameters, incomplete calls, and empty
+scripts are rejected without executing any command from that turn. Existing
+`<bash>`/`<python>` requests remain supported. Explicit `--chat-template chatml`
+keeps the existing tag-based prompting instead of native tool declarations.
+For Nemotron, omit that option and use `--temperature 1` to follow NVIDIA's
+recommended sampling; the checkpoint supplies `top_p=0.95`.
+
 Add `--live-log` to create a retained temporary transcript, or choose its path:
 
 ```bash

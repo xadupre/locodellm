@@ -92,6 +92,24 @@ class PyTorchSessionState(SessionState):
     ) -> None:
         super().__init__(model, tokenizer, verbose=verbose, chat_template=chat_template)
         self.messages: list[dict[str, str]] = []
+        self.tools: list[dict[str, Any]] = []
+
+    def configure_tools(self, tools: list[dict[str, Any]]) -> bool:
+        """Enables declared tools for native Qwen3-Coder-compatible templates."""
+        self.tools = []
+        if self._chat_template is not None or not self.tokenizer.chat_template:
+            return False
+        template = self.tokenizer.get_chat_template(tools=tools)
+        if "<tool_call>" not in template or "<function=" not in template:
+            return False
+        self.tools = tools
+        return True
+
+    def add_tool_result(self, name: str, content: str) -> None:
+        """Appends a native tool response after the assistant's execution request."""
+        if not self.tools:
+            raise ValueError("Native tools have not been configured for this session.")
+        self.messages.append({"role": "tool", "name": name, "content": content})
 
     def new_session(self) -> PyTorchSessionState:
         """Returns an empty conversation sharing the loaded model and tokenizer."""
@@ -107,6 +125,7 @@ class PyTorchSessionState(SessionState):
             [*self.messages, {"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
+            **({"tools": self.tools} if self.tools else {}),
         )
 
     def _encode_context(self, prompt: str) -> numpy.ndarray:

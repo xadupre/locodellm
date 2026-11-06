@@ -22,11 +22,17 @@ from locodellm.generate.live_log import LiveLog
 _PYTHON_CALL = re.compile(
     r"```.*?```|<python>\s*(.*?)\s*</python>"
     r"|<tool_call>\s*<function=(?:stateful_python_code_exec|python)>\s*"
-    r"<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>"
+    r"<parameter=code>\s*((?:(?!</?parameter(?:=|>)).)*?)"
+    r"\s*</parameter>\s*</function>\s*</tool_call>"
     r"|\A<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>\Z",
     re.DOTALL,
 )
-_SCRIPT_CALL = re.compile(_PYTHON_CALL.pattern + r"|<bash>\s*(.*?)\s*</bash>", re.DOTALL)
+_SCRIPT_CALL = re.compile(
+    _PYTHON_CALL.pattern + r"|<bash>\s*(.*?)\s*</bash>"
+    r"|<tool_call>\s*<function=bash>\s*<parameter=command>\s*"
+    r"((?:(?!</?parameter(?:=|>)).)*?)\s*</parameter>\s*</function>\s*</tool_call>",
+    re.DOTALL,
+)
 _TOOL_MARKER = re.compile(
     r"```.*?```|(?P<python></?python\b)|(?P<bash></?bash\b)|(?P<native></?tool_call\b)", re.DOTALL
 )
@@ -110,7 +116,7 @@ def extract_python_calls(text: str) -> list[str]:
 def extract_script_calls(text: str) -> list[tuple[str, str]]:
     """Extracts ordered Python and Bash requests outside thinking and Markdown."""
     return [
-        ("bash" if index == 3 else "python", code)
+        ("bash" if index in (3, 4) else "python", code)
         for match in _SCRIPT_CALL.finditer(strip_thinking(text))
         for index, code in enumerate(match.groups())
         if code is not None
@@ -342,6 +348,41 @@ class PythonHarness:
             "Report only confirmed results; do not invent unexecuted failures. "
             f"To finish, {final_answer_instructions}"
         )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"Executes {label} in the repository working directory.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {parameter: {"type": "string"}},
+                        "required": [parameter],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+            for name, label, parameter in (
+                [("bash", "Bash commands", "command")]
+                if self.bash_only
+                else [("python", "a Python script", "code"), ("bash", "Bash commands", "command")]
+            )
+        ]
+        configure_tools = getattr(session, "configure_tools", None)
+        native_tools = configure_tools(tools) if configure_tools is not None else False
+        request_format = (
+            "<tool_call><function=bash><parameter=command>YOUR COMMAND"
+            "</parameter></function></tool_call>"
+            if native_tools
+            else "<bash>YOUR COMMAND</bash>"
+        )
+        if not self.bash_only:
+            request_format += (
+                " or <tool_call><function=python><parameter=code>YOUR CODE"
+                "</parameter></function></tool_call>"
+                if native_tools
+                else " or <python>YOUR CODE</python>"
+            )
 
         def stop_for_timeout() -> HarnessResult:
             result.timed_out = True
@@ -364,30 +405,47 @@ class PythonHarness:
 
         if self.live_log is not None:
             session.live_log = self.live_log
+        tool_instructions = (
+            "You may use only the Bash tool to solve the task before answering.\n"
+            "To call it, reply with one or more <bash>...</bash> blocks "
+            "containing Bash commands.\nPython tool requests are disabled."
+            if self.bash_only
+            else (
+                "You may use Python and Bash tools to solve the task before answering.\n"
+                "Reply with one or more <python>...</python> blocks containing "
+                "Python scripts, or <bash>...</bash> blocks containing Bash commands.\n"
+                "Python and Bash share the same execution budget and working directory."
+            )
+        )
+        tool_rules = (
+            "Every <bash>...</bash> block is an execution request, never a final answer."
+            if self.bash_only
+            else (
+                "Every <python>...</python> or <bash>...</bash> block is an execution "
+                "request, never a final answer.\n"
+                "A function definition alone does not call it or print anything.\n"
+                "Include calls and print or assert statements to check your solution."
+            )
+        )
+        if native_tools:
+            tool_instructions = (
+                (
+                    "You may use only the Bash tool to solve the task before answering.\n"
+                    "Python tool requests are disabled.\n"
+                    if self.bash_only
+                    else "You may use Python and Bash tools to solve the task before answering.\n"
+                )
+                + f"The tools are declared in the native chat template. Use {request_format}.\n"
+                "Do not use Markdown fences or <bash>/<python> wrappers for tool calls."
+            )
+            tool_rules = (
+                "Every <tool_call>...</tool_call> block is an execution request, "
+                "never a final answer."
+            )
         message = (
             _INSTRUCTIONS.format(
-                tool_instructions=(
-                    "You may use only the Bash tool to solve the task before answering.\n"
-                    "To call it, reply with one or more <bash>...</bash> blocks "
-                    "containing Bash commands.\nPython tool requests are disabled."
-                    if self.bash_only
-                    else (
-                        "You may use Python and Bash tools to solve the task before answering.\n"
-                        "Reply with one or more <python>...</python> blocks containing "
-                        "Python scripts, or <bash>...</bash> blocks containing Bash commands.\n"
-                        "Python and Bash share the same execution budget and working directory."
-                    )
-                ),
-                tool_rules=(
-                    "Every <bash>...</bash> block is an execution request, never a final answer."
-                    if self.bash_only
-                    else (
-                        "Every <python>...</python> or <bash>...</bash> block is an execution "
-                        "request, never a final answer.\n"
-                        "A function definition alone does not call it or print anything.\n"
-                        "Include calls and print or assert statements to check your solution."
-                    )
-                ),
+                tool_instructions=tool_instructions,
+                tool_rules=tool_rules,
                 max_tool_calls=self.max_tool_calls,
                 final_answer_instructions=final_answer_instructions,
                 working_directory_instructions=(
@@ -478,13 +536,18 @@ class PythonHarness:
                     ),
                     None,
                 )
-                if marker is not None and marker.lastgroup is not None:
+                empty_call = any(not code.strip() for _, code in calls)
+                if empty_call or (marker is not None and marker.lastgroup is not None):
                     reasons = {
                         "python": "Malformed Python tool call; expected <python>...</python>.",
                         "bash": "Malformed Bash tool call; expected <bash>...</bash>.",
                         "native": "Unsupported or malformed native tool call.",
                     }
-                    reason = reasons[marker.lastgroup]
+                    if empty_call:
+                        reason = "Empty tool call; a nonempty command or script is required."
+                    else:
+                        assert marker is not None and marker.lastgroup is not None
+                        reason = reasons[marker.lastgroup]
                     exhausted = protocol_retries >= max_protocol_retries
                     result.interactions.append(
                         {
@@ -510,18 +573,18 @@ class PythonHarness:
                     protocol_retries += 1
                     message = (
                         f"{reason} No command from your preceding response was executed. "
-                        "Do not use <tool_call>, <function=...>, or <parameter=...> tags. "
+                        + (
+                            "Use only the declared functions and their required parameter. "
+                            if native_tools
+                            else (
+                                "Do not use <tool_call>, <function=...>, "
+                                "or <parameter=...> tags. "
+                            )
+                        )
                         + (
                             final_message
                             if finalizing
-                            else (
-                                "Reissue the request as <bash>YOUR COMMAND</bash>."
-                                if self.bash_only
-                                else (
-                                    "Reissue the request as <bash>YOUR COMMAND</bash> "
-                                    "or <python>YOUR CODE</python>."
-                                )
-                            )
+                            else f"Reissue the request as {request_format}."
                         )
                     )
                     continue
@@ -609,8 +672,13 @@ class PythonHarness:
                         f"timed out: {execution.timed_out}\n"
                         f"Function calls executed: {execution.function_call_count}."
                     )
+                    if native_tools:
+                        session.add_tool_result(tool, feedback[-1])
+                        result.interactions.append(
+                            {"type": "tool_result", "tool": tool, "content": feedback[-1]}
+                        )
                 remaining = self.max_tool_calls - len(result.tool_calls)
-                message = "\n\n".join(feedback) + (
+                message = ("" if native_tools else "\n\n".join(feedback)) + (
                     "\n"
                     f"Remaining {budget_label} tool calls: {remaining}.\n"
                     "The preceding tool requests were executed, not accepted as a final "
@@ -620,6 +688,11 @@ class PythonHarness:
                     "Answer WITHOUT <python> or </python> tags. Otherwise make "
                     "another allowed tool call with your own checks. "
                     "Do not include <bash> or </bash> tags in the final answer. "
+                    + (
+                        "Do not include <tool_call> tags in the final answer. "
+                        if native_tools
+                        else ""
+                    )
                     + (
                         "Only Bash tool requests are allowed."
                         if self.bash_only

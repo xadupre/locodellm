@@ -1499,7 +1499,7 @@ class TestPythonHarness(unittest.TestCase):
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_native_bash_request_is_reissued_without_executing_rejected_commands(self):
         """Recovers native Bash requests through explicit feedback instead of guessing syntax."""
-        for parameter in ("printf ignored > forbidden.txt", "command"):
+        for parameter in ("printf ignored > forbidden.txt", "commands"):
             malformed = (
                 "<think>Inspect the repository.</think>"
                 "<tool_call><function=bash>"
@@ -1536,6 +1536,58 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(rejected[0]["executed_tool_call_count"], 0)
                 self.assertEqual(rejected[0]["retry"], 1)
                 self.assertFalse(rejected[0]["retry_exhausted"])
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_native_bash_and_python_requests_preserve_execution_order(self):
+        """Executes native commands verbatim and returns their real outputs in order."""
+        bash = (
+            "<tool_call>\n<function=bash>\n<parameter=command>\n"
+            "cat > value.txt <<'EOF'\n42\nEOF\n"
+            "if [ 1 -lt 2 ]; then printf '<think>literal</think>\\n'; fi\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        python = (
+            "<tool_call><function=python><parameter=code>"
+            "from pathlib import Path\nprint(Path('value.txt').read_text().strip())"
+            "</parameter></function></tool_call>"
+        )
+        response = f"```text\n{bash}\n```\n{bash}\n{python}"
+        session = ScriptedSession([response, "Done."])
+        result = PythonHarness(max_tool_calls=2).run(session, "Inspect.", 100)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.text, "Done.")
+        self.assertEqual([call.tool for call in result.tool_calls], ["bash", "python"])
+        self.assertEqual(
+            [call.stdout for call in result.tool_calls], ["<think>literal</think>\n", "42\n"]
+        )
+        self.assertEqual(extract_script_calls(response)[0][0], "bash")
+        self.assertLess(session.turns[1][0].index("literal"), session.turns[1][0].index("42"))
+
+    def test_invalid_native_parameters_and_empty_scripts_reject_entire_turn(self):
+        """Rejects unknown, duplicate, incomplete and empty requests before any execution."""
+        native = (
+            "<tool_call><function=bash><parameter=command>"
+            "touch forbidden.txt</parameter></function></tool_call>"
+        )
+        for request in [
+            native.replace("function=bash", "function=unknown"),
+            native.replace("parameter=command", "parameter=code"),
+            native.replace(
+                "</parameter>", "</parameter><parameter=command>touch other.txt</parameter>"
+            ),
+            native.replace("</parameter>", "</parameter><parameter=timeout>10</parameter>"),
+            native.removesuffix("</tool_call>"),
+            native.replace("touch forbidden.txt", " \n "),
+            "<bash> \n </bash>",
+            "<python> \n </python>",
+        ]:
+            with self.subTest(request=request), tempfile.TemporaryDirectory() as directory:
+                result = PythonHarness().run(
+                    ScriptedSession([native + request] * 3), "Inspect.", 100, directory=directory
+                )
+                self.assertTrue(result.protocol_error)
+                self.assertEqual(result.tool_calls, [])
+                self.assertFalse((Path(directory) / "forbidden.txt").exists())
 
     def test_literal_tool_tags_in_final_markdown_are_not_requests(self):
         """Accepts a final code block containing literal tool markers."""
