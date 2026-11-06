@@ -221,7 +221,13 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         _run_generate(args, stack)
 
 
-def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
+def _run_generate(
+    args: argparse.Namespace,
+    stack: ExitStack,
+    *,
+    final_answer_after: float = 360,
+    max_duration: float = 480,
+) -> None:
     """Runs generation while keeping the optional live transcript open."""
     if args.verbose:
         print(
@@ -305,8 +311,8 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
                 max_length=max_length,
                 final_answer_instructions="return your final answer without a tool call.",
                 directory=repository,
-                final_answer_after=360,
-                max_duration=480,
+                final_answer_after=final_answer_after,
+                max_duration=max_duration,
                 **search_options,
             )
         else:
@@ -327,6 +333,7 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
             "tool_call_count": len(result.tool_calls),
             "tool_calls": [asdict(call) for call in result.tool_calls],
             "error": result.error,
+            "timed_out": result.timed_out,
         }
         if target is not None:
             if args.verbose:
@@ -346,6 +353,16 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
             Path(args.output).write_text(
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
+        if result.timed_out:
+            if live_log is not None:
+                live_log.section("problem timeout", f"{result.error}")
+            print(
+                f"[generate] prompt {prompt_index}/{len(prompts)} timed out: "
+                f"{result.error} Continuing the batch.",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         if result.error:
             if live_log is not None:
                 live_log.section("harness error", result.error)

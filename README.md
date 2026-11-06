@@ -45,8 +45,11 @@ are recorded in the exported conversation events.
 
 With `--harness`, each problem gets six minutes to explore, followed by a
 request to write the final answer without further tool calls. At eight
-minutes, generation stops and the command exports the partial trace and
-repository diff before reporting a timeout. The budget starts after model
+minutes, generation stops for that problem, the command exports its partial
+trace and repository diff, and the batch continues with the next problem.
+The result has `timed_out: true` and an explicit `time_limit` event with the
+elapsed time and limit. Other harness errors still stop the batch.
+The budget starts after model
 loading and repository cleanup, and resets for each problem. Generation
 stops at token boundaries; script timeouts are capped by the remaining budget.
 

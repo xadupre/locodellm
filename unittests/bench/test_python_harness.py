@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -10,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
-from locodellm.__main__ import _compute_case_stats, main
+from locodellm.__main__ import _compute_case_stats, _run_generate, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
 from locodellm.bench.python_harness import (
     PythonHarness,
@@ -43,6 +44,20 @@ class ScriptedSession:
         self.text = self.responses[len(self.turns)]
         self.turns.append((prompt, options))
         self.generated_token_count = 5
+
+
+class TimeLimitedSession(ScriptedSession):
+    """Delays selected model turns until their generation budget expires."""
+
+    def __init__(self, responses, fast_turns=0):
+        super().__init__(responses)
+        self.fast_turns = fast_turns
+
+    def generate(self, prompt, **options):
+        """Emits a partial response after the requested generation time limit."""
+        if len(self.turns) >= self.fast_turns:
+            time.sleep(options["max_time"] + 0.01)
+        super().generate(prompt, **options)
 
 
 def create_repository(directory):
@@ -128,12 +143,7 @@ class TestPythonHarness(unittest.TestCase):
     def test_time_budget_interrupts_generation(self):
         """Requests finalization after a slow turn and records an overdue partial answer."""
 
-        class SlowSession(ScriptedSession):
-            def generate(self, prompt, **options):
-                time.sleep(options["max_time"] + 0.01)
-                super().generate(prompt, **options)
-
-        session = SlowSession(["Partial exploration.", "Partial final answer."])
+        session = TimeLimitedSession(["Partial exploration.", "Partial final answer."])
         started_at = time.monotonic()
         result = PythonHarness().run(
             session, "Find failures.", max_length=100, final_answer_after=0.03, max_duration=0.15
@@ -146,6 +156,9 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(result.token_count, 10)
         self.assertEqual(result.tool_calls, [])
         self.assertEqual(result.interactions[-1]["type"], "time_limit")
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.interactions[-1]["timed_out"])
+        self.assertEqual(result.interactions[-1]["limit_seconds"], 0.15)
         self.assertTrue(
             any(
                 event["type"] == "model_response" and event["content"] == result.text
@@ -570,6 +583,95 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual((repository / "value.txt").read_text(), "1")
                 self.assertEqual((repository / "binary.bin").read_bytes(), b"\x00\xffpayload")
                 self.assertEqual((repository / "non_utf8.txt").read_bytes(), b"\xff\n")
+        finally:
+            del _session_cache[key]
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_generate_batch_continues_after_problem_timeout(self):
+        """Exports an explicit timeout and partial diff before running the next prompt."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates a slow first conversation and a successful second one."""
+                child = (
+                    TimeLimitedSession(
+                        [
+                            "<bash>printf first > first.txt</bash>",
+                            "Partial exploration.",
+                            "Partial final answer.",
+                        ],
+                        fast_turns=1,
+                    )
+                    if not self.children
+                    else ScriptedSession(["Second answer."])
+                )
+                self.children.append(child)
+                return child
+
+        model_id = "test/time-limited-batch"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = BatchSession([])
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                log = root / "live.log"
+                args = argparse.Namespace(
+                    model=model_id,
+                    input=str(source),
+                    repo=None,
+                    clone_dir="clones",
+                    prompt=None,
+                    output=str(output),
+                    live_log=str(log),
+                    verbose=0,
+                    backend="onnx",
+                    device=None,
+                    precision=None,
+                    provider=None,
+                    chat_template=None,
+                    max_length=100,
+                    max_tool_calls=100,
+                    harness="bash",
+                    temperature=0,
+                )
+                with (
+                    contextlib.ExitStack() as stack,
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    _run_generate(args, stack, final_answer_after=0.5, max_duration=0.8)
+                results = json.loads(output.read_text(encoding="utf-8"))["results"]
+                self.assertEqual(len(results), 2)
+                first, second = results
+                self.assertTrue(first["timed_out"])
+                self.assertIn("Problem time limit reached", first["error"])
+                self.assertEqual(first["text"], "Partial final answer.")
+                self.assertIn("+first", first["diff"])
+                timeout = first["events"][-1]
+                self.assertEqual(timeout["type"], "time_limit")
+                self.assertTrue(timeout["timed_out"])
+                self.assertEqual(timeout["limit_seconds"], 0.8)
+                self.assertGreaterEqual(timeout["elapsed_seconds"], 0.8)
+                self.assertFalse(second["timed_out"])
+                self.assertIsNone(second["error"])
+                self.assertEqual(second["text"], "Second answer.")
+                self.assertEqual(second["diff"], "")
+                self.assertEqual(len(session.children), 2)
+                self.assertFalse((repository / "first.txt").exists())
+                self.assertEqual(stdout.getvalue().strip(), "Second answer.")
+                self.assertIn("Continuing the batch", stderr.getvalue())
+                self.assertIn("[problem timeout]", log.read_text())
         finally:
             del _session_cache[key]
 

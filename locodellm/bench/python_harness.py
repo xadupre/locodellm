@@ -98,6 +98,7 @@ class HarnessResult:
     tool_calls: list[PythonToolResult] = field(default_factory=list)
     interactions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    timed_out: bool = False
 
 
 def extract_python_calls(text: str) -> list[str]:
@@ -340,11 +341,14 @@ class PythonHarness:
         )
 
         def stop_for_timeout() -> HarnessResult:
+            result.timed_out = True
             result.error = f"Problem time limit reached ({max_duration:g}s)."
             result.text = strip_thinking(session.text)
             result.interactions.append(
                 {
                     "type": "time_limit",
+                    "timed_out": True,
+                    "limit_seconds": max_duration,
                     "elapsed_seconds": time.monotonic() - started_at,
                     "error": result.error,
                 }
