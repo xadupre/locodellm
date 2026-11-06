@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -19,6 +20,42 @@ class GitRepository:
             raise ValueError(f"'repo' must be the Git repository root: {root}")
         self.revision = self.git("rev-parse", "--verify", "HEAD").strip()
         self.branch = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+
+    @classmethod
+    def clone(
+        cls, url: str, directory: str, revision: str | None = None, verbose: int = 0
+    ) -> GitRepository:
+        """Clones into a fresh retained directory, optionally at a recorded commit."""
+        root = Path(directory).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        destination = tempfile.mkdtemp(prefix="run-", dir=root)
+        if verbose:
+            print(f"[generate] cloning {url!r} into {destination}", file=sys.stderr, flush=True)
+        environment = os.environ.copy()
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+            environment.pop(key, None)
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        try:
+            subprocess.run(
+                ["git", "-c", "protocol.ext.allow=never", "clone", "--", url, destination],
+                env=environment,
+                capture_output=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+                check=True,
+                timeout=600,
+            )
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"Cloning {url!r} into {destination} failed: {error.stderr.strip()}"
+            ) from error
+        target = cls(destination)
+        if revision is not None:
+            if verbose:
+                print(f"[generate] checking out {revision}", file=sys.stderr, flush=True)
+            target.git("checkout", "--detach", revision)
+            target = cls(destination)
+        return target
 
     def git(self, *arguments: str, index_file: str | None = None) -> str:
         """Runs Git against the target repository and reports command failures."""

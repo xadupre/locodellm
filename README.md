@@ -77,8 +77,9 @@ Output contains the resolved `repo`, `base_revision`, and a `results` list with
 each prompt's events, final answer, and `diff`, saved before the next cleanup.
 The patch includes modified, deleted, staged, and new nonignored files, including
 binary changes. Execution stops at the first harness error after exporting its
-events and diff. The last prompt's changes remain on disk. No clone or commit
-is performed. Scripts run with your permissions, without a sandbox.
+events and diff. The last prompt's changes remain on disk. JSON batches use
+the existing repository without cloning; no commit is performed.
+Scripts run with your permissions, without a sandbox.
 
 For native Transformers weights instead of ONNX, add ``--backend pytorch``
 and choose a device:
@@ -136,7 +137,7 @@ target repository. Temporary logs are retained after the run for inspection.
 
 ### ATen failure-discovery datasets
 
-`datasets/aten_failures_set_1.jsonl` and `datasets/aten_failures_set_2.jsonl`
+`datasets/yobx/aten_failures_set_1.jsonl` and `datasets/yobx/aten_failures_set_2.jsonl`
 contain 8 converter-discovery tasks each, covering 16 ATen
 functions in `xadupre/yet-another-onnx-builder`. Related dispatchers and helpers
 stay together; the sets share no functions, source issues, or reference examples.
@@ -170,9 +171,31 @@ Use the dependency versions in `verification.environment` and account for
 the commit alone does not reproduce the embedding-bag value mismatches.
 
 Only send `prompt` to the model; keep `expected_answer` and issue links with the
-evaluator. These JSONL files are evaluation data, not executable task files.
-Load one JSON object per line and extract only its `prompt` when preparing
-model inputs.
+evaluator. `generate` accepts these datasets directly and clones their
+`repository` at `verification.revision` before loading the model:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.8-27B \
+  --input datasets/yobx/aten_failures_set_2.jsonl --clone-dir ./clones \
+  --backend pytorch --device cuda --chat-template chatml --harness bash \
+  --max-tool-calls 100 --max-length 16000 --temperature 0 \
+  --output events.json --live-log live.log --verbose 1
+```
+
+`--clone-dir` defaults to `./clones`. Each run creates a fresh `run-*`
+subdirectory, retained afterwards; it never reuses or cleans an existing
+working tree. The resolved clone path and starting commit are recorded in the
+output JSON. Records must share the same repository and revision. When no
+revision is recorded, the clone uses the repository's default branch.
+
+Only each record's `prompt` is sent to the model; reference answers and other
+dataset metadata are not included. Blank lines are ignored. To use an existing
+repository instead, pass `--repo PATH` instead of `--clone-dir`. Relative paths
+are resolved from the current directory. JSON input keeps its existing
+`{"repo": "...", "prompts": [...]}` format.
+The selected repository is reset and nonignored untracked files are removed
+before every prompt. Keep the dataset, output, and live log outside that
+repository. No dependencies are installed in the clone.
 
 ### Python API
 

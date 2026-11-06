@@ -56,6 +56,9 @@ dmypy.json
 .idea/
 .vscode/
 
+# Generated repository clones
+/clones/
+
 # Generated model weights (sphinx-gallery examples)
 docs/examples/arnir0_*/
 docs/examples/Beebey_*/

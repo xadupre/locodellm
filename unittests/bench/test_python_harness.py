@@ -125,7 +125,7 @@ class TestPythonHarness(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_bash_only_cli_json_input(self):
-        """Preserves explicit Bash-only mode for JSON batches and executes real commands."""
+        """Executes Bash-only JSON and JSONL batches without exposing reference answers."""
         from locodellm.generate.generate_from_model import _session_cache
 
         model_id = "test/bash-only-cli"
@@ -139,39 +139,73 @@ class TestPythonHarness(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 repository = root / "repo"
-                create_repository(repository)
-                source = root / "tasks.json"
-                source.write_text(
-                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
-                    encoding="utf-8",
-                )
+                original = create_repository(repository)
                 output = root / "events.json"
-                with contextlib.redirect_stdout(io.StringIO()):
-                    main(
-                        [
-                            "generate",
-                            model_id,
-                            "--input",
-                            str(source),
-                            "--harness",
-                            "bash",
-                            "--max-tool-calls",
-                            "1",
-                            "--output",
-                            str(output),
-                        ]
+                for format_name in ("json", "jsonl", "jsonl-clone"):
+                    source = root / ("tasks.json" if format_name == "json" else "tasks.jsonl")
+                    prompts = ["First.", "Second."]
+                    content = (
+                        json.dumps({"repo": str(repository), "prompts": prompts})
+                        if format_name == "json"
+                        else "\n".join(
+                            json.dumps(
+                                {
+                                    "prompt": prompt,
+                                    "repository": str(repository),
+                                    "verification": {"revision": original.revision},
+                                    "expected_answer": "HIDDEN REFERENCE",
+                                }
+                            )
+                            for prompt in prompts
+                        )
                     )
-                document = json.loads(output.read_text(encoding="utf-8"))
-                self.assertEqual(len(document["results"]), 2)
-                for result, child in zip(document["results"], session.children):
-                    self.assertIsNone(result["error"])
-                    self.assertIn("only the Bash tool", result["initial_prompt"])
-                    self.assertNotIn("<python>", result["initial_prompt"])
-                    self.assertIn("Remaining Bash tool calls: 0", child.turns[1][0])
-                    self.assertIn("Only Bash tool requests are allowed.", child.turns[1][0])
-                    self.assertEqual(result["tool_calls"][0]["tool"], "bash")
-                    self.assertEqual(result["tool_calls"][0]["stdout"], "42")
-                    self.assertIn("+42", result["diff"])
+                    source.write_text(content, encoding="utf-8")
+                    session.children.clear()
+                    repo_options = (
+                        ["--clone-dir", str(root / "clones")]
+                        if format_name == "jsonl-clone"
+                        else (["--repo", str(repository)] if format_name == "jsonl" else [])
+                    )
+                    with (
+                        self.subTest(format_name=format_name),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        main(
+                            [
+                                "generate",
+                                model_id,
+                                "--input",
+                                str(source),
+                                *repo_options,
+                                "--harness",
+                                "bash",
+                                "--max-tool-calls",
+                                "1",
+                                "--output",
+                                str(output),
+                            ]
+                        )
+                    document = json.loads(output.read_text(encoding="utf-8"))
+                    if format_name == "jsonl-clone":
+                        self.assertEqual(Path(document["repo"]).parent, root / "clones")
+                        self.assertTrue(Path(document["repo"]).is_dir())
+                    else:
+                        self.assertEqual(document["repo"], str(repository))
+                    self.assertEqual(document["base_revision"], original.revision)
+                    self.assertEqual(len(document["results"]), 2)
+                    for result, child, prompt in zip(
+                        document["results"], session.children, prompts
+                    ):
+                        self.assertEqual(result["prompt"], prompt)
+                        self.assertIsNone(result["error"])
+                        self.assertIn("only the Bash tool", result["initial_prompt"])
+                        self.assertNotIn("<python>", result["initial_prompt"])
+                        self.assertNotIn("HIDDEN REFERENCE", result["initial_prompt"])
+                        self.assertIn("Remaining Bash tool calls: 0", child.turns[1][0])
+                        self.assertIn("Only Bash tool requests are allowed.", child.turns[1][0])
+                        self.assertEqual(result["tool_calls"][0]["tool"], "bash")
+                        self.assertEqual(result["tool_calls"][0]["stdout"], "42")
+                        self.assertIn("+42", result["diff"])
         finally:
             del _session_cache[key]
 
@@ -532,6 +566,49 @@ class TestPythonHarness(unittest.TestCase):
             before = index.read_bytes()
             self.assertEqual(target.diff(), "")
             self.assertEqual(index.read_bytes(), before)
+
+    def test_repository_clones_are_fresh_and_pinned(self):
+        """Clones recorded commits or HEAD without reusing or changing the source tree."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = create_repository(root / "source")
+            (source.path / "tracked.txt").write_text("updated\n")
+            source.git(
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-am",
+                "Update tracked file",
+            )
+            head = source.git("rev-parse", "HEAD").strip()
+            (source.path / "tracked.txt").write_text("preserve dirty content")
+            (source.path / "untracked.txt").write_text("preserve untracked content")
+            clone_directory = str(root / "clones")
+            pinned = GitRepository.clone(
+                str(source.path), clone_directory, revision=source.revision
+            )
+            current = GitRepository.clone(str(source.path), clone_directory)
+            self.assertNotEqual(pinned.path, current.path)
+            self.assertEqual(pinned.path.parent, root / "clones")
+            self.assertEqual(pinned.revision, source.revision)
+            self.assertEqual(current.revision, head)
+            self.assertEqual((pinned.path / "tracked.txt").read_text(), "original\n")
+            self.assertEqual((current.path / "tracked.txt").read_text(), "updated\n")
+            pinned.clean()
+            self.assertEqual((source.path / "tracked.txt").read_text(), "preserve dirty content")
+            self.assertEqual(
+                (source.path / "untracked.txt").read_text(), "preserve untracked content"
+            )
+            with self.assertRaisesRegex(RuntimeError, "Cloning .* failed"):
+                GitRepository.clone(str(root / "missing"), clone_directory)
+            with self.assertRaisesRegex(RuntimeError, "Git checkout .* failed"):
+                GitRepository.clone(str(source.path), clone_directory, revision="a" * 40)
 
     def test_live_log_paths_are_validated_before_cleanup(self):
         """Rejects log paths that would be deleted or corrupt input/output artifacts."""
