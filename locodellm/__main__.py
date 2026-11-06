@@ -334,6 +334,7 @@ def _run_generate(
             "tool_calls": [asdict(call) for call in result.tool_calls],
             "error": result.error,
             "timed_out": result.timed_out,
+            "protocol_error": result.protocol_error,
         }
         if target is not None:
             if args.verbose:
@@ -353,11 +354,15 @@ def _run_generate(
             Path(args.output).write_text(
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
-        if result.timed_out:
+        if result.timed_out or result.protocol_error:
+            reason = "timed out" if result.timed_out else "has an invalid tool protocol"
             if live_log is not None:
-                live_log.section("problem timeout", f"{result.error}")
+                live_log.section(
+                    "problem timeout" if result.timed_out else "problem protocol error",
+                    f"{result.error}",
+                )
             print(
-                f"[generate] prompt {prompt_index}/{len(prompts)} timed out: "
+                f"[generate] prompt {prompt_index}/{len(prompts)} {reason}: "
                 f"{result.error} Continuing the batch.",
                 file=sys.stderr,
                 flush=True,

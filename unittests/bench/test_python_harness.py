@@ -413,7 +413,7 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIn("budget exhausted", result.error)
         for response in ("Some prose.\n<bash>ls", "Some prose.\n</bash>"):
             with self.subTest(response=response):
-                result = PythonHarness().run(ScriptedSession([response]), "Problem.", 100)
+                result = PythonHarness().run(ScriptedSession([response] * 3), "Problem.", 100)
                 self.assertIn("Malformed Bash", result.error)
                 self.assertEqual(result.tool_calls, [])
         final = '```bash\nprintf "<bash>"\n```'
@@ -672,6 +672,75 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(stdout.getvalue().strip(), "Second answer.")
                 self.assertIn("Continuing the batch", stderr.getvalue())
                 self.assertIn("[problem timeout]", log.read_text())
+        finally:
+            del _session_cache[key]
+
+    def test_generate_batch_continues_after_protocol_retries_are_exhausted(self):
+        """Exports repeated tool-format rejections and proceeds to the next problem."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        request = (
+            "<tool_call><function=bash>"
+            "<parameter=printf forbidden>ignored</parameter></function></tool_call>"
+        )
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates a malformed conversation followed by a successful one."""
+                child = ScriptedSession([request] * 3 if not self.children else ["Done."])
+                self.children.append(child)
+                return child
+
+        model_id = "test/protocol-error-batch"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = BatchSession([])
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--harness",
+                            "bash",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+                results = json.loads(output.read_text())["results"]
+                self.assertEqual(len(results), 2)
+                first, second = results
+                self.assertTrue(first["protocol_error"])
+                self.assertFalse(first["timed_out"])
+                self.assertIn("Protocol retry budget exhausted", first["error"])
+                self.assertEqual(first["tool_calls"], [])
+                rejections = [
+                    event for event in first["events"] if event["type"] == "tool_call_rejected"
+                ]
+                self.assertEqual(len(rejections), 3)
+                self.assertTrue(rejections[-1]["retry_exhausted"])
+                self.assertFalse(second["protocol_error"])
+                self.assertIsNone(second["error"])
+                self.assertEqual(second["text"], "Done.")
+                self.assertEqual(stdout.getvalue().strip(), "Done.")
+                self.assertIn("Continuing the batch", stderr.getvalue())
+                self.assertEqual(len(session.children[0].turns), 3)
         finally:
             del _session_cache[key]
 
@@ -1356,9 +1425,10 @@ class TestPythonHarness(unittest.TestCase):
             native.removesuffix("</tool_call>"),
         ]:
             with self.subTest(request=request):
-                result = PythonHarness().run(ScriptedSession([request]), "Problem.", 100)
+                result = PythonHarness().run(ScriptedSession([request] * 3), "Problem.", 100)
                 self.assertEqual(result.tool_calls, [])
-                self.assertIn("native Python tool call", result.error)
+                self.assertIn("native tool call", result.error)
+                self.assertTrue(result.protocol_error)
 
     def test_invalid_tagged_script_receives_tool_feedback(self):
         """Keeps invalid Python scripts on the tool execution error path."""
@@ -1414,17 +1484,58 @@ class TestPythonHarness(unittest.TestCase):
                 "I will inspect the repository.\n<python>\n" + "print('files')\n" * 1000,
                 "Malformed",
             ),
-            ("Here is a request.\n<tool_call><function=python>", "native Python tool call"),
+            ("Here is a request.\n<tool_call><function=python>", "native tool call"),
             ("<think><python>print(42)</python>", "empty answer"),
             ("", "empty answer"),
         ]:
             with self.subTest(response=response):
                 result = PythonHarness().run(
-                    ScriptedSession([response]), "Problem.", max_length=100
+                    ScriptedSession([response] * 3), "Problem.", max_length=100
                 )
                 self.assertEqual(len(result.tool_calls), 0)
                 self.assertIn(error, result.error)
                 self.assertEqual(result.text, "")
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_native_bash_request_is_reissued_without_executing_rejected_commands(self):
+        """Recovers native Bash requests through explicit feedback instead of guessing syntax."""
+        for parameter in ("printf ignored > forbidden.txt", "command"):
+            malformed = (
+                "<think>Inspect the repository.</think>"
+                "<tool_call><function=bash>"
+                f"<parameter={parameter}>printf ignored > forbidden.txt</parameter>"
+                "</function></tool_call>"
+                "<bash>touch also_forbidden.txt</bash>"
+            )
+            session = ScriptedSession(
+                [malformed, "<bash>printf 42 > answer.txt; cat answer.txt</bash>", "Done."]
+            )
+            with self.subTest(parameter=parameter), tempfile.TemporaryDirectory() as directory:
+                with LiveLog(str(Path(directory) / "live.log")) as log:
+                    result = PythonHarness(max_tool_calls=1, bash_only=True, live_log=log).run(
+                        session, "Inspect.", 100, directory=directory
+                    )
+                    self.assertIn("[tool call rejected]", log.path.read_text())
+                self.assertIsNone(result.error)
+                self.assertFalse(result.protocol_error)
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(len(result.tool_calls), 1)
+                self.assertEqual(result.tool_calls[0].stdout, "42")
+                self.assertFalse((Path(directory) / "forbidden.txt").exists())
+                self.assertFalse((Path(directory) / "also_forbidden.txt").exists())
+                self.assertIn(
+                    "No command from your preceding response was executed", session.turns[1][0]
+                )
+                self.assertIn("<bash>YOUR COMMAND</bash>", session.turns[1][0])
+                rejected = [
+                    event
+                    for event in result.interactions
+                    if event["type"] == "tool_call_rejected"
+                ]
+                self.assertEqual(len(rejected), 1)
+                self.assertEqual(rejected[0]["executed_tool_call_count"], 0)
+                self.assertEqual(rejected[0]["retry"], 1)
+                self.assertFalse(rejected[0]["retry_exhausted"])
 
     def test_literal_tool_tags_in_final_markdown_are_not_requests(self):
         """Accepts a final code block containing literal tool markers."""

@@ -99,6 +99,7 @@ class HarnessResult:
     interactions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     timed_out: bool = False
+    protocol_error: bool = False
 
 
 def extract_python_calls(text: str) -> list[str]:
@@ -333,6 +334,8 @@ class PythonHarness:
             started_at + final_answer_after if final_answer_after is not None else None
         )
         finalizing = False
+        protocol_retries = 0
+        max_protocol_retries = 2
         final_message = (
             "The exploration time limit has been reached. Stop exploring and write "
             "your final answer now. Do not request or execute any more tools. "
@@ -401,7 +404,9 @@ class PythonHarness:
         )
         with tempfile.TemporaryDirectory(prefix="locodellm-python-") as script_directory:
             working_directory = directory or script_directory
-            for turn in range(1, self.max_tool_calls + 2 + (max_duration is not None)):
+            for turn in range(
+                1, self.max_tool_calls + 2 + (max_duration is not None) + max_protocol_retries
+            ):
                 now = time.monotonic()
                 if deadline is not None and now >= deadline:
                     return stop_for_timeout()
@@ -464,6 +469,62 @@ class PythonHarness:
                     )
                 )
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
+                unmatched = _SCRIPT_CALL.sub("", response)
+                marker = next(
+                    (
+                        match
+                        for match in _TOOL_MARKER.finditer(unmatched)
+                        if match.lastgroup is not None
+                    ),
+                    None,
+                )
+                if marker is not None and marker.lastgroup is not None:
+                    reasons = {
+                        "python": "Malformed Python tool call; expected <python>...</python>.",
+                        "bash": "Malformed Bash tool call; expected <bash>...</bash>.",
+                        "native": "Unsupported or malformed native tool call.",
+                    }
+                    reason = reasons[marker.lastgroup]
+                    exhausted = protocol_retries >= max_protocol_retries
+                    result.interactions.append(
+                        {
+                            "type": "tool_call_rejected",
+                            "reason": reason,
+                            "retry": protocol_retries + 1,
+                            "retry_limit": max_protocol_retries,
+                            "retry_exhausted": exhausted,
+                            "executed_tool_call_count": 0,
+                        }
+                    )
+                    if self.live_log is not None:
+                        self.live_log.section("tool call rejected", reason)
+                    if self.verbose:
+                        print(f"[harness] {reason}", file=sys.stderr, flush=True)
+                    if exhausted:
+                        result.protocol_error = True
+                        result.error = (
+                            f"{reason} Protocol retry budget exhausted "
+                            f"({max_protocol_retries} retries)."
+                        )
+                        return result
+                    protocol_retries += 1
+                    message = (
+                        f"{reason} No command from your preceding response was executed. "
+                        "Do not use <tool_call>, <function=...>, or <parameter=...> tags. "
+                        + (
+                            final_message
+                            if finalizing
+                            else (
+                                "Reissue the request as <bash>YOUR COMMAND</bash>."
+                                if self.bash_only
+                                else (
+                                    "Reissue the request as <bash>YOUR COMMAND</bash> "
+                                    "or <python>YOUR CODE</python>."
+                                )
+                            )
+                        )
+                    )
+                    continue
                 if finalizing and calls:
                     result.error = "A final answer is required; further tool calls are disabled."
                     return result
@@ -471,24 +532,8 @@ class PythonHarness:
                     result.error = "Python tool requests are disabled in Bash-only mode."
                     return result
                 if not calls:
-                    marker = next(
-                        (
-                            match
-                            for match in _TOOL_MARKER.finditer(response)
-                            if match.lastgroup is not None
-                        ),
-                        None,
-                    )
                     if not response:
                         result.error = "The model returned an empty answer."
-                    elif marker is not None and marker.lastgroup == "python":
-                        result.error = (
-                            "Malformed Python tool call; expected <python>...</python>."
-                        )
-                    elif marker is not None and marker.lastgroup == "native":
-                        result.error = "Unsupported or malformed native Python tool call."
-                    elif marker is not None and marker.lastgroup == "bash":
-                        result.error = "Malformed Bash tool call; expected <bash>...</bash>."
                     else:
                         result.text = response
                     return result

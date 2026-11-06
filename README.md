@@ -48,7 +48,13 @@ request to write the final answer without further tool calls. At eight
 minutes, generation stops for that problem, the command exports its partial
 trace and repository diff, and the batch continues with the next problem.
 The result has `timed_out: true` and an explicit `time_limit` event with the
-elapsed time and limit. Other harness errors still stop the batch.
+elapsed time and limit.
+Malformed or unsupported tool-call formats receive up to two requests to
+reissue the call in the allowed format. No commands from a rejected response
+are executed, and each rejection is recorded as `tool_call_rejected`.
+If correction fails, the result has `protocol_error: true` and the batch
+continues. These retries do not reset the time budget. Other harness errors
+still stop the batch.
 The budget starts after model
 loading and repository cleanup, and resets for each problem. Generation
 stops at token boundaries; script timeouts are capped by the remaining budget.
