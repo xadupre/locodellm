@@ -11,18 +11,26 @@ _THINKING_MARKER_RE = re.compile(
     r"|<parameter=code>.*?</parameter>|</?think>",
     re.DOTALL,
 )
+_THINKING_END_RE = re.compile(r"```.*?```|</think>", re.DOTALL)
 
 
 def strip_thinking(text: str) -> str:
     """Returns the answer after thinking, without modifying the original response.
 
     Handles completions whose opening ``<think>`` was already in the prompt.
-    Fenced and tool-tagged code is opaque so literal thinking tags are preserved.
+    Fenced code and tool-tagged code in the answer are opaque so literal
+    thinking tags are preserved.
     An explicitly unclosed thinking section contains no final answer.
     """
     answer_start = 0
     thinking = False
-    for marker in _THINKING_MARKER_RE.finditer(text):
+    position = 0
+    while True:
+        pattern = _THINKING_END_RE if thinking else _THINKING_MARKER_RE
+        marker = pattern.search(text, position)
+        if marker is None:
+            break
+        position = marker.end()
         if marker[0] == "<think>":
             thinking = True
         elif marker[0] == "</think>":

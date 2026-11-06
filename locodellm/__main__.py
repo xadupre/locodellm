@@ -123,28 +123,92 @@ def _cmd_models(args: argparse.Namespace) -> None:  # noqa: ARG001
         print(f"{model_id:<{width}}  {description}")
 
 
-def _load_generate_input(filename: str) -> tuple[list[str], str]:
+def _load_generate_input(
+    filename: str,
+    repository: str | None = None,
+    clone_directory: str = "clones",
+    verbose: int = 0,
+) -> tuple[list[str], str]:
     """Loads independent prompts and resolves their repository directory."""
     import json
+    import re
     from pathlib import Path
 
     source = Path(filename).resolve()
-    document = json.loads(source.read_text(encoding="utf-8"))
-    if not isinstance(document, dict) or set(document) != {"prompts", "repo"}:
-        raise ValueError("JSON input must contain exactly 'prompts' and 'repo'.")
-    prompts = document["prompts"]
+    if source.suffix.lower() == ".jsonl":
+        prompts = []
+        repositories: set[tuple[str, str | None]] = set()
+        with source.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"Invalid JSONL in {source} at line {line_number}: {error.msg}"
+                    ) from error
+                if (
+                    not isinstance(record, dict)
+                    or not isinstance(record.get("prompt"), str)
+                    or not record["prompt"].strip()
+                ):
+                    raise ValueError(
+                        f"JSONL line {line_number} must contain a nonempty 'prompt' string."
+                    )
+                prompts.append(record["prompt"])
+                if repository is None:
+                    url = record.get("repository")
+                    if not isinstance(url, str) or not url.strip():
+                        raise ValueError(
+                            f"JSONL line {line_number} requires 'repository' for automatic "
+                            "cloning; alternatively provide --repo."
+                        )
+                    verification = record.get("verification", {})
+                    if not isinstance(verification, dict):
+                        raise ValueError(f"JSONL line {line_number} has invalid 'verification'.")
+                    revision = verification.get("revision")
+                    if revision is not None and (
+                        not isinstance(revision, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
+                    ):
+                        raise ValueError(
+                            f"JSONL line {line_number} requires a full commit SHA "
+                            "in 'verification.revision'."
+                        )
+                    repositories.add((url, revision))
+        base_directory = Path.cwd()
+    else:
+        if repository is not None:
+            raise ValueError("--repo is only supported with JSONL input; JSON defines 'repo'.")
+        document = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or set(document) != {"prompts", "repo"}:
+            raise ValueError("JSON input must contain exactly 'prompts' and 'repo'.")
+        prompts = document["prompts"]
+        repository = document["repo"]
+        base_directory = source.parent
+        if clone_directory != "clones":
+            raise ValueError("--clone-dir is only supported with JSONL input.")
     if (
         not isinstance(prompts, list)
         or not prompts
         or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)
     ):
         raise ValueError("'prompts' must be a nonempty list of nonempty strings.")
-    repository = document["repo"]
+    if source.suffix.lower() == ".jsonl" and repository is None:
+        if len(repositories) != 1:
+            raise ValueError("JSONL records must use the same repository and revision.")
+        from locodellm.generate.repository import GitRepository
+
+        url, revision = next(iter(repositories))
+        repository = str(
+            GitRepository.clone(url, clone_directory, revision=revision, verbose=verbose).path
+        )
     if not isinstance(repository, str) or not repository.strip():
         raise ValueError("'repo' must be a nonempty local directory path.")
     path = Path(repository).expanduser()
     if not path.is_absolute():
-        path = source.parent / path
+        path = base_directory / path
     path = path.resolve()
     if not path.is_dir():
         raise ValueError(f"Repository directory does not exist: {path}")
@@ -157,7 +221,13 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         _run_generate(args, stack)
 
 
-def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
+def _run_generate(
+    args: argparse.Namespace,
+    stack: ExitStack,
+    *,
+    final_answer_after: float = 360,
+    max_duration: float = 480,
+) -> None:
     """Runs generation while keeping the optional live transcript open."""
     if args.verbose:
         print(
@@ -177,7 +247,9 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
     if args.verbose:
         print("[generate] reading prompts and validating repository", file=sys.stderr, flush=True)
     prompts, repository = (
-        _load_generate_input(args.input) if args.input is not None else ([args.prompt], None)
+        _load_generate_input(args.input, args.repo, args.clone_dir, verbose=args.verbose)
+        if args.input is not None
+        else ([args.prompt], None)
     )
     target = GitRepository(repository) if repository is not None else None
     if args.live_log and any(
@@ -239,6 +311,8 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
                 max_length=max_length,
                 final_answer_instructions="return your final answer without a tool call.",
                 directory=repository,
+                final_answer_after=final_answer_after,
+                max_duration=max_duration,
                 **search_options,
             )
         else:
@@ -259,6 +333,8 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
             "tool_call_count": len(result.tool_calls),
             "tool_calls": [asdict(call) for call in result.tool_calls],
             "error": result.error,
+            "timed_out": result.timed_out,
+            "protocol_error": result.protocol_error,
         }
         if target is not None:
             if args.verbose:
@@ -278,6 +354,20 @@ def _run_generate(args: argparse.Namespace, stack: ExitStack) -> None:
             Path(args.output).write_text(
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
+        if result.timed_out or result.protocol_error:
+            reason = "timed out" if result.timed_out else "has an invalid tool protocol"
+            if live_log is not None:
+                live_log.section(
+                    "problem timeout" if result.timed_out else "problem protocol error",
+                    f"{result.error}",
+                )
+            print(
+                f"[generate] prompt {prompt_index}/{len(prompts)} {reason}: "
+                f"{result.error} Continuing the batch.",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         if result.error:
             if live_log is not None:
                 live_log.section("harness error", result.error)
@@ -562,8 +652,21 @@ def main(args: list[str] | None = None) -> None:
     gen_parser.add_argument(
         "--input",
         default=None,
-        metavar="JSON",
-        help="JSON prompts and local repo path; enables the Python/Bash harness.",
+        metavar="FILE",
+        help="JSON prompts with repo, or JSONL records (cloned by default); enables the harness.",
+    )
+    repository_options = gen_parser.add_mutually_exclusive_group()
+    repository_options.add_argument(
+        "--repo",
+        default=None,
+        metavar="PATH",
+        help="Local Git repository for JSONL input; cleaned before each prompt.",
+    )
+    repository_options.add_argument(
+        "--clone-dir",
+        default="clones",
+        metavar="PATH",
+        help="Parent directory for fresh JSONL repository clones (default: ./clones).",
     )
     gen_parser.add_argument(
         "--precision",
@@ -764,7 +867,11 @@ def main(args: list[str] | None = None) -> None:
         if not math.isfinite(parsed.temperature) or parsed.temperature < 0:
             gen_parser.error("--temperature must be finite and nonnegative")
         if (parsed.prompt is None) == (parsed.input is None):
-            gen_parser.error("provide either PROMPT or --input JSON, but not both")
+            gen_parser.error("provide either PROMPT or --input FILE, but not both")
+        if parsed.repo is not None and parsed.input is None:
+            gen_parser.error("--repo requires --input JSONL")
+        if parsed.clone_dir != "clones" and parsed.input is None:
+            gen_parser.error("--clone-dir requires --input JSONL")
         if parsed.input is not None:
             parsed.harness = parsed.harness or "python"
     if parsed.command in {"generate", "bench"}:

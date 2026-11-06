@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from locodellm import __version__
-from locodellm.__main__ import main
+from locodellm.__main__ import _load_generate_input, main
 from locodellm.ext_test_case import ExtTestCase, requires_onnxruntime_genai
 
 
@@ -49,6 +49,26 @@ class TestMain(ExtTestCase):
 
 class TestMainGenerate(ExtTestCase):
     """Tests for the generate subcommand."""
+
+    @requires_onnxruntime_genai()
+    def test_onnx_generation_max_time(self):
+        """Stops ONNX decoding before the next token without dropping prompt history."""
+        import tempfile
+        from pathlib import Path
+
+        from locodellm.generate.generate_from_model import get_session
+        from locodellm.test_models import create_tiny_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = create_tiny_model(str(Path(directory) / "model"))
+            session = get_session(model).new_session()
+            session.generate("<s>", max_new_tokens=100, max_time=1e-9)
+            self.assertEqual(session.generated_token_count, 0)
+            self.assertEqual(session.text, "")
+            self.assertEqual(session.tokens.size, len(session.tokenizer.encode("<s>")))
+            for value in (0, -1, float("nan"), float("inf")):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_time"):
+                    session.generate("<s>", max_time=value)
 
     @requires_onnxruntime_genai()
     def test_generate_onnx_temperature(self):
@@ -159,6 +179,104 @@ class TestMainGenerate(ExtTestCase):
                     main(["generate", "unused/model", *options])
                 self.assertEqual(error.exception.code, 2)
 
+    def test_jsonl_input_extracts_only_prompts(self):
+        """Loads UTF-8 prompts in order without exposing reference answers or metadata."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "tasks.jsonl"
+            source.write_text(
+                "\n".join(
+                    json.dumps(record, ensure_ascii=False)
+                    for record in [
+                        {"prompt": "Vérifie l'export.", "expected_answer": "SECRET ANSWER"},
+                        {"prompt": "Second task.", "repository": "https://example.com/repo"},
+                    ]
+                )
+                + "\n\n",
+                encoding="utf-8",
+            )
+            prompts, repository = _load_generate_input(str(source), ".")
+            self.assertEqual(prompts, ["Vérifie l'export.", "Second task."])
+            self.assertEqual(repository, str(Path.cwd()))
+
+    def test_invalid_jsonl_input(self):
+        """Rejects missing repositories, empty inputs, and malformed prompt records."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "tasks.jsonl"
+            source.write_text('{"prompt": "Task."}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires 'repository'"):
+                main(["generate", "unused/model", "--input", str(source)])
+            for content, message in [
+                (" \n", "nonempty list"),
+                ('{"prompt": "Task."}\n{\n', "at line 2"),
+                ('{"prompt": "Task."}\n{"prompt": 1}\n', "JSONL line 2"),
+                ('{"expected_answer": "Answer."}\n', "JSONL line 1"),
+                ('{"prompt": " "}\n', "JSONL line 1"),
+                ('["Task."]\n', "JSONL line 1"),
+            ]:
+                with self.subTest(content=content):
+                    source.write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        main(
+                            [
+                                "generate",
+                                "unused/model",
+                                "--input",
+                                str(source),
+                                "--repo",
+                                directory,
+                            ]
+                        )
+            source.write_text('{"prompt": "Task."}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Repository directory does not exist"):
+                _load_generate_input(str(source), str(Path(directory) / "missing"))
+            source = source.with_suffix(".json")
+            source.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "--repo is only supported with JSONL"):
+                _load_generate_input(str(source), directory)
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as error,
+            ):
+                main(["generate", "unused/model", "Task.", "--repo", directory])
+            self.assertEqual(error.exception.code, 2)
+
+    def test_invalid_jsonl_clone_metadata(self):
+        """Rejects incompatible repositories and invalid revisions before cloning."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "tasks.jsonl"
+            record = {"prompt": "Task.", "repository": directory}
+            for records, message in [
+                ([{**record, "repository": " "}], "requires 'repository'"),
+                ([{**record, "verification": []}], "invalid 'verification'"),
+                ([{**record, "verification": {"revision": "main"}}], "full commit SHA"),
+                ([{**record, "verification": {"revision": 1}}], "full commit SHA"),
+                ([record, {**record, "repository": directory + "/other"}], "same repository"),
+                ([record, {**record, "verification": {"revision": "a" * 40}}], "same repository"),
+            ]:
+                with self.subTest(records=records):
+                    source.write_text(
+                        "\n".join(json.dumps(value) for value in records), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        _load_generate_input(str(source), clone_directory=directory)
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as error,
+            ):
+                main(["generate", "unused/model", "Task.", "--clone-dir", directory])
+            self.assertEqual(error.exception.code, 2)
+
     def test_invalid_temperature(self):
         """Rejects negative and nonfinite temperatures before loading a model."""
         for temperature in ["-1", "nan", "inf", "-inf"]:
@@ -225,14 +343,17 @@ class TestMainBench(ExtTestCase):
 
         import pandas
 
+        from locodellm.test_models import create_mock_generate_model
+
         with tempfile.TemporaryDirectory() as directory:
+            model_path = create_mock_generate_model(os.path.join(directory, "model"))
             output_path = os.path.join(directory, "results.csv")
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 main(
                     [
                         "bench",
-                        "mock/generate",
+                        model_path,
                         "basic",
                         "--harness",
                         "python",

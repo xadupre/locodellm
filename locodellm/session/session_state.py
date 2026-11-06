@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import time
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -121,6 +123,7 @@ class SessionState:
         max_length: int = 200,
         *,
         max_new_tokens: int | None = None,
+        max_time: float | None = None,
         **search_options: Any,
     ) -> SessionState:
         """Generate text from *prompt*, appending to the conversation history.
@@ -134,6 +137,8 @@ class SessionState:
                 accumulated across turns).
             max_new_tokens: If set, limits new tokens for this turn instead
                 of using the total ``max_length`` limit.
+            max_time: If set, stops generation at the next token boundary
+                after this many seconds, preserving the partial response.
             **search_options: Extra search options forwarded to
                 ``GeneratorParams.set_search_options`` (e.g. ``temperature``,
                 ``top_k``, ``top_p``).
@@ -143,6 +148,9 @@ class SessionState:
         """
         if max_new_tokens is not None and max_new_tokens < 1:
             raise ValueError("max_new_tokens must be positive.")
+        if max_time is not None and (not math.isfinite(max_time) or max_time <= 0):
+            raise ValueError("max_time must be finite and positive.")
+        deadline = time.monotonic() + max_time if max_time is not None else None
 
         import onnxruntime_genai as og
 
@@ -178,6 +186,8 @@ class SessionState:
         new_tokens: list[int] = []
         decoder = self.tokenizer.create_stream() if self.live_log is not None else None
         while not generator.is_done():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             generator.generate_next_token()
             token = generator.get_next_tokens()
             new_tokens.extend(token.tolist())
@@ -193,7 +203,7 @@ class SessionState:
             new_tokens.pop()
 
         self.tokens = np.concatenate([context, np.array(new_tokens, dtype=np.int32)])
-        self.text = self.tokenizer.decode(new_tokens)
+        self.text = self.tokenizer.decode(new_tokens) if new_tokens else ""
         self.generated_token_count = len(new_tokens)
         self._turn_count += 1
 

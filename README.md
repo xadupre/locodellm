@@ -43,6 +43,22 @@ all harness turns. The default, `--temperature 0`, uses greedy decoding.
 Temperatures must be finite and nonnegative. The effective sampling options
 are recorded in the exported conversation events.
 
+With `--harness`, each problem gets six minutes to explore, followed by a
+request to write the final answer without further tool calls. At eight
+minutes, generation stops for that problem, the command exports its partial
+trace and repository diff, and the batch continues with the next problem.
+The result has `timed_out: true` and an explicit `time_limit` event with the
+elapsed time and limit.
+Malformed or unsupported tool-call formats receive up to two requests to
+reissue the call in the allowed format. No commands from a rejected response
+are executed, and each rejection is recorded as `tool_call_rejected`.
+If correction fails, the result has `protocol_error: true` and the batch
+continues. These retries do not reset the time budget. Other harness errors
+still stop the batch.
+The budget starts after model
+loading and repository cleanup, and resets for each problem. Generation
+stops at token boundaries; script timeouts are capped by the remaining budget.
+
 For changes in an existing local repository, create `tasks.json`:
 
 ```json
@@ -77,8 +93,9 @@ Output contains the resolved `repo`, `base_revision`, and a `results` list with
 each prompt's events, final answer, and `diff`, saved before the next cleanup.
 The patch includes modified, deleted, staged, and new nonignored files, including
 binary changes. Execution stops at the first harness error after exporting its
-events and diff. The last prompt's changes remain on disk. No clone or commit
-is performed. Scripts run with your permissions, without a sandbox.
+events and diff. The last prompt's changes remain on disk. JSON batches use
+the existing repository without cloning; no commit is performed.
+Scripts run with your permissions, without a sandbox.
 
 For native Transformers weights instead of ONNX, add ``--backend pytorch``
 and choose a device:
@@ -120,6 +137,46 @@ python -m locodellm generate Qwen/Qwen3.5-0.8B \
 The initial instructions advertise only Bash. Python tool requests are rejected;
 this is not isolation, since Bash commands can still launch Python.
 
+With PyTorch and a native Qwen3-Coder-compatible chat template (including
+Nemotron), the harness automatically declares the allowed functions and uses
+native `<tool_call>` requests instead of advertising custom script tags:
+
+```xml
+<tool_call>
+<function=bash>
+<parameter=command>git status --short</parameter>
+</function>
+</tool_call>
+```
+
+Bash takes the required string parameter `command`; Python takes `code`.
+Execution results are returned as native tool messages and recorded in the trace.
+Unknown functions, extra or duplicate parameters, incomplete calls, and empty
+scripts are rejected without executing any command from that turn. Existing
+`<bash>`/`<python>` requests remain supported. Explicit `--chat-template chatml`
+keeps the existing tag-based prompting instead of native tool declarations.
+For Nemotron, omit that option and use `--temperature 1` to follow NVIDIA's
+recommended sampling; the checkpoint supplies `top_p=0.95`.
+
+The parser accepts multiple protocols in the same response, independently of
+`--chat-template`: script tags, native XML, wrapped `<tool_call><bash>...`
+requests, and Qwen JSON:
+
+```xml
+<tool_call>{"name":"bash","arguments":{"command":"git status --short"}}</tool_call>
+```
+
+OpenAI-style `function` objects inside `<tool_call>` are also supported, including
+JSON-encoded `arguments`. A bounded compatibility parser handles the legacy Bash
+envelopes observed with Qwen, such as
+`<tool_call><function=bash><parameter=pwd</parameter></function></tool_call>`.
+It extracts the enclosed command verbatim, without reconstructing missing commands
+or accepting unknown parameters. Unsupported envelopes and ambiguous requests are
+rejected atomically, including duplicate JSON keys. Markdown examples and reasoning
+are never executed. All protocols share the existing tool budget, time limits and
+Bash-only restrictions; `tool_protocols` in model-response events records the
+recognized formats.
+
 Add `--live-log` to create a retained temporary transcript, or choose its path:
 
 ```bash
@@ -136,7 +193,7 @@ target repository. Temporary logs are retained after the run for inspection.
 
 ### ATen failure-discovery datasets
 
-`datasets/aten_failures_set_1.jsonl` and `datasets/aten_failures_set_2.jsonl`
+`datasets/yobx/aten_failures_set_1.jsonl` and `datasets/yobx/aten_failures_set_2.jsonl`
 contain 8 converter-discovery tasks each, covering 16 ATen
 functions in `xadupre/yet-another-onnx-builder`. Related dispatchers and helpers
 stay together; the sets share no functions, source issues, or reference examples.
@@ -170,9 +227,31 @@ Use the dependency versions in `verification.environment` and account for
 the commit alone does not reproduce the embedding-bag value mismatches.
 
 Only send `prompt` to the model; keep `expected_answer` and issue links with the
-evaluator. These JSONL files are evaluation data, not executable task files.
-Load one JSON object per line and extract only its `prompt` when preparing
-model inputs.
+evaluator. `generate` accepts these datasets directly and clones their
+`repository` at `verification.revision` before loading the model:
+
+```bash
+python -m locodellm generate Qwen/Qwen3.8-27B \
+  --input datasets/yobx/aten_failures_set_2.jsonl --clone-dir ./clones \
+  --backend pytorch --device cuda --chat-template chatml --harness bash \
+  --max-tool-calls 100 --max-length 16000 --temperature 0 \
+  --output events.json --live-log live.log --verbose 1
+```
+
+`--clone-dir` defaults to `./clones`. Each run creates a fresh `run-*`
+subdirectory, retained afterwards; it never reuses or cleans an existing
+working tree. The resolved clone path and starting commit are recorded in the
+output JSON. Records must share the same repository and revision. When no
+revision is recorded, the clone uses the repository's default branch.
+
+Only each record's `prompt` is sent to the model; reference answers and other
+dataset metadata are not included. Blank lines are ignored. To use an existing
+repository instead, pass `--repo PATH` instead of `--clone-dir`. Relative paths
+are resolved from the current directory. JSON input keeps its existing
+`{"repo": "...", "prompts": [...]}` format.
+The selected repository is reset and nonignored untracked files are removed
+before every prompt. Keep the dataset, output, and live log outside that
+repository. No dependencies are installed in the clone.
 
 ### Python API
 
@@ -262,6 +341,69 @@ session.generate("<s>", max_length=10)
 ```
 
 ## Benchmarks
+
+### Export-failure reward
+
+`export_failure_reward` scores one clearly extracted example using four
+independently verified boolean criteria. Each satisfied criterion adds `0.25`;
+the score is maximized and ranges from `0` to `1`, without penalties or gating.
+Setting `answer_extractable=True` grants a floor of `0.05` for a final answer
+containing a clearly extractable code example, even if unverified. It is not an
+extra bonus: `reward = max(0.05, 0.25 * satisfied_criteria)` in that case.
+Rejected tool requests without such a final answer receive no extraction credit.
+
+```python
+from locodellm.bench import export_failure_reward
+
+reward = export_failure_reward(
+    reference_valid=True,       # PyTorch runs on the concrete inputs
+    export_call_valid=True,     # to_onnx follows the required protocol
+    failure_valid=True,         # an admissible failure is actually observed
+    reproduction_valid=False,  # independent replay, route and stage not yet verified
+    answer_extractable=True,   # final answer contains a clearly extractable code example
+)
+assert reward == 0.75
+```
+
+The function only computes the reward. Extracting examples and verifying these
+criteria must happen separately; model assertions or a successful harness exit
+are not verification. Non-boolean criteria are rejected.
+
+### Semantic answer judging
+
+The deterministic factual reward remains the default. Semantic judging is an
+opt-in diagnostic and is not included in that reward.
+
+`judge_export_answer` compares a generated report with the `expected_answer`
+object of a failure-discovery dataset record. It returns the best semantic match
+to one reference example, independently of the factual reward:
+
+```python
+from locodellm.bench import export_failure_reward, judge_export_answer
+
+factual = export_failure_reward(
+    reference_valid=True,
+    export_call_valid=True,
+    failure_valid=False,
+    reproduction_valid=False,
+)
+semantic = judge_export_answer(
+    session, generated_answer, record["expected_answer"], task=record["prompt"]
+)
+print(factual, semantic.similarity, semantic.closest_reference, semantic.reason)
+```
+
+The judge uses a fresh PyTorch conversation sharing the loaded weights, without
+the solving history or tools. Native thinking is disabled and decoding is greedy.
+It compares causes, triggering conditions, observations, conversion routes and
+failure stages, not prose similarity. References are evaluator-only data.
+One format-correction turn is allowed within the same time budget by default
+(`max_format_retries=0` disables it). Judgments that remain malformed, out-of-range
+or refer to unknown examples raise `JudgeProtocolError` with the raw completion
+attached; they never become a default numeric score.
+Schema-valid self-judgments can still contradict the candidate or references.
+They require calibration before use as training rewards and do not replace
+independent execution checks.
 
 ### Built-in benchmark
 

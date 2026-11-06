@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import numpy
 
 from locodellm.__main__ import main
+from locodellm.bench.python_harness import PythonHarness
 from locodellm.generate.generate_from_model import _model_path_cache, _session_cache, get_session
 
 
@@ -125,6 +127,96 @@ class TestPyTorchSession(unittest.TestCase):
         numpy.testing.assert_array_equal(chatml.tokens[: len(history)], history)
         self.assertEqual(chatml.generated_token_count, 1)
 
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_native_tool_declarations_recovery_and_results(self):
+        """Runs native tool turns through real Transformers generation and Bash."""
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        session.tokenizer.chat_template = (
+            "{% if tools %}{{ '<|user|>\\n<tools>' }}{{ tools|tojson }}"
+            "{{ '</tools>\\nUse <tool_call><function=NAME> calls.<|end|>\\n' }}{% endif %}"
+            "{% for message in messages %}{% if message['role'] == 'tool' %}"
+            "{{ '<|user|>\\n<tool_response>\\n' + message['content'] "
+            "+ '\\n</tool_response><|end|>\\n' }}{% else %}"
+            "{{ '<|' + message['role'] + '|>\\n' + message['content'] + '<|end|>\\n' }}"
+            "{% endif %}{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
+        )
+        responses = [
+            (
+                "<tool_call><function=unknown><parameter=command>"
+                "touch forbidden.txt</parameter></function></tool_call>"
+            ),
+            (
+                "<tool_call><function=bash><parameter=command>"
+                "printf 42 > answer.txt; cat answer.txt</parameter></function></tool_call>"
+            ),
+            (
+                "<tool_call><function=bash><parameter=command>"
+                "cat answer.txt; printf failed >&2; exit 7</parameter></function></tool_call>"
+            ),
+            "Done.",
+        ]
+        session.tokenizer.add_tokens(responses)
+        session.model.resize_token_embeddings(len(session.tokenizer), mean_resizing=False)
+        response_ids = [
+            session.tokenizer.encode(response, add_special_tokens=False) for response in responses
+        ]
+        self.assertTrue(all(len(ids) == 1 for ids in response_ids))
+
+        class ScriptedTokens(LogitsProcessor):
+            """Forces successive response tokens and EOS through the actual decoder."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, input_ids, scores):
+                token = response_ids[self.calls // 2][0] if self.calls % 2 == 0 else 3
+                self.calls += 1
+                scores.fill_(-float("inf"))
+                scores[:, token] = 0
+                return scores
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = PythonHarness(bash_only=True, max_tool_calls=2).run(
+                session,
+                "Inspect.",
+                8,
+                directory=directory,
+                logits_processor=LogitsProcessorList([ScriptedTokens()]),
+            )
+            self.assertIsNone(result.error)
+            self.assertEqual(result.text, "Done.")
+            self.assertFalse((Path(directory) / "forbidden.txt").exists())
+            self.assertEqual((Path(directory) / "answer.txt").read_text(), "42")
+        self.assertEqual([tool["function"]["name"] for tool in session.tools], ["bash"])
+        self.assertEqual([call.returncode for call in result.tool_calls], [0, 7])
+        tool_messages = [message for message in session.messages if message["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 2)
+        self.assertEqual(tool_messages[0]["name"], "bash")
+        self.assertIn("stdout:\n42", tool_messages[0]["content"])
+        self.assertIn("stderr:\nfailed", tool_messages[1]["content"])
+        self.assertIn("exit code: 7", tool_messages[1]["content"])
+        correction = session.messages[2]["content"]
+        self.assertIn("<function=bash><parameter=command>", correction)
+        self.assertNotIn("Do not use <tool_call>", correction)
+        rendered = session._wrap_prompt("Next.")
+        self.assertIn("<tools>", rendered)
+        self.assertIn('"required": ["command"]', rendered)
+        self.assertIn("<tool_response>", rendered)
+        self.assertEqual(
+            len([event for event in result.interactions if event["type"] == "tool_result"]), 2
+        )
+        fresh = session.new_session()
+        self.assertEqual(fresh.tools, [])
+        self.assertEqual(fresh.messages, [])
+        fresh._chat_template = "chatml"
+        self.assertFalse(fresh.configure_tools(session.tools))
+        self.assertNotIn("<tools>", fresh._wrap_prompt("Inspect."))
+        with self.assertRaisesRegex(ValueError, "have not been configured"):
+            fresh.add_tool_result("bash", "42")
+
     def test_generation_errors(self):
         """Rejects invalid per-turn limits and prompts exceeding the total limit."""
         session = get_session(self.model_path, backend="pytorch")
@@ -133,6 +225,21 @@ class TestPyTorchSession(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds max_length"):
             session.generate("hello", max_length=session.get_prompt_length("hello"))
         self.assertEqual(session.messages, [])
+
+    def test_native_template_options_are_copied_to_fresh_sessions(self):
+        """Disables native thinking without mutating the shared tokenizer or parent."""
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        original_template = session.tokenizer.chat_template
+        session.tokenizer.chat_template = (
+            original_template
+            + "{% if enable_thinking %}<think>{% else %}<think></think>{% endif %}"
+        )
+        session.chat_template_kwargs = {"enable_thinking": True}
+        child = session.new_session()
+        child.chat_template_kwargs["enable_thinking"] = False
+        self.assertTrue(child._wrap_prompt("Judge.").endswith("<think></think>"))
+        self.assertTrue(session._wrap_prompt("Solve.").endswith("<think>"))
+        self.assertEqual(child.tools, [])
 
     def test_eos_and_untemplated_history(self):
         """Strips terminal EOS tokens and preserves history without a chat template."""
@@ -259,6 +366,11 @@ class TestPyTorchSession(unittest.TestCase):
                 self.assertIsNone(document["error"])
                 self.assertEqual(document["tool_calls"], [])
                 option = "max_new_tokens" if harness else "max_length"
+                if harness:
+                    self.assertGreater(document["initial_generation_options"]["max_time"], 0)
+                    self.assertLessEqual(
+                        document["initial_generation_options"].pop("max_time"), 360
+                    )
                 self.assertEqual(
                     document["initial_generation_options"], {option: limit, "do_sample": False}
                 )
@@ -309,9 +421,35 @@ class TestPyTorchSession(unittest.TestCase):
                     self.assertEqual(document["text"], expected.text)
                     self.assertEqual(document["token_count"], expected.generated_token_count)
                     option = "max_new_tokens" if harness else "max_length"
+                    if harness:
+                        self.assertGreater(document["initial_generation_options"]["max_time"], 0)
+                        self.assertLessEqual(
+                            document["initial_generation_options"].pop("max_time"), 360
+                        )
                     self.assertEqual(
                         document["initial_generation_options"], {option: limit, **search_options}
                     )
+
+    def test_generation_max_time(self):
+        """Stops a real PyTorch generation at a token boundary and retains its response."""
+        import time
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class SlowTokens(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                time.sleep(0.02)
+                return scores
+
+        session = get_session(self.model_path, backend="pytorch", device="cpu")
+        session.generate(
+            "hello",
+            max_new_tokens=20,
+            max_time=0.001,
+            logits_processor=LogitsProcessorList([SlowTokens()]),
+        )
+        self.assertEqual(session.generated_token_count, 1)
+        self.assertEqual(session.text, "answer")
+        self.assertEqual(session.messages[-1]["content"], "answer")
 
     def test_verbose_generation_progress_and_cached_sessions(self):
         """Reports flushed loading, model-turn, and token progress with a real model."""

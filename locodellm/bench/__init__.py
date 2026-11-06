@@ -11,17 +11,23 @@ from locodellm.bench.prompt_test import (
     load_prompt_tests,
 )
 from locodellm.bench.run_code import UNDEFINED, RunStatus, run_function
+from locodellm.bench.rewards import export_failure_reward
+from locodellm.bench.answer_judge import JudgeProtocolError, SemanticJudgment, judge_export_answer
 
 __all__ = [
     "BenchPromptTest",
     "BenchResult",
     "ExpectedResult",
+    "JudgeProtocolError",
     "PromptTest",
     "PromptTestResult",
     "RunStatus",
+    "SemanticJudgment",
     "UNDEFINED",
     "dump_prompt_tests",
+    "export_failure_reward",
     "get_available_benchmarks",
+    "judge_export_answer",
     "load_prompt_tests",
     "run_function",
 ]

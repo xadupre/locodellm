@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -10,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
-from locodellm.__main__ import _compute_case_stats, main
+from locodellm.__main__ import _compute_case_stats, _run_generate, main
 from locodellm.bench import BenchPromptTest, ExpectedResult, PromptTest
 from locodellm.bench.python_harness import (
     PythonHarness,
@@ -43,6 +44,20 @@ class ScriptedSession:
         self.text = self.responses[len(self.turns)]
         self.turns.append((prompt, options))
         self.generated_token_count = 5
+
+
+class TimeLimitedSession(ScriptedSession):
+    """Delays selected model turns until their generation budget expires."""
+
+    def __init__(self, responses, fast_turns=0):
+        super().__init__(responses)
+        self.fast_turns = fast_turns
+
+    def generate(self, prompt, **options):
+        """Emits a partial response after the requested generation time limit."""
+        if len(self.turns) >= self.fast_turns:
+            time.sleep(options["max_time"] + 0.01)
+        super().generate(prompt, **options)
 
 
 def create_repository(directory):
@@ -84,6 +99,97 @@ def create_repository(directory):
 
 
 class TestPythonHarness(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_time_budget_requests_final_answer_and_stops_tools(self):
+        """Interrupts exploration scripts and requests a final answer without more tools."""
+        for final_response, expected_error in [
+            ("Confirmed result.", None),
+            ("<bash>touch forbidden.txt</bash>", "further tool calls are disabled"),
+        ]:
+            with (
+                self.subTest(final_response=final_response),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                session = ScriptedSession(["<bash>sleep 2</bash>", final_response])
+                with LiveLog(str(Path(root) / "live.log")) as log:
+                    result = PythonHarness(timeout=3, bash_only=True, live_log=log).run(
+                        session,
+                        "Find failures.",
+                        max_length=100,
+                        directory=root,
+                        final_answer_after=0.2,
+                        max_duration=1,
+                    )
+                    self.assertEqual(len(result.tool_calls), 1)
+                    self.assertTrue(result.tool_calls[0].timed_out)
+                    self.assertIn("write your final answer now", session.turns[-1][0])
+                    self.assertIn("timed out: True", session.turns[-1][0])
+                    self.assertLessEqual(session.turns[0][1]["max_time"], 0.2)
+                    self.assertLessEqual(session.turns[-1][1]["max_time"], 1)
+                    self.assertTrue(
+                        any(
+                            event["type"] == "final_answer_requested"
+                            for event in result.interactions
+                        )
+                    )
+                    self.assertIn("[final answer requested]", log.path.read_text())
+                if expected_error is None:
+                    self.assertIsNone(result.error)
+                    self.assertEqual(result.text, final_response)
+                else:
+                    self.assertIn(expected_error, result.error)
+                    self.assertFalse((Path(root) / "forbidden.txt").exists())
+
+    def test_time_budget_interrupts_generation(self):
+        """Requests finalization after a slow turn and records an overdue partial answer."""
+
+        session = TimeLimitedSession(["Partial exploration.", "Partial final answer."])
+        started_at = time.monotonic()
+        result = PythonHarness().run(
+            session, "Find failures.", max_length=100, final_answer_after=0.03, max_duration=0.15
+        )
+        self.assertLess(time.monotonic() - started_at, 1)
+        self.assertEqual(len(session.turns), 2)
+        self.assertIn("write your final answer now", session.turns[1][0])
+        self.assertIn("Problem time limit reached", result.error)
+        self.assertEqual(result.text, "Partial final answer.")
+        self.assertEqual(result.token_count, 10)
+        self.assertEqual(result.tool_calls, [])
+        self.assertEqual(result.interactions[-1]["type"], "time_limit")
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.interactions[-1]["timed_out"])
+        self.assertEqual(result.interactions[-1]["limit_seconds"], 0.15)
+        self.assertTrue(
+            any(
+                event["type"] == "model_response" and event["content"] == result.text
+                for event in result.interactions
+            )
+        )
+
+    def test_invalid_problem_time_budget(self):
+        """Rejects invalid or inconsistent limits without generating."""
+        for final_after, duration in [
+            (None, 0),
+            (None, float("inf")),
+            (None, float("nan")),
+            (0, 1),
+            (-1, 1),
+            (2, 1),
+            (1, None),
+            (float("nan"), 1),
+        ]:
+            with self.subTest(final_after=final_after, duration=duration):
+                session = ScriptedSession([])
+                with self.assertRaises(ValueError):
+                    PythonHarness().run(
+                        session,
+                        "Prompt.",
+                        max_length=100,
+                        final_answer_after=final_after,
+                        max_duration=duration,
+                    )
+                self.assertEqual(session.turns, [])
+
     def test_live_tool_output_is_visible_before_execution_finishes(self):
         """Checks flushed stdout and stderr from inside a still-running real script."""
         with tempfile.TemporaryDirectory() as directory:
@@ -125,7 +231,7 @@ class TestPythonHarness(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_bash_only_cli_json_input(self):
-        """Preserves explicit Bash-only mode for JSON batches and executes real commands."""
+        """Executes Bash-only JSON and JSONL batches without exposing reference answers."""
         from locodellm.generate.generate_from_model import _session_cache
 
         model_id = "test/bash-only-cli"
@@ -139,39 +245,73 @@ class TestPythonHarness(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 repository = root / "repo"
-                create_repository(repository)
-                source = root / "tasks.json"
-                source.write_text(
-                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
-                    encoding="utf-8",
-                )
+                original = create_repository(repository)
                 output = root / "events.json"
-                with contextlib.redirect_stdout(io.StringIO()):
-                    main(
-                        [
-                            "generate",
-                            model_id,
-                            "--input",
-                            str(source),
-                            "--harness",
-                            "bash",
-                            "--max-tool-calls",
-                            "1",
-                            "--output",
-                            str(output),
-                        ]
+                for format_name in ("json", "jsonl", "jsonl-clone"):
+                    source = root / ("tasks.json" if format_name == "json" else "tasks.jsonl")
+                    prompts = ["First.", "Second."]
+                    content = (
+                        json.dumps({"repo": str(repository), "prompts": prompts})
+                        if format_name == "json"
+                        else "\n".join(
+                            json.dumps(
+                                {
+                                    "prompt": prompt,
+                                    "repository": str(repository),
+                                    "verification": {"revision": original.revision},
+                                    "expected_answer": "HIDDEN REFERENCE",
+                                }
+                            )
+                            for prompt in prompts
+                        )
                     )
-                document = json.loads(output.read_text(encoding="utf-8"))
-                self.assertEqual(len(document["results"]), 2)
-                for result, child in zip(document["results"], session.children):
-                    self.assertIsNone(result["error"])
-                    self.assertIn("only the Bash tool", result["initial_prompt"])
-                    self.assertNotIn("<python>", result["initial_prompt"])
-                    self.assertIn("Remaining Bash tool calls: 0", child.turns[1][0])
-                    self.assertIn("Only Bash tool requests are allowed.", child.turns[1][0])
-                    self.assertEqual(result["tool_calls"][0]["tool"], "bash")
-                    self.assertEqual(result["tool_calls"][0]["stdout"], "42")
-                    self.assertIn("+42", result["diff"])
+                    source.write_text(content, encoding="utf-8")
+                    session.children.clear()
+                    repo_options = (
+                        ["--clone-dir", str(root / "clones")]
+                        if format_name == "jsonl-clone"
+                        else (["--repo", str(repository)] if format_name == "jsonl" else [])
+                    )
+                    with (
+                        self.subTest(format_name=format_name),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        main(
+                            [
+                                "generate",
+                                model_id,
+                                "--input",
+                                str(source),
+                                *repo_options,
+                                "--harness",
+                                "bash",
+                                "--max-tool-calls",
+                                "1",
+                                "--output",
+                                str(output),
+                            ]
+                        )
+                    document = json.loads(output.read_text(encoding="utf-8"))
+                    if format_name == "jsonl-clone":
+                        self.assertEqual(Path(document["repo"]).parent, root / "clones")
+                        self.assertTrue(Path(document["repo"]).is_dir())
+                    else:
+                        self.assertEqual(document["repo"], str(repository))
+                    self.assertEqual(document["base_revision"], original.revision)
+                    self.assertEqual(len(document["results"]), 2)
+                    for result, child, prompt in zip(
+                        document["results"], session.children, prompts
+                    ):
+                        self.assertEqual(result["prompt"], prompt)
+                        self.assertIsNone(result["error"])
+                        self.assertIn("only the Bash tool", result["initial_prompt"])
+                        self.assertNotIn("<python>", result["initial_prompt"])
+                        self.assertNotIn("HIDDEN REFERENCE", result["initial_prompt"])
+                        self.assertIn("Remaining Bash tool calls: 0", child.turns[1][0])
+                        self.assertIn("Only Bash tool requests are allowed.", child.turns[1][0])
+                        self.assertEqual(result["tool_calls"][0]["tool"], "bash")
+                        self.assertEqual(result["tool_calls"][0]["stdout"], "42")
+                        self.assertIn("+42", result["diff"])
         finally:
             del _session_cache[key]
 
@@ -184,6 +324,7 @@ class TestPythonHarness(unittest.TestCase):
                 "</function></tool_call>"
             ),
             "<bash>exit 99</bash><python>print(42)</python>",
+            '<tool_call>{"name":"python","arguments":{"code":"print(42)"}}</tool_call>',
         ]:
             with self.subTest(request=request):
                 result = PythonHarness(bash_only=True).run(
@@ -273,7 +414,7 @@ class TestPythonHarness(unittest.TestCase):
         self.assertIn("budget exhausted", result.error)
         for response in ("Some prose.\n<bash>ls", "Some prose.\n</bash>"):
             with self.subTest(response=response):
-                result = PythonHarness().run(ScriptedSession([response]), "Problem.", 100)
+                result = PythonHarness().run(ScriptedSession([response] * 3), "Problem.", 100)
                 self.assertIn("Malformed Bash", result.error)
                 self.assertEqual(result.tool_calls, [])
         final = '```bash\nprintf "<bash>"\n```'
@@ -446,6 +587,164 @@ class TestPythonHarness(unittest.TestCase):
         finally:
             del _session_cache[key]
 
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_generate_batch_continues_after_problem_timeout(self):
+        """Exports an explicit timeout and partial diff before running the next prompt."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates a slow first conversation and a successful second one."""
+                child = (
+                    TimeLimitedSession(
+                        [
+                            "<bash>printf first > first.txt</bash>",
+                            "Partial exploration.",
+                            "Partial final answer.",
+                        ],
+                        fast_turns=1,
+                    )
+                    if not self.children
+                    else ScriptedSession(["Second answer."])
+                )
+                self.children.append(child)
+                return child
+
+        model_id = "test/time-limited-batch"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = BatchSession([])
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                log = root / "live.log"
+                args = argparse.Namespace(
+                    model=model_id,
+                    input=str(source),
+                    repo=None,
+                    clone_dir="clones",
+                    prompt=None,
+                    output=str(output),
+                    live_log=str(log),
+                    verbose=0,
+                    backend="onnx",
+                    device=None,
+                    precision=None,
+                    provider=None,
+                    chat_template=None,
+                    max_length=100,
+                    max_tool_calls=100,
+                    harness="bash",
+                    temperature=0,
+                )
+                with (
+                    contextlib.ExitStack() as stack,
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    _run_generate(args, stack, final_answer_after=0.5, max_duration=0.8)
+                results = json.loads(output.read_text(encoding="utf-8"))["results"]
+                self.assertEqual(len(results), 2)
+                first, second = results
+                self.assertTrue(first["timed_out"])
+                self.assertIn("Problem time limit reached", first["error"])
+                self.assertEqual(first["text"], "Partial final answer.")
+                self.assertIn("+first", first["diff"])
+                timeout = first["events"][-1]
+                self.assertEqual(timeout["type"], "time_limit")
+                self.assertTrue(timeout["timed_out"])
+                self.assertEqual(timeout["limit_seconds"], 0.8)
+                self.assertGreaterEqual(timeout["elapsed_seconds"], 0.8)
+                self.assertFalse(second["timed_out"])
+                self.assertIsNone(second["error"])
+                self.assertEqual(second["text"], "Second answer.")
+                self.assertEqual(second["diff"], "")
+                self.assertEqual(len(session.children), 2)
+                self.assertFalse((repository / "first.txt").exists())
+                self.assertEqual(stdout.getvalue().strip(), "Second answer.")
+                self.assertIn("Continuing the batch", stderr.getvalue())
+                self.assertIn("[problem timeout]", log.read_text())
+        finally:
+            del _session_cache[key]
+
+    def test_generate_batch_continues_after_protocol_retries_are_exhausted(self):
+        """Exports repeated tool-format rejections and proceeds to the next problem."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        request = (
+            "<tool_call><function=bash>"
+            "<parameter=printf forbidden>ignored</parameter></function></tool_call>"
+        )
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates a malformed conversation followed by a successful one."""
+                child = ScriptedSession([request] * 3 if not self.children else ["Done."])
+                self.children.append(child)
+                return child
+
+        model_id = "test/protocol-error-batch"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = BatchSession([])
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--harness",
+                            "bash",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+                results = json.loads(output.read_text())["results"]
+                self.assertEqual(len(results), 2)
+                first, second = results
+                self.assertTrue(first["protocol_error"])
+                self.assertFalse(first["timed_out"])
+                self.assertIn("Protocol retry budget exhausted", first["error"])
+                self.assertEqual(first["tool_calls"], [])
+                rejections = [
+                    event for event in first["events"] if event["type"] == "tool_call_rejected"
+                ]
+                self.assertEqual(len(rejections), 3)
+                self.assertTrue(rejections[-1]["retry_exhausted"])
+                self.assertFalse(second["protocol_error"])
+                self.assertIsNone(second["error"])
+                self.assertEqual(second["text"], "Done.")
+                self.assertEqual(stdout.getvalue().strip(), "Done.")
+                self.assertIn("Continuing the batch", stderr.getvalue())
+                self.assertEqual(len(session.children[0].turns), 3)
+        finally:
+            del _session_cache[key]
+
     def test_generate_json_exports_failure_before_stopping(self):
         """Preserves changes and failure events without starting later prompts."""
         from locodellm.generate.generate_from_model import _session_cache
@@ -532,6 +831,49 @@ class TestPythonHarness(unittest.TestCase):
             before = index.read_bytes()
             self.assertEqual(target.diff(), "")
             self.assertEqual(index.read_bytes(), before)
+
+    def test_repository_clones_are_fresh_and_pinned(self):
+        """Clones recorded commits or HEAD without reusing or changing the source tree."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = create_repository(root / "source")
+            (source.path / "tracked.txt").write_text("updated\n")
+            source.git(
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-am",
+                "Update tracked file",
+            )
+            head = source.git("rev-parse", "HEAD").strip()
+            (source.path / "tracked.txt").write_text("preserve dirty content")
+            (source.path / "untracked.txt").write_text("preserve untracked content")
+            clone_directory = str(root / "clones")
+            pinned = GitRepository.clone(
+                str(source.path), clone_directory, revision=source.revision
+            )
+            current = GitRepository.clone(str(source.path), clone_directory)
+            self.assertNotEqual(pinned.path, current.path)
+            self.assertEqual(pinned.path.parent, root / "clones")
+            self.assertEqual(pinned.revision, source.revision)
+            self.assertEqual(current.revision, head)
+            self.assertEqual((pinned.path / "tracked.txt").read_text(), "original\n")
+            self.assertEqual((current.path / "tracked.txt").read_text(), "updated\n")
+            pinned.clean()
+            self.assertEqual((source.path / "tracked.txt").read_text(), "preserve dirty content")
+            self.assertEqual(
+                (source.path / "untracked.txt").read_text(), "preserve untracked content"
+            )
+            with self.assertRaisesRegex(RuntimeError, "Cloning .* failed"):
+                GitRepository.clone(str(root / "missing"), clone_directory)
+            with self.assertRaisesRegex(RuntimeError, "Git checkout .* failed"):
+                GitRepository.clone(str(source.path), clone_directory, revision="a" * 40)
 
     def test_live_log_paths_are_validated_before_cleanup(self):
         """Rejects log paths that would be deleted or corrupt input/output artifacts."""
@@ -1084,9 +1426,10 @@ class TestPythonHarness(unittest.TestCase):
             native.removesuffix("</tool_call>"),
         ]:
             with self.subTest(request=request):
-                result = PythonHarness().run(ScriptedSession([request]), "Problem.", 100)
+                result = PythonHarness().run(ScriptedSession([request] * 3), "Problem.", 100)
                 self.assertEqual(result.tool_calls, [])
-                self.assertIn("native Python tool call", result.error)
+                self.assertIn("native tool call", result.error)
+                self.assertTrue(result.protocol_error)
 
     def test_invalid_tagged_script_receives_tool_feedback(self):
         """Keeps invalid Python scripts on the tool execution error path."""
@@ -1142,17 +1485,214 @@ class TestPythonHarness(unittest.TestCase):
                 "I will inspect the repository.\n<python>\n" + "print('files')\n" * 1000,
                 "Malformed",
             ),
-            ("Here is a request.\n<tool_call><function=python>", "native Python tool call"),
+            ("Here is a request.\n<tool_call><function=python>", "native tool call"),
             ("<think><python>print(42)</python>", "empty answer"),
             ("", "empty answer"),
         ]:
             with self.subTest(response=response):
                 result = PythonHarness().run(
-                    ScriptedSession([response]), "Problem.", max_length=100
+                    ScriptedSession([response] * 3), "Problem.", max_length=100
                 )
                 self.assertEqual(len(result.tool_calls), 0)
                 self.assertIn(error, result.error)
                 self.assertEqual(result.text, "")
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_native_bash_request_is_reissued_without_executing_rejected_commands(self):
+        """Recovers native Bash requests through explicit feedback instead of guessing syntax."""
+        for parameter in ("printf ignored > forbidden.txt", "commands"):
+            malformed = (
+                "<think>Inspect the repository.</think>"
+                "<tool_call><function=bash>"
+                f"<parameter={parameter}>printf ignored > forbidden.txt</parameter>"
+                "</function></tool_call>"
+                "<bash>touch also_forbidden.txt</bash>"
+            )
+            session = ScriptedSession(
+                [malformed, "<bash>printf 42 > answer.txt; cat answer.txt</bash>", "Done."]
+            )
+            with self.subTest(parameter=parameter), tempfile.TemporaryDirectory() as directory:
+                with LiveLog(str(Path(directory) / "live.log")) as log:
+                    result = PythonHarness(max_tool_calls=1, bash_only=True, live_log=log).run(
+                        session, "Inspect.", 100, directory=directory
+                    )
+                    self.assertIn("[tool call rejected]", log.path.read_text())
+                self.assertIsNone(result.error)
+                self.assertFalse(result.protocol_error)
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(len(result.tool_calls), 1)
+                self.assertEqual(result.tool_calls[0].stdout, "42")
+                self.assertFalse((Path(directory) / "forbidden.txt").exists())
+                self.assertFalse((Path(directory) / "also_forbidden.txt").exists())
+                self.assertIn(
+                    "No command from your preceding response was executed", session.turns[1][0]
+                )
+                self.assertIn("<bash>YOUR COMMAND</bash>", session.turns[1][0])
+                rejected = [
+                    event
+                    for event in result.interactions
+                    if event["type"] == "tool_call_rejected"
+                ]
+                self.assertEqual(len(rejected), 1)
+                self.assertEqual(rejected[0]["executed_tool_call_count"], 0)
+                self.assertEqual(rejected[0]["retry"], 1)
+                self.assertFalse(rejected[0]["retry_exhausted"])
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_native_bash_and_python_requests_preserve_execution_order(self):
+        """Executes native commands verbatim and returns their real outputs in order."""
+        bash = (
+            "<tool_call>\n<function=bash>\n<parameter=command>\n"
+            "cat > value.txt <<'EOF'\n42\nEOF\n"
+            "if [ 1 -lt 2 ]; then printf '<think>literal</think>\\n'; fi\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        python = (
+            "<tool_call><function=python><parameter=code>"
+            "from pathlib import Path\nprint(Path('value.txt').read_text().strip())"
+            "</parameter></function></tool_call>"
+        )
+        response = f"```text\n{bash}\n```\n{bash}\n{python}"
+        session = ScriptedSession([response, "Done."])
+        result = PythonHarness(max_tool_calls=2).run(session, "Inspect.", 100)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.text, "Done.")
+        self.assertEqual([call.tool for call in result.tool_calls], ["bash", "python"])
+        self.assertEqual(
+            [call.stdout for call in result.tool_calls], ["<think>literal</think>\n", "42\n"]
+        )
+        self.assertEqual(extract_script_calls(response)[0][0], "bash")
+        self.assertLess(session.turns[1][0].index("literal"), session.turns[1][0].index("42"))
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_multiple_tool_protocols_share_order_budget_and_feedback(self):
+        """Executes mixed JSON, XML and tagged requests without treating examples as calls."""
+        python = {"name": "python", "arguments": {"code": "print('json <think>literal</think>')"}}
+        bash = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": json.dumps({"command": "printf nested"})},
+        }
+        requests = [
+            "<bash>printf tagged</bash>",
+            (
+                "<tool_call><function=bash><parameter=command>printf xml"
+                "</parameter></function></tool_call>"
+            ),
+            f"<tool_call>{json.dumps(python)}</tool_call>",
+            f"<tool_call>{json.dumps(bash)}</tool_call>",
+            "<tool_call><bash>printf wrapped</bash></tool_call>",
+        ]
+        response = f"<think>{requests[0]}</think>\n```text\n{requests[2]}\n```\n" + "\n".join(
+            requests
+        )
+        session = ScriptedSession([response, "Done."])
+        result = PythonHarness(max_tool_calls=5).run(session, "Inspect.", 100)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            [call.stdout for call in result.tool_calls],
+            ["tagged", "xml", "json <think>literal</think>\n", "nested", "wrapped"],
+        )
+        self.assertEqual(
+            result.interactions[1]["tool_protocols"],
+            ["tag", "xml", "json", "json", "wrapped-tag"],
+        )
+        self.assertIn("Remaining Python/Bash tool calls: 0", session.turns[1][0])
+        rejected = PythonHarness(max_tool_calls=4).run(
+            ScriptedSession([response]), "Inspect.", 100
+        )
+        self.assertEqual(rejected.tool_calls, [])
+        self.assertIn("requested 5 with 4 remaining", rejected.error)
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_observed_qwen_bash_envelopes_execute_without_guessing_commands(self):
+        """Supports the observed legacy wrappers while preserving the command payload."""
+        command = "printf 42 | tee answer.txt"
+        bodies = [
+            f"<function=bash><parameter={command}</parameter></function>",
+            f"<function=bash>{command}</parameter></function>",
+            f"<bash><parameter><parameter={command}</parameter></bash>",
+            f"<bash><parameter>{command}</parameter></bash>",
+            f"<bash>{command}</parameter></bash>",
+            f"<bash>{command}</bash>",
+        ]
+        for body in bodies:
+            response = f"<think>Use the <bash> tool.</think><tool_call>{body}</tool_call>"
+            session = ScriptedSession([response, "Done."])
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                result = PythonHarness(bash_only=True, max_tool_calls=1).run(
+                    session, "Inspect.", 100, directory=directory
+                )
+                self.assertIsNone(result.error)
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(len(result.tool_calls), 1)
+                self.assertEqual(result.tool_calls[0].code, command)
+                self.assertEqual(result.tool_calls[0].stdout, "42")
+                self.assertEqual((Path(directory) / "answer.txt").read_text(), "42")
+                self.assertFalse(
+                    any(event["type"] == "tool_call_rejected" for event in result.interactions)
+                )
+
+    def test_invalid_json_and_ambiguous_envelopes_reject_entire_turn(self):
+        """Rejects ambiguous payloads rather than guessing functions or dropping arguments."""
+        invalid = [
+            '{"name":"unknown","arguments":{"command":"touch forbidden.txt"}}',
+            '{"name":"bash","arguments":{"code":"touch forbidden.txt"}}',
+            '{"name":"bash","arguments":{"command":"true","timeout":10}}',
+            '{"name":"bash","arguments":{"command":"true","command":"touch forbidden.txt"}}',
+            '{"name":"python","name":"bash","arguments":{"command":"touch forbidden.txt"}}',
+            '{"name":"bash","arguments":["touch forbidden.txt"]}',
+            '{"name":"bash","arguments":"not JSON"}',
+            '{"name":"bash","arguments":{"command":42}}',
+            '{"type":"other","function":{"name":"bash","arguments":{"command":"true"}}}',
+            (
+                '{"function":{"name":"bash","arguments":"{\\"command\\":\\"true\\",'
+                '\\"command\\":\\"touch forbidden.txt\\"}"}}'
+            ),
+            '{"name":"bash","arguments":',
+            (
+                "<function=bash><parameter=command>printf first</parameter>"
+                "<parameter=command>touch forbidden.txt</parameter></function>"
+            ),
+            "<bash><parameter=unknown>touch forbidden.txt</parameter></bash>",
+            "<function=unknown>touch forbidden.txt</parameter></function>",
+            "<bash>touch forbidden.txt</parameter>",
+        ]
+        for body in invalid:
+            request = "<bash>touch forbidden.txt</bash>" + f"<tool_call>{body}</tool_call>"
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                result = PythonHarness().run(
+                    ScriptedSession([request] * 3), "Inspect.", 100, directory=directory
+                )
+                self.assertTrue(result.protocol_error)
+                self.assertEqual(result.tool_calls, [])
+                self.assertFalse((Path(directory) / "forbidden.txt").exists())
+
+    def test_invalid_native_parameters_and_empty_scripts_reject_entire_turn(self):
+        """Rejects unknown, duplicate, incomplete and empty requests before any execution."""
+        native = (
+            "<tool_call><function=bash><parameter=command>"
+            "touch forbidden.txt</parameter></function></tool_call>"
+        )
+        for request in [
+            native.replace("function=bash", "function=unknown"),
+            native.replace("parameter=command", "parameter=code"),
+            native.replace(
+                "</parameter>", "</parameter><parameter=command>touch other.txt</parameter>"
+            ),
+            native.replace("</parameter>", "</parameter><parameter=timeout>10</parameter>"),
+            native.removesuffix("</tool_call>"),
+            native.replace("touch forbidden.txt", " \n "),
+            "<bash> \n </bash>",
+            "<python> \n </python>",
+        ]:
+            with self.subTest(request=request), tempfile.TemporaryDirectory() as directory:
+                result = PythonHarness().run(
+                    ScriptedSession([native + request] * 3), "Inspect.", 100, directory=directory
+                )
+                self.assertTrue(result.protocol_error)
+                self.assertEqual(result.tool_calls, [])
+                self.assertFalse((Path(directory) / "forbidden.txt").exists())
 
     def test_literal_tool_tags_in_final_markdown_are_not_requests(self):
         """Accepts a final code block containing literal tool markers."""
@@ -1228,6 +1768,44 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(extract_code(prefix + fenced), answer)
                 self.assertEqual(strip_thinking(prefix + fenced), fenced)
         self.assertEqual(extract_code("<think>```python\nraise AssertionError()\n```"), "")
+
+    def test_tool_tag_mentions_in_thinking_do_not_hide_the_answer(self):
+        """Preserves the answer when reasoning mentions a tool's opening tag."""
+        for opening, closing in [
+            ("<bash>", "</bash>"),
+            ("<python>", "</python>"),
+            ("<tool_call>", "</tool_call>"),
+            ("<parameter=code>", "</parameter>"),
+        ]:
+            with self.subTest(opening=opening):
+                answer = f"{opening}print('literal </think>'){closing}"
+                prefix = f"<think>I need to use the {opening} tag format.</think>\n\n"
+                self.assertEqual(strip_thinking(prefix + answer), answer)
+                self.assertEqual(
+                    strip_thinking(f"<think>Use {opening}.\n{opening}print(42){closing}"), ""
+                )
+        answer = "Final answer."
+        thinking = "<think>```python\nprint('</think>')\n```\nFinish.</think>\n"
+        self.assertEqual(strip_thinking(thinking + answer), answer)
+
+    def test_malformed_bash_after_thinking_is_not_reported_as_empty(self):
+        """Reports the observed malformed call as a protocol error instead of an empty answer."""
+        call = "<tool_call>\n<bash>\ncd . && pwd && ls -la\n</parameter>\n</tool_call>"
+        response = (
+            "<think>\nI need to use the <bash> tag format, not the tool call format. "
+            "Let me reissue.\n</think>\n\n" + call
+        )
+        self.assertEqual(strip_thinking(response), call)
+        result = PythonHarness(bash_only=True).run(
+            ScriptedSession([response] * 3), "Inspect.", max_length=100
+        )
+        self.assertTrue(result.protocol_error)
+        self.assertIn("native tool call", result.error)
+        self.assertNotIn("empty answer", result.error)
+        self.assertEqual(result.tool_calls, [])
+        self.assertEqual(
+            sum(event["type"] == "tool_call_rejected" for event in result.interactions), 3
+        )
 
     def test_failed_evaluation_is_logged_without_feedback(self):
         """Records errors without revealing test outcomes to the model."""
