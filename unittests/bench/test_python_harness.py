@@ -324,6 +324,7 @@ class TestPythonHarness(unittest.TestCase):
                 "</function></tool_call>"
             ),
             "<bash>exit 99</bash><python>print(42)</python>",
+            '<tool_call>{"name":"python","arguments":{"code":"print(42)"}}</tool_call>',
         ]:
             with self.subTest(request=request):
                 result = PythonHarness(bash_only=True).run(
@@ -1563,6 +1564,110 @@ class TestPythonHarness(unittest.TestCase):
         self.assertEqual(extract_script_calls(response)[0][0], "bash")
         self.assertLess(session.turns[1][0].index("literal"), session.turns[1][0].index("42"))
 
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_multiple_tool_protocols_share_order_budget_and_feedback(self):
+        """Executes mixed JSON, XML and tagged requests without treating examples as calls."""
+        python = {"name": "python", "arguments": {"code": "print('json <think>literal</think>')"}}
+        bash = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": json.dumps({"command": "printf nested"})},
+        }
+        requests = [
+            "<bash>printf tagged</bash>",
+            (
+                "<tool_call><function=bash><parameter=command>printf xml"
+                "</parameter></function></tool_call>"
+            ),
+            f"<tool_call>{json.dumps(python)}</tool_call>",
+            f"<tool_call>{json.dumps(bash)}</tool_call>",
+            "<tool_call><bash>printf wrapped</bash></tool_call>",
+        ]
+        response = f"<think>{requests[0]}</think>\n```text\n{requests[2]}\n```\n" + "\n".join(
+            requests
+        )
+        session = ScriptedSession([response, "Done."])
+        result = PythonHarness(max_tool_calls=5).run(session, "Inspect.", 100)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            [call.stdout for call in result.tool_calls],
+            ["tagged", "xml", "json <think>literal</think>\n", "nested", "wrapped"],
+        )
+        self.assertEqual(
+            result.interactions[1]["tool_protocols"],
+            ["tag", "xml", "json", "json", "wrapped-tag"],
+        )
+        self.assertIn("Remaining Python/Bash tool calls: 0", session.turns[1][0])
+        rejected = PythonHarness(max_tool_calls=4).run(
+            ScriptedSession([response]), "Inspect.", 100
+        )
+        self.assertEqual(rejected.tool_calls, [])
+        self.assertIn("requested 5 with 4 remaining", rejected.error)
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_observed_qwen_bash_envelopes_execute_without_guessing_commands(self):
+        """Supports the observed legacy wrappers while preserving the command payload."""
+        command = "printf 42 | tee answer.txt"
+        bodies = [
+            f"<function=bash><parameter={command}</parameter></function>",
+            f"<function=bash>{command}</parameter></function>",
+            f"<bash><parameter><parameter={command}</parameter></bash>",
+            f"<bash><parameter>{command}</parameter></bash>",
+            f"<bash>{command}</parameter></bash>",
+            f"<bash>{command}</bash>",
+        ]
+        for body in bodies:
+            response = f"<think>Use the <bash> tool.</think><tool_call>{body}</tool_call>"
+            session = ScriptedSession([response, "Done."])
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                result = PythonHarness(bash_only=True, max_tool_calls=1).run(
+                    session, "Inspect.", 100, directory=directory
+                )
+                self.assertIsNone(result.error)
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(len(result.tool_calls), 1)
+                self.assertEqual(result.tool_calls[0].code, command)
+                self.assertEqual(result.tool_calls[0].stdout, "42")
+                self.assertEqual((Path(directory) / "answer.txt").read_text(), "42")
+                self.assertFalse(
+                    any(event["type"] == "tool_call_rejected" for event in result.interactions)
+                )
+
+    def test_invalid_json_and_ambiguous_envelopes_reject_entire_turn(self):
+        """Rejects ambiguous payloads rather than guessing functions or dropping arguments."""
+        invalid = [
+            '{"name":"unknown","arguments":{"command":"touch forbidden.txt"}}',
+            '{"name":"bash","arguments":{"code":"touch forbidden.txt"}}',
+            '{"name":"bash","arguments":{"command":"true","timeout":10}}',
+            '{"name":"bash","arguments":{"command":"true","command":"touch forbidden.txt"}}',
+            '{"name":"python","name":"bash","arguments":{"command":"touch forbidden.txt"}}',
+            '{"name":"bash","arguments":["touch forbidden.txt"]}',
+            '{"name":"bash","arguments":"not JSON"}',
+            '{"name":"bash","arguments":{"command":42}}',
+            '{"type":"other","function":{"name":"bash","arguments":{"command":"true"}}}',
+            (
+                '{"function":{"name":"bash","arguments":"{\\"command\\":\\"true\\",'
+                '\\"command\\":\\"touch forbidden.txt\\"}"}}'
+            ),
+            '{"name":"bash","arguments":',
+            (
+                "<function=bash><parameter=command>printf first</parameter>"
+                "<parameter=command>touch forbidden.txt</parameter></function>"
+            ),
+            "<bash><parameter=unknown>touch forbidden.txt</parameter></bash>",
+            "<function=unknown>touch forbidden.txt</parameter></function>",
+            "<bash>touch forbidden.txt</parameter>",
+        ]
+        for body in invalid:
+            request = "<bash>touch forbidden.txt</bash>" + f"<tool_call>{body}</tool_call>"
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                result = PythonHarness().run(
+                    ScriptedSession([request] * 3), "Inspect.", 100, directory=directory
+                )
+                self.assertTrue(result.protocol_error)
+                self.assertEqual(result.tool_calls, [])
+                self.assertFalse((Path(directory) / "forbidden.txt").exists())
+
     def test_invalid_native_parameters_and_empty_scripts_reject_entire_turn(self):
         """Rejects unknown, duplicate, incomplete and empty requests before any execution."""
         native = (
@@ -1685,7 +1790,7 @@ class TestPythonHarness(unittest.TestCase):
 
     def test_malformed_bash_after_thinking_is_not_reported_as_empty(self):
         """Reports the observed malformed call as a protocol error instead of an empty answer."""
-        call = "<tool_call>\n<bash>\ncd . && pwd && ls -la\n</parameter>\n</bash>\n</tool_call>"
+        call = "<tool_call>\n<bash>\ncd . && pwd && ls -la\n</parameter>\n</tool_call>"
         response = (
             "<think>\nI need to use the <bash> tag format, not the tool call format. "
             "Let me reissue.\n</think>\n\n" + call

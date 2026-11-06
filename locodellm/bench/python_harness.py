@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import math
 import os
 import re
@@ -19,19 +20,22 @@ from typing import Any
 from locodellm.utils import strip_thinking
 from locodellm.generate.live_log import LiveLog
 
-_PYTHON_CALL = re.compile(
-    r"```.*?```|<python>\s*(.*?)\s*</python>"
-    r"|<tool_call>\s*<function=(?:stateful_python_code_exec|python)>\s*"
-    r"<parameter=code>\s*((?:(?!</?parameter(?:=|>)).)*?)"
-    r"\s*</parameter>\s*</function>\s*</tool_call>"
-    r"|\A<parameter=code>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>\Z",
+_SCRIPT_CALL = re.compile(
+    r"```.*?```|(?P<python><python>.*?</python>)|(?P<bash><bash>.*?</bash>)"
+    r"|(?P<native><tool_call>.*?</tool_call>)"
+    r"|(?P<abbreviated>\A<parameter=code>.*?</parameter>\s*</function>\s*</tool_call>\Z)",
     re.DOTALL,
 )
-_SCRIPT_CALL = re.compile(
-    _PYTHON_CALL.pattern + r"|<bash>\s*(.*?)\s*</bash>"
-    r"|<tool_call>\s*<function=bash>\s*<parameter=command>\s*"
-    r"((?:(?!</?parameter(?:=|>)).)*?)\s*</parameter>\s*</function>\s*</tool_call>",
-    re.DOTALL,
+_NATIVE_FUNCTION = re.compile(r"\s*<function=([^\s<>]+)>\s*(.*?)\s*</function>\s*", re.DOTALL)
+_NATIVE_ARGUMENT = re.compile(
+    r"<parameter=([^\s<>]+)>\s*((?:(?!</?parameter(?:=|>)).)*?)\s*</parameter>", re.DOTALL
+)
+_PARAMETER_MARKER = re.compile(r"</?(?:parameter|function|tool_call)\b")
+_LEGACY_BASH_INLINE = re.compile(
+    r"(?:<parameter>\s*)?<parameter=([^<>]*?)\s*</parameter>", re.DOTALL
+)
+_LEGACY_BASH_BODY = re.compile(
+    r"(?:<parameter>\s*)?((?:(?!</?parameter\b).)*?)\s*</parameter>", re.DOTALL
 )
 _TOOL_MARKER = re.compile(
     r"```.*?```|(?P<python></?python\b)|(?P<bash></?bash\b)|(?P<native></?tool_call\b)", re.DOTALL
@@ -108,6 +112,121 @@ class HarnessResult:
     protocol_error: bool = False
 
 
+@dataclass(frozen=True)
+class ScriptRequest:
+    """Records a normalized request and the protocol used by the model."""
+
+    tool: str
+    code: str
+    protocol: str
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any] | None:
+    """Rejects duplicate JSON keys instead of silently choosing a command."""
+    result = dict(pairs)
+    return result if len(result) == len(pairs) else None
+
+
+def _parse_json_request(body: str) -> ScriptRequest | None:
+    """Parses Qwen JSON and OpenAI-style function envelopes with one string argument."""
+    try:
+        payload = json.loads(body, object_pairs_hook=_unique_json_object)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if "function" in payload:
+        if (
+            set(payload) - {"function", "type", "id"}
+            or payload.get("type", "function") != "function"
+            or ("id" in payload and not isinstance(payload["id"], str))
+        ):
+            return None
+        payload = payload["function"]
+    if not isinstance(payload, dict) or set(payload) != {"name", "arguments"}:
+        return None
+    name = payload["name"]
+    if name not in ("bash", "python", "stateful_python_code_exec"):
+        return None
+    parameter = "command" if name == "bash" else "code"
+    arguments = payload["arguments"]
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments, object_pairs_hook=_unique_json_object)
+        except json.JSONDecodeError:
+            return None
+    if (
+        not isinstance(arguments, dict)
+        or set(arguments) != {parameter}
+        or not isinstance(arguments[parameter], str)
+    ):
+        return None
+    return ScriptRequest("bash" if name == "bash" else "python", arguments[parameter], "json")
+
+
+def _parse_native_request(body: str) -> ScriptRequest | None:
+    """Parses named XML arguments and explicitly supported legacy Bash envelopes."""
+    function = _NATIVE_FUNCTION.fullmatch(body)
+    alias = re.fullmatch(r"\s*<(bash|python)>\s*(.*?)\s*</\1>\s*", body, re.DOTALL)
+    if function is None and alias is None:
+        return _parse_json_request(body)
+    match = function if function is not None else alias
+    assert match is not None
+    name, content = match.groups()
+    if name not in ("bash", "python", "stateful_python_code_exec"):
+        return None
+    tool = "bash" if name == "bash" else "python"
+    parameter = "command" if tool == "bash" else "code"
+    argument = _NATIVE_ARGUMENT.fullmatch(content)
+    if argument is not None:
+        if argument[1] != parameter:
+            return None
+        return ScriptRequest(tool, argument[2], "xml")
+    if tool == "bash":
+        inline = _LEGACY_BASH_INLINE.fullmatch(content)
+        if inline is not None:
+            return ScriptRequest(tool, inline[1], "legacy-bash")
+        legacy = _LEGACY_BASH_BODY.fullmatch(content)
+        if legacy is not None and _PARAMETER_MARKER.search(legacy[1]) is None:
+            return ScriptRequest(tool, legacy[1], "legacy-bash")
+    if alias is not None and _PARAMETER_MARKER.search(content) is None:
+        return ScriptRequest(tool, content, "wrapped-tag")
+    return None
+
+
+def _parse_script_requests(response: str) -> tuple[list[ScriptRequest], str]:
+    """Normalizes complete requests and preserves rejected markup for atomic validation."""
+    requests = []
+    unmatched = []
+    position = 0
+    for match in _SCRIPT_CALL.finditer(response):
+        unmatched.append(response[position : match.start()])
+        position = match.end()
+        kind = match.lastgroup
+        if kind is None:
+            continue
+        request = None
+        if kind in ("python", "bash"):
+            request = ScriptRequest(kind, match[0][len(kind) + 2 : -len(kind) - 3].strip(), "tag")
+        elif kind == "native":
+            request = _parse_native_request(match[0][11:-12].strip())
+        else:
+            argument = re.fullmatch(
+                r"<parameter=code>\s*((?:(?!</?parameter(?:=|>)).)*?)"
+                r"\s*</parameter>\s*</function>\s*</tool_call>",
+                match[0],
+                re.DOTALL,
+            )
+            if argument is not None:
+                request = ScriptRequest("python", argument[1], "abbreviated-python")
+        if request is None:
+            unmatched.append(match[0])
+        else:
+            requests.append(request)
+    unmatched.append(response[position:])
+    return requests, "".join(unmatched)
+
+
 def extract_python_calls(text: str) -> list[str]:
     """Extracts explicit Python requests outside thinking and Markdown fences."""
     return [code for tool, code in extract_script_calls(text) if tool == "python"]
@@ -115,12 +234,8 @@ def extract_python_calls(text: str) -> list[str]:
 
 def extract_script_calls(text: str) -> list[tuple[str, str]]:
     """Extracts ordered Python and Bash requests outside thinking and Markdown."""
-    return [
-        ("bash" if index in (3, 4) else "python", code)
-        for match in _SCRIPT_CALL.finditer(strip_thinking(text))
-        for index, code in enumerate(match.groups())
-        if code is not None
-    ]
+    requests, _ = _parse_script_requests(strip_thinking(text))
+    return [(request.tool, request.code) for request in requests]
 
 
 def generate_with_trace(
@@ -442,6 +557,17 @@ class PythonHarness:
                 "Every <tool_call>...</tool_call> block is an execution request, "
                 "never a final answer."
             )
+        else:
+            tool_instructions += (
+                "\nNative XML tool calls with function=bash and parameter=command "
+                "are also accepted, as are JSON requests such as "
+                '<tool_call>{"name":"bash","arguments":{"command":"YOUR COMMAND"}}</tool_call>.'
+            )
+            if not self.bash_only:
+                tool_instructions += (
+                    " For Python, use function/name python and parameter/code code."
+                )
+            tool_rules += "\nEvery <tool_call>...</tool_call> block is also an execution request."
         message = (
             _INSTRUCTIONS.format(
                 tool_instructions=tool_instructions,
@@ -515,7 +641,8 @@ class PythonHarness:
                 if not finalizing and final_deadline is not None and now >= final_deadline:
                     continue
                 response = strip_thinking(session.text)
-                calls = extract_script_calls(response)
+                requests, unmatched = _parse_script_requests(response)
+                calls = [(request.tool, request.code) for request in requests]
                 budget_label = (
                     "Bash"
                     if self.bash_only
@@ -527,7 +654,9 @@ class PythonHarness:
                     )
                 )
                 result.interactions[-1]["requested_tool_call_count"] = len(calls)
-                unmatched = _SCRIPT_CALL.sub("", response)
+                result.interactions[-1]["tool_protocols"] = [
+                    request.protocol for request in requests
+                ]
                 marker = next(
                     (
                         match
@@ -577,8 +706,8 @@ class PythonHarness:
                             "Use only the declared functions and their required parameter. "
                             if native_tools
                             else (
-                                "Do not use <tool_call>, <function=...>, "
-                                "or <parameter=...> tags. "
+                                "Accepted protocols include script tags, named XML parameters "
+                                "and JSON tool calls. "
                             )
                         )
                         + (

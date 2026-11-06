@@ -158,6 +158,25 @@ keeps the existing tag-based prompting instead of native tool declarations.
 For Nemotron, omit that option and use `--temperature 1` to follow NVIDIA's
 recommended sampling; the checkpoint supplies `top_p=0.95`.
 
+The parser accepts multiple protocols in the same response, independently of
+`--chat-template`: script tags, native XML, wrapped `<tool_call><bash>...`
+requests, and Qwen JSON:
+
+```xml
+<tool_call>{"name":"bash","arguments":{"command":"git status --short"}}</tool_call>
+```
+
+OpenAI-style `function` objects inside `<tool_call>` are also supported, including
+JSON-encoded `arguments`. A bounded compatibility parser handles the legacy Bash
+envelopes observed with Qwen, such as
+`<tool_call><function=bash><parameter=pwd</parameter></function></tool_call>`.
+It extracts the enclosed command verbatim, without reconstructing missing commands
+or accepting unknown parameters. Unsupported envelopes and ambiguous requests are
+rejected atomically, including duplicate JSON keys. Markdown examples and reasoning
+are never executed. All protocols share the existing tool budget, time limits and
+Bash-only restrictions; `tool_protocols` in model-response events records the
+recognized formats.
+
 Add `--live-log` to create a retained temporary transcript, or choose its path:
 
 ```bash
