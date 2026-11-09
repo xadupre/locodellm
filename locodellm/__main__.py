@@ -358,13 +358,15 @@ def _run_generate(
             Path(args.output).write_text(
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
-        if result.timed_out or result.protocol_error or result.empty_answer:
+        if result.error is not None:
             if result.timed_out:
                 reason, section = "timed out", "problem timeout"
             elif result.protocol_error:
                 reason, section = "has an invalid tool protocol", "problem protocol error"
-            else:
+            elif result.empty_answer:
                 reason, section = "returned an empty answer", "problem empty answer"
+            else:
+                reason, section = "failed", "problem failure"
             if live_log is not None:
                 live_log.section(section, f"{result.error}")
             print(
@@ -374,10 +376,6 @@ def _run_generate(
                 flush=True,
             )
             continue
-        if result.error:
-            if live_log is not None:
-                live_log.section("harness error", result.error)
-            raise RuntimeError(result.error)
         print(result.text, flush=True)
 
 

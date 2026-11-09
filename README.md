@@ -56,7 +56,9 @@ If correction fails, the result has `protocol_error: true` and the batch
 continues. These retries do not reset the time budget. An empty final answer,
 including reasoning without a final response, is recorded with `empty_answer: true`
 and an explicit error; its trace and diff are saved before the next problem runs.
-Other harness errors still stop the batch.
+Other model failures, such as requesting tools after finalization or exceeding
+the tool budget, are also recorded without stopping the batch. Loading,
+repository and infrastructure exceptions still propagate.
 The budget starts after model
 loading and repository cleanup, and resets for each problem. Generation
 stops at token boundaries; script timeouts are capped by the remaining budget.
