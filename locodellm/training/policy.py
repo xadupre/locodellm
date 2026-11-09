@@ -27,7 +27,7 @@ def load_policy(model_name, adapter, *, train, device):
         if device.startswith("cuda") and torch.cuda.is_bf16_supported()
         else torch.float32
     )
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
     if adapter:
         model = PeftModel.from_pretrained(model, adapter, is_trainable=train)
     elif train:
