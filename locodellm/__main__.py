@@ -48,6 +48,9 @@ bench
         python -m locodellm bench mock/generate basic --chat-template chatml
         python -m locodellm bench mock/generate basic --chat-template chatml -o results.csv
 
+train
+    Trains a native PyTorch LoRA policy on multi-turn export-discovery trajectories.
+
 """
 
 from __future__ import annotations
@@ -619,6 +622,9 @@ def main(args: list[str] | None = None) -> None:
     sub.add_parser("version", help="Print the package version.")
     sub.add_parser("benchmarks", help="List available built-in and LM-Eval benchmarks.")
     sub.add_parser("models", help="List available mock ONNX test models.")
+    from locodellm.training import cli
+
+    cli.add_parser(sub)
 
     gen_parser = sub.add_parser(
         "generate",
@@ -908,6 +914,7 @@ def main(args: list[str] | None = None) -> None:
         "generate": _cmd_generate,
         "chat": _cmd_chat,
         "bench": _cmd_bench,
+        "train": cli.run,
     }
     dispatch[parsed.command](parsed)
 

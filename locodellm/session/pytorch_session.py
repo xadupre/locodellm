@@ -94,6 +94,7 @@ class PyTorchSessionState(SessionState):
         self.messages: list[dict[str, str]] = []
         self.tools: list[dict[str, Any]] = []
         self.chat_template_kwargs: dict[str, Any] = {}
+        self.last_generated_tokens: list[int] = []
 
     def configure_tools(self, tools: list[dict[str, Any]]) -> bool:
         """Enables declared tools for native Qwen3-Coder-compatible templates."""
@@ -210,6 +211,7 @@ class PyTorchSessionState(SessionState):
                 **options,
             )
         new_tokens = output[0, len(context) :].tolist()
+        self.last_generated_tokens = list(new_tokens)
         eos = options.get("eos_token_id", self.model.generation_config.eos_token_id)
         eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         while new_tokens and new_tokens[-1] in eos_ids:

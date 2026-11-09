@@ -342,6 +342,77 @@ session.generate("<s>", max_length=10)
 
 ## Benchmarks
 
+### Multi-turn SLM-GRPO training on ATen discovery tasks
+
+The `train` command applies the SLM-GRPO paper's LoRA/GRPO protocol to the
+ATen JSONL datasets. Install the optional dependencies with
+`python -m pip install ".[train]"` and prepare the target repository's dependencies
+using `verification.environment` in the dataset. Models may be local checkpoints.
+
+**Safety:** training executes arbitrary model-generated Python/Bash, including
+independent verification. The subprocesses and fresh Git clones are **not security
+sandboxes**. Run only inside a disposable, unprivileged container/VM without
+secrets or sensitive mounts; prepare dependencies and model weights beforehand.
+`--allow-code-execution` is mandatory. The initial automatic repository clone
+requires network access; use `--repo` with a clean local checkout at the recorded
+revision for offline training.
+
+```bash
+python -m locodellm train Qwen/Qwen3-0.6B \
+  --protocol slm-grpo \
+  --input datasets/yobx/aten_failures_set_1.jsonl \
+  --output runs/aten-slm-grpo \
+  --device cuda --epochs 2 --group-size 4 \
+  --harness bash --max-tool-calls 10 --max-new-tokens 2048 \
+  --allow-code-execution
+```
+
+Each group contains independent **multi-turn trajectories for the same task**.
+Every trajectory starts a fresh conversation and repository clone. Tool results
+become subsequent prompts; one final `export_failure_reward` is shared by all
+assistant actions in that trajectory. The loss is averaged over all its generated
+tokens, then over trajectories, **not over turns**. Prompt, tool-result and template
+tokens are context only. Exact sampled token ids (including EOS) and frozen
+old-policy probabilities are retained per turn; subsequent updates never
+reconstruct actions by re-tokenizing text.
+
+Defaults follow SLM-GRPO: group size 8, 5 epochs, learning rate `1e-5`,
+temperature `0.9`, LoRA rank 32/alpha 64, one update per group, no KL term,
+and centered but unnormalized advantages. `--normalize-advantages` enables
+standard-deviation scaling. `--updates-per-group` reuses the same frozen old
+policy probabilities for clipped GRPO updates.
+
+The final answer must include a complete runnable script in Python Markdown
+fences. The verifier instruments real `to_onnx(module, inputs, ...)` calls,
+executes the reference module, validates `target_opset=18, optimize=False`,
+and checks ONNX metadata and CPU ONNX Runtime outputs (`rtol=atol=2e-3`).
+Use explicit `input_names` and a tuple of tensor inputs for runtime comparison;
+nested or ambiguous input mappings are marked unverified, not failures.
+Converter exceptions count only when the traceback identifies an actual ATen
+converter. Invalid reference inputs and unrelated script exceptions do not count
+as export failures. Failure/reproduction credit also requires reaching the task's
+converter or a same-family helper route listed in its reference metadata.
+Unrelated converters and unrecognized tracing bypasses cannot earn this credit.
+Conversion routes and tracing mode are recorded.
+
+Two fresh-process replays in separate clones of the recorded revision supply
+the four factual criteria; the best verified example receives the additive
+reward described below. Extraction alone gets the existing 0.05 floor.
+Source modifications during exploration or an incomplete/erroring tool conversation
+receive zero. Source modifications during replay invalidate all verified criteria.
+This is **not** semantic reference matching: neither `expected_answer` nor issue
+links are sent to the solving policy. Pre-existing patches recorded in reference
+metadata are not applied; only failures reproduced on the pinned clean sources
+can earn reproduction credit. Generated code is not an adversarially secure
+verification boundary; isolation remains the caller's responsibility.
+
+`--output` must be empty or absent. It receives `config.json`, `train.jsonl`
+(all prompts, actions, tool responses, probabilities and verification diagnostics),
+retained `repositories/run-*` clones, and the final `adapter/`. Checkpoints are
+published every 10 minutes at an update boundary; `--checkpoint-minutes` and
+`--checkpoint-steps` adjust this. `--adapter PATH` warm-starts saved LoRA weights,
+not optimizer/RNG state. Use set 2 separately for held-out evaluation.
+
 ### Export-failure reward
 
 `export_failure_reward` scores one clearly extracted example using four
