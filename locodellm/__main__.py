@@ -51,6 +51,9 @@ bench
 train
     Trains a native PyTorch LoRA policy on multi-turn export-discovery trajectories.
 
+evaluate
+    Scores saved ATen generations and prints a factual final report.
+
 """
 
 from __future__ import annotations
@@ -224,6 +227,13 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         _run_generate(args, stack)
 
 
+def _cmd_evaluate(args: argparse.Namespace) -> None:
+    """Scores saved ATen generations and prints a factual final report."""
+    from locodellm.bench.export_evaluation import run
+
+    run(args)
+
+
 def _run_generate(
     args: argparse.Namespace,
     stack: ExitStack,
@@ -255,13 +265,45 @@ def _run_generate(
         else ([args.prompt], None)
     )
     target = GitRepository(repository) if repository is not None else None
+    evaluation_output = None
+    evaluation_tasks = None
+    if (
+        args.input is not None
+        and Path(args.input).suffix.lower() == ".jsonl"
+        and not getattr(args, "no_evaluate", False)
+    ):
+        records = [
+            json.loads(line)
+            for line in Path(args.input).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if any(
+            isinstance(record.get("function"), str) and record["function"].startswith("aten_")
+            for record in records
+        ):
+            from locodellm.training.export_verifier import load_tasks
+
+            evaluation_tasks = load_tasks(args.input)
+            if (
+                target is None
+                or target.revision != evaluation_tasks[0]["verification"]["revision"]
+            ):
+                raise ValueError("ATen evaluation requires the dataset's recorded revision.")
+            if args.output:
+                evaluation_output = Path(args.output).with_suffix(".evaluation.json")
+                if any(
+                    filename is not None
+                    and evaluation_output.resolve() == Path(filename).resolve()
+                    for filename in (args.input, args.live_log or None)
+                ):
+                    raise ValueError("The evaluation report must differ from the input and log.")
     if args.live_log and any(
         filename is not None and Path(args.live_log).resolve() == Path(filename).resolve()
         for filename in (args.input, args.output)
     ):
         raise ValueError("The live log must differ from the input and output JSON files.")
     if target is not None:
-        for filename in (args.input, args.output, args.live_log or None):
+        for filename in (args.input, args.output, args.live_log or None, evaluation_output):
             if filename is not None and Path(filename).resolve().is_relative_to(target.path):
                 raise ValueError(
                     "Input/output JSON and live log files must be outside the target repository."
@@ -347,14 +389,14 @@ def _run_generate(
         if live_log is not None:
             document["live_log"] = str(live_log.path)
         documents.append(document)
+        exported = (
+            {"repo": repository, "base_revision": target.revision, "results": documents}
+            if target is not None
+            else document
+        )
         if args.output:
             if args.verbose:
                 print(f"[generate] saving {args.output!r}", file=sys.stderr, flush=True)
-            exported = (
-                {"repo": repository, "base_revision": target.revision, "results": documents}
-                if target is not None
-                else document
-            )
             Path(args.output).write_text(
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
@@ -377,6 +419,32 @@ def _run_generate(
             )
             continue
         print(result.text, flush=True)
+    if evaluation_tasks is not None:
+        import tempfile
+
+        from locodellm.bench.export_evaluation import evaluate, print_report
+
+        del session, loaded
+        print(
+            "[generate] evaluating ATen answers: generated Python may be executed "
+            "(not sandboxed).",
+            file=sys.stderr,
+            flush=True,
+        )
+        with tempfile.TemporaryDirectory(prefix="locodellm-generated-") as directory:
+            results_path = Path(args.output) if args.output else Path(directory) / "events.json"
+            if not args.output:
+                results_path.write_text(json.dumps(exported), encoding="utf-8")
+            report = evaluate(
+                Path(args.input),
+                results_path,
+                allow_execution=True,
+                timeout=args.verification_timeout,
+                output=evaluation_output,
+            )
+        print_report(report)
+        if evaluation_output is not None:
+            print(f"Report: {evaluation_output.resolve()}", flush=True)
 
 
 def _cmd_chat(args: argparse.Namespace) -> None:
@@ -627,6 +695,19 @@ def main(args: list[str] | None = None) -> None:
 
     cli.add_parser(sub)
 
+    evaluate_parser = sub.add_parser(
+        "evaluate", help="Score saved ATen generations and print a factual report."
+    )
+    evaluate_parser.add_argument("--input", required=True, help="Pinned ATen dataset JSONL.")
+    evaluate_parser.add_argument("--results", required=True, help="Saved generate output JSON.")
+    evaluate_parser.add_argument("--output", "-o", help="Also saves the evaluation as JSON.")
+    evaluate_parser.add_argument("--verification-timeout", type=float, default=60)
+    evaluate_parser.add_argument(
+        "--allow-code-execution",
+        action="store_true",
+        help="Allows generated Python replays; requires a disposable isolated environment.",
+    )
+
     gen_parser = sub.add_parser(
         "generate",
         help="Generate text from a prompt.",
@@ -720,6 +801,17 @@ def main(args: list[str] | None = None) -> None:
     )
     gen_parser.add_argument(
         "--output", "-o", default=None, help="Writes the conversation and tool events as JSON."
+    )
+    gen_parser.add_argument(
+        "--no-evaluate",
+        action="store_true",
+        help="Disables automatic ATen evaluation, which executes generated Python.",
+    )
+    gen_parser.add_argument(
+        "--verification-timeout",
+        type=float,
+        default=60,
+        help="Seconds per independent ATen verification replay (default: 60).",
     )
     gen_parser.add_argument(
         "--live-log",
@@ -871,6 +963,8 @@ def main(args: list[str] | None = None) -> None:
     if parsed.command == "chat" and parsed.max_length < 1:
         chat_parser.error("--max-length must be positive")
     if parsed.command == "generate":
+        if not math.isfinite(parsed.verification_timeout) or parsed.verification_timeout <= 0:
+            gen_parser.error("--verification-timeout must be finite and positive")
         if not math.isfinite(parsed.temperature) or parsed.temperature < 0:
             gen_parser.error("--temperature must be finite and nonnegative")
         if (parsed.prompt is None) == (parsed.input is None):
@@ -916,6 +1010,7 @@ def main(args: list[str] | None = None) -> None:
         "chat": _cmd_chat,
         "bench": _cmd_bench,
         "train": cli.run,
+        "evaluate": _cmd_evaluate,
     }
     dispatch[parsed.command](parsed)
 

@@ -16,6 +16,56 @@ from locodellm.generate.repository import GitRepository
 from locodellm.utils import strip_thinking
 
 
+def load_tasks(filename: str, limit: int | None = None) -> list[dict]:
+    """Loads pinned JSONL discovery tasks without copying references into prompts."""
+    tasks = []
+    identities = set()
+    identifiers = set()
+    with Path(filename).open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"JSONL line {line_number} must be an object.")
+            if any(
+                not isinstance(record.get(key), str) or not record[key].strip()
+                for key in ("id", "prompt", "repository", "function")
+            ):
+                raise ValueError(
+                    f"JSONL line {line_number} requires id, prompt, repository and function."
+                )
+            verification = record.get("verification")
+            if (
+                not isinstance(verification, dict)
+                or not isinstance(verification.get("revision"), str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", verification["revision"]) is None
+            ):
+                raise ValueError(f"JSONL line {line_number} requires a full verification SHA.")
+            if record["id"] in identifiers:
+                raise ValueError(f"Duplicate task id: {record['id']}")
+            identifiers.add(record["id"])
+            identities.add((record["repository"], verification["revision"]))
+            tasks.append(record)
+    if not tasks or len(identities) != 1:
+        raise ValueError("Tasks must be nonempty and share one repository and revision.")
+    if limit is not None and limit < 1:
+        raise ValueError("The task limit must be positive.")
+    return tasks if limit is None else tasks[:limit]
+
+
+def allowed_converters(task: dict) -> set[str]:
+    """Returns the target converter and recorded same-family helpers."""
+    names = {task["function"]}
+    for example in task.get("expected_answer", {}).get("examples", []):
+        names.update(
+            name
+            for name in example.get("actual_converters", [])
+            if name.startswith(task["function"] + "_")
+        )
+    return names
+
+
 @dataclass
 class ExportReward:
     """Records the factual reward and independent replay evidence."""

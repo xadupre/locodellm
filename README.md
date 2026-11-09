@@ -257,6 +257,42 @@ The selected repository is reset and nonignored untracked files are removed
 before every prompt. Keep the dataset, output, and live log outside that
 repository. No dependencies are installed in the clone.
 
+`generate` automatically evaluates pinned ATen JSONL tasks (records with an
+`aten_*` function) and prints the final factual report to **stdout**, including
+failed model answers. No second command is needed. With `--output events.json`,
+it also saves the report as `events.evaluation.json`; without `--output`, the
+report is printed without saving files. Other prompt formats are unchanged.
+Use `--no-evaluate` to disable this step, or `--verification-timeout SECONDS` to
+set the timeout per independent replay.
+
+Automatic evaluation executes generated Python, just as the task harness does;
+run ATen generation in a disposable isolated environment. To score saved answers
+separately without loading the model again:
+
+```bash
+python -m locodellm evaluate \
+  --input datasets/yobx/aten_failures_set_2.jsonl \
+  --results events.json --output evaluation.json \
+  --verification-timeout 60 --allow-code-execution
+```
+
+The final report is printed to **stdout**: mean training reward out of one,
+counts for each factual criterion, tool usage, missing tasks, and per-problem
+scores and observed errors. Partial reward is not a bug-discovery success rate.
+The optional JSON report includes replay evidence and the generation file's
+SHA-256, so it can be associated with the correct run. Saved prompts and source
+revision must match the dataset; the original generation clone must still exist.
+Incomplete batches are clearly marked, with their mean computed only over the
+evaluated tasks. Model failures and source-modifying answers receive zero;
+infrastructure errors still fail the command.
+
+Evaluation uses the same verifier as training, executing generated Python twice
+in fresh temporary clones when a final script is extractable. It is **not a
+sandbox**: the standalone command requires `--allow-code-execution` and a
+disposable isolated environment.
+Temporary verification clones are removed afterwards; diagnostics remain in the
+JSON report.
+
 ### Python API
 
 #### `create_session` and `session.generate`

@@ -371,6 +371,197 @@ def test_export_extraction_opt_in_and_timeout(tmp_path):
     assert all(replay["timed_out"] for replay in result.replays)
 
 
+@pytest.fixture
+def saved_export_batch(tmp_path):
+    """Creates saved generations with a failure, missing code and rejected rollouts."""
+    source = make_export_repository(tmp_path / "source")
+    tasks = [
+        {
+            "id": f"task-{index}",
+            "function": "aten_fixture",
+            "prompt": f"Investigate export case {index}.",
+            "repository": str(source.path),
+            "verification": {"revision": source.revision},
+        }
+        for index in range(5)
+    ]
+    dataset = tmp_path / "tasks.jsonl"
+    dataset.write_text("".join(json.dumps(task) + "\n" for task in tasks))
+    rows = [
+        {
+            "prompt": task["prompt"],
+            "text": export_answer() if index != 1 else "All tests passed, trust me.",
+            "tool_call_count": 0 if index == 1 else 1,
+            "error": "Final answer refused" if index == 2 else None,
+            "diff": "Source changed" if index == 3 else "",
+        }
+        for index, task in enumerate(tasks[:4])
+    ]
+    results = tmp_path / "events.json"
+    results.write_text(
+        json.dumps({"repo": str(source.path), "base_revision": source.revision, "results": rows})
+    )
+    return source, dataset, results
+
+
+def test_export_evaluation_cli_report(saved_export_batch, tmp_path, capsys):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.__main__ import main
+
+    source, dataset, results = saved_export_batch
+    output = tmp_path / "evaluation.json"
+    main(
+        [
+            "evaluate",
+            "--input",
+            str(dataset),
+            "--results",
+            str(results),
+            "--output",
+            str(output),
+            "--allow-code-execution",
+        ]
+    )
+    report = json.loads(output.read_text())
+    assert report["summary"]["mean_reward"] == 0.25
+    assert report["summary"]["missing_tasks"] == 1
+    assert report["summary"]["generation_tool_calls"] == 3
+    assert report["summary"]["independent_replays"] == 2
+    assert [row["total"] for row in report["results"]] == [1, 0, 0, 0]
+    assert report["results"][0]["criteria"]["reproduction_valid"]
+    assert not report["results"][1]["criteria"]["answer_extractable"]
+    assert all(not row["replays"] for row in report["results"][1:])
+    stdout = capsys.readouterr().out
+    assert "Mean reward: 0.2500 / 1" in stdout
+    assert "Evaluated: 4/5 tasks" in stdout
+    assert "Confirmed converter failures: 1/4" in stdout
+    assert "WARNING: 1 missing tasks" in stdout
+    assert "No extractable runnable Python" in stdout
+    assert "Final answer refused" in stdout
+    assert "Repository modified during generation" in stdout
+    assert f"Report: {output}" in stdout
+    assert not source.diff()
+
+
+@pytest.mark.parametrize("mode", ["saved", "stdout", "disabled"])
+def test_generate_automatically_evaluates_aten(saved_export_batch, mode, capsys):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.__main__ import main
+    from locodellm.generate.generate_from_model import _session_cache
+    from unittests.bench.test_python_harness import ScriptedSession
+
+    class BatchSession(ScriptedSession):
+        def new_session(self):
+            """Creates a model failure followed by a complete export reproducer."""
+            child = ScriptedSession([""] if not self.children else [export_answer()])
+            self.children.append(child)
+            return child
+
+    source, dataset, results = saved_export_batch
+    tasks = [json.loads(line) for line in dataset.read_text().splitlines()][:2]
+    dataset.write_text("".join(json.dumps(task) + "\n" for task in tasks))
+    model_id = f"test/automatic-aten-evaluation-{mode}"
+    key = (model_id, None, None, (), "{}")
+    assert key not in _session_cache
+    _session_cache[key] = BatchSession([])
+    output = results.with_suffix(".evaluation.json")
+    options = [
+        "generate",
+        model_id,
+        "--input",
+        str(dataset),
+        "--repo",
+        str(source.path),
+        "--harness",
+        "bash",
+    ]
+    if mode == "saved":
+        options.extend(["--output", str(results)])
+    elif mode == "disabled":
+        options.extend(["--no-evaluate", "--output", str(results)])
+    try:
+        main(options)
+    finally:
+        del _session_cache[key]
+    stdout = capsys.readouterr().out
+    if mode == "disabled":
+        assert "ATen export evaluation" not in stdout
+        assert not output.exists()
+    else:
+        assert "ATen export evaluation" in stdout
+        assert "Mean reward: 0.5000 / 1" in stdout
+        assert "Evaluated: 2/2 tasks" in stdout
+        assert "Confirmed converter failures: 1/2" in stdout
+        assert "The model returned an empty answer" in stdout
+        if mode == "saved":
+            import hashlib
+
+            report = json.loads(output.read_text())
+            assert report["generation_sha256"] == hashlib.sha256(results.read_bytes()).hexdigest()
+            assert report["summary"]["mean_reward"] == 0.5
+            assert f"Report: {output}" in stdout
+        else:
+            assert not output.exists()
+            assert "Report:" not in stdout
+    assert not source.diff()
+
+
+def test_generate_aten_validation_before_loading(saved_export_batch, capsys):
+    from locodellm.__main__ import main
+
+    source, dataset, _ = saved_export_batch
+    tasks = [json.loads(line) for line in dataset.read_text().splitlines()]
+    for task in tasks:
+        task["verification"]["revision"] = "0" * 40
+    dataset.write_text("".join(json.dumps(task) + "\n" for task in tasks))
+    common = ["generate", "unused/model", "--input", str(dataset), "--repo", str(source.path)]
+    with pytest.raises(ValueError, match="recorded revision"):
+        main(common)
+    for timeout in ("0", "nan", "inf"):
+        with pytest.raises(SystemExit) as error:
+            main([*common, "--verification-timeout", timeout])
+        assert error.value.code == 2
+    assert "loading model" not in capsys.readouterr().err
+
+
+def test_export_evaluation_execution_opt_in_and_paths(saved_export_batch, tmp_path):
+    from locodellm.bench.export_evaluation import evaluate
+
+    source, dataset, results = saved_export_batch
+    with pytest.raises(PermissionError, match="allow-code-execution"):
+        evaluate(dataset, results, allow_execution=False)
+    for timeout in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            evaluate(dataset, results, allow_execution=True, timeout=timeout)
+    for output in (dataset, results, source.path / "evaluation.json"):
+        with pytest.raises(ValueError, match="output must"):
+            evaluate(dataset, results, allow_execution=True, output=output)
+    assert not (tmp_path / "evaluation.json").exists()
+
+
+@pytest.mark.parametrize("problem", ["revision", "unknown", "duplicate", "empty", "count"])
+def test_export_evaluation_rejects_mismatched_results(saved_export_batch, problem):
+    from locodellm.bench.export_evaluation import evaluate
+
+    _, dataset, results = saved_export_batch
+    document = json.loads(results.read_text())
+    if problem == "revision":
+        document["base_revision"] = "0" * 40
+    elif problem == "unknown":
+        document["results"][0]["prompt"] = "A prompt from another run."
+    elif problem == "duplicate":
+        document["results"].append(document["results"][0])
+    elif problem == "empty":
+        document["results"] = []
+    else:
+        document["results"][0]["tool_call_count"] = -1
+    results.write_text(json.dumps(document))
+    with pytest.raises(ValueError):
+        evaluate(dataset, results, allow_execution=True)
+
+
 def test_multiturn_token_weighted_gradient(tmp_path):
     torch = pytest.importorskip("torch")
     from locodellm.training.grpo import Turn, trajectory_backward

@@ -8,7 +8,6 @@ import json
 import math
 from pathlib import Path
 import random
-import re
 import time
 
 import torch
@@ -16,7 +15,12 @@ import torch
 from locodellm.bench.python_harness import PythonHarness
 from locodellm.generate.repository import GitRepository
 from locodellm.session.pytorch_session import PyTorchSessionState
-from locodellm.training.export_verifier import ExportReward, verify_export_answer
+from locodellm.training.export_verifier import (
+    ExportReward,
+    allowed_converters,
+    load_tasks,
+    verify_export_answer,
+)
 from locodellm.training.optimization import completion_log_probs, group_advantages, policy_loss
 from locodellm.training.policy import load_policy, save_adapter
 
@@ -55,44 +59,6 @@ class TrainingSession(PyTorchSessionState):
             )
         self.turns.append(Turn(tokens.cpu(), prompt_length, old.detach().cpu()))
         return self
-
-
-def load_tasks(filename: str, limit: int | None = None) -> list[dict]:
-    """Loads pinned JSONL discovery tasks without copying references into prompts."""
-    tasks = []
-    identities = set()
-    identifiers = set()
-    with Path(filename).open(encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, 1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError(f"JSONL line {line_number} must be an object.")
-            if any(
-                not isinstance(record.get(key), str) or not record[key].strip()
-                for key in ("id", "prompt", "repository", "function")
-            ):
-                raise ValueError(
-                    f"JSONL line {line_number} requires id, prompt, repository and function."
-                )
-            verification = record.get("verification")
-            if (
-                not isinstance(verification, dict)
-                or not isinstance(verification.get("revision"), str)
-                or re.fullmatch(r"[0-9a-fA-F]{40}", verification["revision"]) is None
-            ):
-                raise ValueError(f"JSONL line {line_number} requires a full verification SHA.")
-            if record["id"] in identifiers:
-                raise ValueError(f"Duplicate task id: {record['id']}")
-            identifiers.add(record["id"])
-            identities.add((record["repository"], verification["revision"]))
-            tasks.append(record)
-    if not tasks or len(identities) != 1:
-        raise ValueError("Training requires nonempty tasks sharing one repository and revision.")
-    if limit is not None and limit < 1:
-        raise ValueError("The task limit must be positive.")
-    return tasks if limit is None else tasks[:limit]
 
 
 def trajectory_backward(model, turns: list[Turn], advantage, *, temperature, group_size):
@@ -167,20 +133,13 @@ def sample_trajectory(model, tokenizer, task, source, args):
             [],
         )
     else:
-        allowed_converters = {task["function"]}
-        for example in task.get("expected_answer", {}).get("examples", []):
-            allowed_converters.update(
-                name
-                for name in example.get("actual_converters", [])
-                if name.startswith(task["function"] + "_")
-            )
         reward = verify_export_answer(
             result.text,
             source,
             args.output / "repositories",
             allow_execution=args.allow_code_execution,
             timeout=args.verification_timeout,
-            allowed_converters=allowed_converters,
+            allowed_converters=allowed_converters(task),
         )
     return session.turns, {
         "task_id": task["id"],
