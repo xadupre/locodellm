@@ -53,8 +53,10 @@ Malformed or unsupported tool-call formats receive up to two requests to
 reissue the call in the allowed format. No commands from a rejected response
 are executed, and each rejection is recorded as `tool_call_rejected`.
 If correction fails, the result has `protocol_error: true` and the batch
-continues. These retries do not reset the time budget. Other harness errors
-still stop the batch.
+continues. These retries do not reset the time budget. An empty final answer,
+including reasoning without a final response, is recorded with `empty_answer: true`
+and an explicit error; its trace and diff are saved before the next problem runs.
+Other harness errors still stop the batch.
 The budget starts after model
 loading and repository cleanup, and resets for each problem. Generation
 stops at token boundaries; script timeouts are capped by the remaining budget.

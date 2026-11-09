@@ -745,6 +745,88 @@ class TestPythonHarness(unittest.TestCase):
         finally:
             del _session_cache[key]
 
+    def test_generate_batch_continues_after_empty_answers(self):
+        """Records empty final answers without aborting later independent problems."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates two empty conversations followed by a successful one."""
+                responses = [
+                    [""],
+                    [
+                        (
+                            "<python>from pathlib import Path\n"
+                            "Path('evidence.txt').write_text('kept')</python>"
+                        ),
+                        "<think>Unfinished reasoning",
+                    ],
+                    ["Done."],
+                ]
+                child = ScriptedSession(responses[len(self.children)])
+                self.children.append(child)
+                return child
+
+        model_id = "test/empty-answer-batch"
+        key = (model_id, None, None, (), "{}")
+        session = BatchSession([])
+        self.assertNotIn(key, _session_cache)
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps(
+                        {"repo": str(repository), "prompts": ["First.", "Second.", "Third."]}
+                    ),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                log = root / "live.log"
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--harness",
+                            "python",
+                            "--output",
+                            str(output),
+                            "--live-log",
+                            str(log),
+                        ]
+                    )
+                results = json.loads(output.read_text())["results"]
+                self.assertEqual(len(results), 3)
+                for result in results[:2]:
+                    self.assertTrue(result["empty_answer"])
+                    self.assertEqual(result["error"], "The model returned an empty answer.")
+                    self.assertEqual(result["text"], "")
+                    self.assertFalse(result["protocol_error"])
+                    self.assertFalse(result["timed_out"])
+                self.assertEqual(results[0]["tool_calls"], [])
+                self.assertEqual(len(results[1]["tool_calls"]), 1)
+                self.assertIn("+kept", results[1]["diff"])
+                self.assertFalse(results[2]["empty_answer"])
+                self.assertIsNone(results[2]["error"])
+                self.assertEqual(results[2]["text"], "Done.")
+                self.assertEqual(results[2]["diff"], "")
+                self.assertFalse((repository / "evidence.txt").exists())
+                self.assertEqual(len(session.children), 3)
+                self.assertEqual(stdout.getvalue().strip(), "Done.")
+                self.assertEqual(stderr.getvalue().count("Continuing the batch"), 2)
+                self.assertEqual(log.read_text().count("[problem empty answer]"), 2)
+        finally:
+            del _session_cache[key]
+
     def test_generate_json_exports_failure_before_stopping(self):
         """Preserves changes and failure events without starting later prompts."""
         from locodellm.generate.generate_from_model import _session_cache
@@ -1496,6 +1578,7 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(len(result.tool_calls), 0)
                 self.assertIn(error, result.error)
                 self.assertEqual(result.text, "")
+                self.assertEqual(result.empty_answer, error == "empty answer")
 
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_native_bash_request_is_reissued_without_executing_rejected_commands(self):

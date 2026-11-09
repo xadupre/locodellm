@@ -338,6 +338,7 @@ def _run_generate(
             "error": result.error,
             "timed_out": result.timed_out,
             "protocol_error": result.protocol_error,
+            "empty_answer": result.empty_answer,
         }
         if target is not None:
             if args.verbose:
@@ -357,13 +358,15 @@ def _run_generate(
             Path(args.output).write_text(
                 json.dumps(exported, indent=2, ensure_ascii=True), encoding="utf-8"
             )
-        if result.timed_out or result.protocol_error:
-            reason = "timed out" if result.timed_out else "has an invalid tool protocol"
+        if result.timed_out or result.protocol_error or result.empty_answer:
+            if result.timed_out:
+                reason, section = "timed out", "problem timeout"
+            elif result.protocol_error:
+                reason, section = "has an invalid tool protocol", "problem protocol error"
+            else:
+                reason, section = "returned an empty answer", "problem empty answer"
             if live_log is not None:
-                live_log.section(
-                    "problem timeout" if result.timed_out else "problem protocol error",
-                    f"{result.error}",
-                )
+                live_log.section(section, f"{result.error}")
             print(
                 f"[generate] prompt {prompt_index}/{len(prompts)} {reason}: "
                 f"{result.error} Continuing the batch.",

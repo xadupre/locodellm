@@ -189,6 +189,7 @@ def sample_trajectory(model, tokenizer, task, source, args):
         "error": result.error,
         "timed_out": result.timed_out,
         "protocol_error": result.protocol_error,
+        "empty_answer": result.empty_answer,
         "source_modified": source_modified,
         "repository": str(repository.path),
         "revision": repository.revision,
