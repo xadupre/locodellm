@@ -29,6 +29,11 @@ pytorch = [
     "accelerate",
     "transformers>=5.3",
 ]
+train = [
+    "locodellm[pytorch]",
+    "peft>=0.18,<1",
+    "onnxruntime",
+]
 style = [
     "black==26.10.1",
     "ruff==0.15.20",
@@ -39,7 +44,7 @@ typing = [
 ]
 dev = [
     "locodellm[style]",
-    "locodellm[pytorch]",
+    "locodellm[train]",
     "pytest>=7",
     "pytest-cov",
     "onnx",

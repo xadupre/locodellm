@@ -58,6 +58,7 @@ dmypy.json
 
 # Generated repository clones
 /clones/
+/runs/
 
 # Generated model weights (sphinx-gallery examples)
 docs/examples/arnir0_*/

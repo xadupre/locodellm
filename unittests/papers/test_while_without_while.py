@@ -589,6 +589,7 @@ def test_real_ddp_continues_on_timeout_and_propagates_true_errors(tmp_path, scen
     )
     output = tmp_path / "distributed"
     output.mkdir()
+    repository_root = str(Path(__file__).resolve().parents[2])
     process = subprocess.Popen(
         [
             sys.executable,
@@ -601,7 +602,13 @@ def test_real_ddp_continues_on_timeout_and_propagates_true_errors(tmp_path, scen
         stderr=subprocess.STDOUT,
         text=True,
         start_new_session=True,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        env={
+            **os.environ,
+            "CUDA_VISIBLE_DEVICES": "",
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, (repository_root, os.environ.get("PYTHONPATH")))
+            ),
+        },
     )
     try:
         log, _ = process.communicate(timeout=90)

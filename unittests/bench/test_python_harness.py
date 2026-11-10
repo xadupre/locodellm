@@ -745,14 +745,179 @@ class TestPythonHarness(unittest.TestCase):
         finally:
             del _session_cache[key]
 
-    def test_generate_json_exports_failure_before_stopping(self):
-        """Preserves changes and failure events without starting later prompts."""
+    def test_generate_batch_continues_after_empty_answers(self):
+        """Records empty final answers without aborting later independent problems."""
         from locodellm.generate.generate_from_model import _session_cache
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates two empty conversations followed by a successful one."""
+                responses = [
+                    [""],
+                    [
+                        (
+                            "<python>from pathlib import Path\n"
+                            "Path('evidence.txt').write_text('kept')</python>"
+                        ),
+                        "<think>Unfinished reasoning",
+                    ],
+                    ["Done."],
+                ]
+                child = ScriptedSession(responses[len(self.children)])
+                self.children.append(child)
+                return child
+
+        model_id = "test/empty-answer-batch"
+        key = (model_id, None, None, (), "{}")
+        session = BatchSession([])
+        self.assertNotIn(key, _session_cache)
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps(
+                        {"repo": str(repository), "prompts": ["First.", "Second.", "Third."]}
+                    ),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                log = root / "live.log"
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    main(
+                        [
+                            "generate",
+                            model_id,
+                            "--input",
+                            str(source),
+                            "--harness",
+                            "python",
+                            "--output",
+                            str(output),
+                            "--live-log",
+                            str(log),
+                        ]
+                    )
+                results = json.loads(output.read_text())["results"]
+                self.assertEqual(len(results), 3)
+                for result in results[:2]:
+                    self.assertTrue(result["empty_answer"])
+                    self.assertEqual(result["error"], "The model returned an empty answer.")
+                    self.assertEqual(result["text"], "")
+                    self.assertFalse(result["protocol_error"])
+                    self.assertFalse(result["timed_out"])
+                self.assertEqual(results[0]["tool_calls"], [])
+                self.assertEqual(len(results[1]["tool_calls"]), 1)
+                self.assertIn("+kept", results[1]["diff"])
+                self.assertFalse(results[2]["empty_answer"])
+                self.assertIsNone(results[2]["error"])
+                self.assertEqual(results[2]["text"], "Done.")
+                self.assertEqual(results[2]["diff"], "")
+                self.assertFalse((repository / "evidence.txt").exists())
+                self.assertEqual(len(session.children), 3)
+                self.assertEqual(stdout.getvalue().strip(), "Done.")
+                self.assertEqual(stderr.getvalue().count("Continuing the batch"), 2)
+                self.assertEqual(log.read_text().count("[problem empty answer]"), 2)
+        finally:
+            del _session_cache[key]
+
+    @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
+    def test_generate_batch_continues_after_tools_requested_during_finalization(self):
+        """Records a finalization refusal without executing it or aborting the batch."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates a finalization refusal followed by an independent answer."""
+                child = ScriptedSession(
+                    [
+                        "<bash>printf kept > evidence.txt; sleep 2</bash>",
+                        "<bash>touch forbidden.txt</bash>",
+                    ]
+                    if not self.children
+                    else ["Done."]
+                )
+                self.children.append(child)
+                return child
+
+        model_id = "test/finalization-refusal-batch"
+        key = (model_id, None, None, (), "{}")
+        self.assertNotIn(key, _session_cache)
+        session = BatchSession([])
+        _session_cache[key] = session
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                create_repository(repository)
+                source = root / "tasks.json"
+                source.write_text(
+                    json.dumps({"repo": str(repository), "prompts": ["First.", "Second."]}),
+                    encoding="utf-8",
+                )
+                output = root / "events.json"
+                log = root / "live.log"
+                args = argparse.Namespace(
+                    model=model_id,
+                    input=str(source),
+                    repo=None,
+                    clone_dir="clones",
+                    prompt=None,
+                    output=str(output),
+                    live_log=str(log),
+                    verbose=0,
+                    backend="onnx",
+                    device=None,
+                    precision=None,
+                    provider=None,
+                    chat_template=None,
+                    max_length=100,
+                    max_tool_calls=10,
+                    harness="bash",
+                    temperature=0,
+                )
+                with (
+                    contextlib.ExitStack() as stack,
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    _run_generate(args, stack, final_answer_after=0.2, max_duration=2)
+                first, second = json.loads(output.read_text())["results"]
+                self.assertIn("further tool calls are disabled", first["error"])
+                self.assertFalse(first["timed_out"])
+                self.assertEqual(len(first["tool_calls"]), 1)
+                self.assertIn("+kept", first["diff"])
+                self.assertFalse((repository / "forbidden.txt").exists())
+                self.assertFalse((repository / "evidence.txt").exists())
+                self.assertIsNone(second["error"])
+                self.assertEqual(second["text"], "Done.")
+                self.assertEqual(stdout.getvalue().strip(), "Done.")
+                self.assertIn("Continuing the batch", stderr.getvalue())
+                self.assertIn("[problem failure]", log.read_text())
+        finally:
+            del _session_cache[key]
+
+    def test_generate_json_exports_budget_failure_and_continues(self):
+        """Preserves model failures and partial diffs before running later prompts."""
+        from locodellm.generate.generate_from_model import _session_cache
+
+        class BatchSession(ScriptedSession):
+            def new_session(self):
+                """Creates an over-budget conversation followed by a successful one."""
+                child = ScriptedSession(self.responses if not self.children else ["Done."])
+                self.children.append(child)
+                return child
 
         model_id = "test/scripted-json-failure"
         key = (model_id, None, None, (), "{}")
         self.assertNotIn(key, _session_cache)
-        session = ScriptedSession(
+        session = BatchSession(
             [
                 (
                     "<python>from pathlib import Path\n"
@@ -773,7 +938,10 @@ class TestPythonHarness(unittest.TestCase):
                     encoding="utf-8",
                 )
                 output = root / "events.json"
-                with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                with (
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
                     main(
                         [
                             "generate",
@@ -787,12 +955,16 @@ class TestPythonHarness(unittest.TestCase):
                         ]
                     )
                 document = json.loads(output.read_text(encoding="utf-8"))
-                self.assertEqual(len(document["results"]), 1)
+                self.assertEqual(len(document["results"]), 2)
                 self.assertIn("budget exhausted", document["results"][0]["error"])
                 self.assertEqual(document["results"][0]["tool_call_count"], 1)
                 self.assertIn("+kept", document["results"][0]["diff"])
-                self.assertEqual(len(session.children), 1)
-                self.assertEqual((repository / "changed.txt").read_text(), "kept")
+                self.assertEqual(document["results"][1]["text"], "Done.")
+                self.assertIsNone(document["results"][1]["error"])
+                self.assertEqual(len(session.children), 2)
+                self.assertFalse((repository / "changed.txt").exists())
+                self.assertEqual(stdout.getvalue().strip(), "Done.")
+                self.assertIn("Continuing the batch", stderr.getvalue())
         finally:
             del _session_cache[key]
 
@@ -947,12 +1119,12 @@ class TestPythonHarness(unittest.TestCase):
                         if harness:
                             args += ["--harness", "python", "--max-tool-calls", str(budget)]
                         stdout = io.StringIO()
-                        with contextlib.redirect_stdout(stdout):
-                            if failed:
-                                with self.assertRaisesRegex(RuntimeError, "2 executions"):
-                                    main(args)
-                            else:
-                                main(args)
+                        stderr = io.StringIO()
+                        with (
+                            contextlib.redirect_stdout(stdout),
+                            contextlib.redirect_stderr(stderr),
+                        ):
+                            main(args)
                         with open(output, encoding="utf-8") as stream:
                             document = json.load(stream)
                 finally:
@@ -998,7 +1170,9 @@ class TestPythonHarness(unittest.TestCase):
                     self.assertEqual(turns[0][1]["max_length"], 200)
                 if failed:
                     self.assertIn("budget exhausted", document["error"])
+                    self.assertIn("2 executions", document["error"])
                     self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("Continuing the batch", stderr.getvalue())
                 else:
                     self.assertIsNone(document["error"])
                     self.assertEqual(document["text"], responses[-1])
@@ -1496,6 +1670,7 @@ class TestPythonHarness(unittest.TestCase):
                 self.assertEqual(len(result.tool_calls), 0)
                 self.assertIn(error, result.error)
                 self.assertEqual(result.text, "")
+                self.assertEqual(result.empty_answer, error == "empty answer")
 
     @unittest.skipUnless(shutil.which("bash"), "Bash is not installed")
     def test_native_bash_request_is_reissued_without_executing_rejected_commands(self):

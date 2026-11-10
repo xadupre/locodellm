@@ -110,6 +110,7 @@ class HarnessResult:
     error: str | None = None
     timed_out: bool = False
     protocol_error: bool = False
+    empty_answer: bool = False
 
 
 @dataclass(frozen=True)
@@ -725,6 +726,7 @@ class PythonHarness:
                     return result
                 if not calls:
                     if not response:
+                        result.empty_answer = True
                         result.error = "The model returned an empty answer."
                     else:
                         result.text = response
