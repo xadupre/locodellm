@@ -101,7 +101,7 @@ def example_progress(code: str) -> tuple[bool, bool, bool]:
         tree = ast.parse(code)
     except SyntaxError:
         return False, False, False
-    aliases = {}
+    aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             aliases.update(
