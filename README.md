@@ -276,18 +276,22 @@ python -m locodellm evaluate \
   --verification-timeout 60 --allow-code-execution
 ```
 
-The final report is printed to **stdout**: mean training reward out of one,
+The final report is printed to **stdout**: mean training reward out of two,
 counts for each factual criterion, tool usage, missing tasks, and per-problem
 scores and observed errors. Partial reward is not a bug-discovery success rate.
 The optional JSON report includes replay evidence and the generation file's
 SHA-256, so it can be associated with the correct run. Saved prompts and source
 revision must match the dataset; the original generation clone must still exist.
 Incomplete batches are clearly marked, with their mean computed only over the
-evaluated tasks. Model failures and source-modifying answers receive zero;
-infrastructure errors still fail the command.
+evaluated tasks. Model failures receive no original reward but retain independently
+verified progress bonuses. Changes to existing repository sources still receive
+zero; added Python examples and tests are evaluated without applying their patch.
+Infrastructure errors still fail the command.
 
 Evaluation uses the same verifier as training, executing generated Python twice
-in fresh temporary clones when a final script is extractable. It is **not a
+in fresh temporary clones. Evidence includes final Python code, Python tool
+bodies, literal Bash `python -c`/Python heredoc commands, and added Python files.
+Shell commands themselves are never replayed. It is **not a
 sandbox**: the standalone command requires `--allow-code-execution` and a
 disposable isolated environment.
 Temporary verification clones are removed afterwards; diagnostics remain in the
@@ -422,12 +426,17 @@ and centered but unnormalized advantages. `--normalize-advantages` enables
 standard-deviation scaling. `--updates-per-group` reuses the same frozen old
 policy probabilities for clipped GRPO updates.
 
-The final answer must include a complete runnable script in Python Markdown
-fences. The verifier instruments real `to_onnx(module, inputs, ...)` calls,
-executes the reference module, validates `target_opset=18, optimize=False`,
+The final answer should include a complete runnable script in Python Markdown
+fences; Python tool scripts and added Python examples/tests are also evaluated.
+The verifier instruments real `to_onnx(module, inputs, ...)` calls,
+executes the reference module, validates the original `target_opset=18, optimize=False`
+protocol for the original reward,
 and checks ONNX metadata and CPU ONNX Runtime outputs (`rtol=atol=2e-3`).
-Use explicit `input_names` and a tuple of tensor inputs for runtime comparison;
+Use explicit `input_names` and a tuple of tensor inputs for runtime comparison.
+Without explicit names, only matching named `forward` arguments are mapped;
 nested or ambiguous input mappings are marked unverified, not failures.
+Valid exports using other opsets or default optimization can earn progress bonuses,
+but do not satisfy the original export-call/failure criteria.
 Converter exceptions count only when the traceback identifies an actual ATen
 converter. Invalid reference inputs and unrelated script exceptions do not count
 as export failures. Failure/reproduction credit also requires reaching the task's
@@ -435,11 +444,16 @@ converter or a same-family helper route listed in its reference metadata.
 Unrelated converters and unrecognized tracing bypasses cannot earn this credit.
 Conversion routes and tracing mode are recorded.
 
-Two fresh-process replays in separate clones of the recorded revision supply
-the four factual criteria; the best verified example receives the additive
-reward described below. Extraction alone gets the existing 0.05 floor.
-Source modifications during exploration or an incomplete/erroring tool conversation
-receive zero. Source modifications during replay invalidate all verified criteria.
+Two fresh-process replays per distinct export script in separate clones of the
+recorded revision supply the factual criteria. The original score uses the final
+answer and retains its existing 0.05 extraction floor; four progress bonuses are
+added across the examples, up to a total of two, without normalization.
+Creating a module or comparison test earns progress credit even before execution.
+Passing-test and failure bonuses require independent execution evidence, not prose
+or a successful shell exit. An incomplete/erroring conversation loses its original
+reward, not its progress bonuses. Adding a Python file also disqualifies the
+original reward. Changes to existing sources during exploration still receive
+zero. Source modifications during replay invalidate execution evidence.
 This is **not** semantic reference matching: neither `expected_answer` nor issue
 links are sent to the solving policy. Pre-existing patches recorded in reference
 metadata are not applied; only failures reproduced on the pinned clean sources
@@ -455,13 +469,24 @@ not optimizer/RNG state. Use set 2 separately for held-out evaluation.
 
 ### Export-failure reward
 
-`export_failure_reward` scores one clearly extracted example using four
-independently verified boolean criteria. Each satisfied criterion adds `0.25`;
-the score is maximized and ranges from `0` to `1`, without penalties or gating.
+`export_failure_reward` preserves the original four independently verified
+boolean criteria. Each satisfied original criterion adds `0.25`, up to `1`.
 Setting `answer_extractable=True` grants a floor of `0.05` for a final answer
 containing a clearly extractable code example, even if unverified. It is not an
 extra bonus: `reward = max(0.05, 0.25 * satisfied_criteria)` in that case.
 Rejected tool requests without such a final answer receive no extraction credit.
+
+Four additional milestones each add `0.25`: creating a concrete PyTorch module
+example (`example_created`), creating an ONNX export/comparison test
+(`test_created`), independently executing a passing comparison test
+(`test_passed`), and independently confirming a failing converter example
+distinct from a passing comparison case (`failure_confirmed`). A case is
+identified by its converters, input values and PyTorch outputs. A printed
+comparison without an assertion is not a comparison test. Except for this second
+case, the milestones are additive, not prerequisites for each other.
+They accumulate across passing and failing examples; the original reward and its
+floor are unchanged. The maximum is **2**, without normalization. Reports show
+`base_reward` and `progress_reward` separately.
 
 ```python
 from locodellm.bench import export_failure_reward
@@ -472,8 +497,12 @@ reward = export_failure_reward(
     failure_valid=True,         # an admissible failure is actually observed
     reproduction_valid=False,  # independent replay, route and stage not yet verified
     answer_extractable=True,   # final answer contains a clearly extractable code example
+    example_created=True,
+    test_created=True,
+    test_passed=True,
+    failure_confirmed=False,
 )
-assert reward == 0.75
+assert reward == 1.5
 ```
 
 The function only computes the reward. Extracting examples and verifying these

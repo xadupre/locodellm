@@ -33,6 +33,10 @@ class TestExportFailureReward(unittest.TestCase):
                 "failure_valid",
                 "reproduction_valid",
                 "answer_extractable",
+                "example_created",
+                "test_created",
+                "test_passed",
+                "failure_confirmed",
             ),
             False,
         )
@@ -60,6 +64,30 @@ class TestExportFailureReward(unittest.TestCase):
                         failure_valid=criteria[2],
                         reproduction_valid=criteria[3],
                         answer_extractable=True,
+                    ),
+                    expected,
+                )
+
+    def test_progress_bonuses_add_to_the_original_score_without_normalization(self):
+        """Preserves the original reward and adds each milestone independently."""
+        for original, progress, expected in [
+            ((False, False, False, False), (True, False, False, False), 0.30),
+            ((True, True, False, False), (True, True, True, False), 1.25),
+            ((True, True, True, True), (True, True, True, True), 2.0),
+            ((False, False, False, False), (False, False, False, True), 0.30),
+        ]:
+            with self.subTest(original=original, progress=progress):
+                self.assertAlmostEqual(
+                    export_failure_reward(
+                        reference_valid=original[0],
+                        export_call_valid=original[1],
+                        failure_valid=original[2],
+                        reproduction_valid=original[3],
+                        answer_extractable=True,
+                        example_created=progress[0],
+                        test_created=progress[1],
+                        test_passed=progress[2],
+                        failure_confirmed=progress[3],
                     ),
                     expected,
                 )

@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -306,15 +307,15 @@ def export_answer(mode="comparison", *, invalid_reference=False, invalid_api=Fal
 @pytest.mark.parametrize(
     "mode,invalid_reference,invalid_api,expected",
     [
-        ("comparison", False, False, (1.0, True, "comparison")),
-        ("export", False, False, (1.0, True, "export")),
-        ("metadata", False, False, (1.0, True, "metadata")),
-        ("passed", False, False, (0.5, False, "comparison")),
-        ("upstream", False, False, (0.5, False, "export")),
-        ("comparison", True, False, (0.05, False, "pytorch")),
-        ("comparison", False, True, (0.25, False, "export_call")),
-        ("unrelated", False, False, (0.5, False, "comparison")),
-        ("modified", False, False, (0.05, False, "comparison")),
+        ("comparison", False, False, (1.25, True, "comparison")),
+        ("export", False, False, (1.25, True, "export")),
+        ("metadata", False, False, (1.25, True, "metadata")),
+        ("passed", False, False, (0.75, False, "comparison")),
+        ("upstream", False, False, (0.75, False, "export")),
+        ("comparison", True, False, (0.30, False, "pytorch")),
+        ("comparison", False, True, (0.5, False, "comparison")),
+        ("unrelated", False, False, (0.75, False, "comparison")),
+        ("modified", False, False, (0.30, False, "comparison")),
     ],
 )
 def test_factual_export_replays(tmp_path, mode, invalid_reference, invalid_api, expected):
@@ -347,6 +348,7 @@ def test_factual_export_replays(tmp_path, mode, invalid_reference, invalid_api, 
     assert result.criteria["failure_valid"] == expected[1]
     assert result.criteria["reproduction_valid"] == expected[1]
     assert result.replays[0]["observations"][0]["stage"] == expected[2]
+    assert result.total == result.base_reward + result.progress_reward
     assert result.replays[0]["repository"] != result.replays[1]["repository"]
     assert all(replay["revision"] == source.revision for replay in result.replays)
     assert not source.diff()
@@ -367,8 +369,186 @@ def test_export_extraction_opt_in_and_timeout(tmp_path):
     result = verify_export_answer(
         export_answer(), source, tmp_path / "clones", allow_execution=True, timeout=0.01
     )
-    assert result.total == 0.05
+    assert result.total == 0.30
     assert all(replay["timed_out"] for replay in result.replays)
+
+
+@pytest.mark.parametrize("evidence", ["tool", "diff"])
+def test_original_reward_requires_final_answer_and_unchanged_sources(tmp_path, evidence):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.training.export_verifier import verify_export_answer
+
+    source = make_export_repository(tmp_path / "source")
+    answer = export_answer()
+    code = answer.removeprefix("```python\n").removesuffix("```")
+    if evidence == "tool":
+        answer = "No final example."
+        tool_calls = [{"tool": "python", "code": code}]
+        diff = ""
+    else:
+        test_file = source.path / "test_export.py"
+        test_file.write_text(code)
+        diff = source.diff()
+        test_file.unlink()
+        tool_calls = []
+    result = verify_export_answer(
+        answer,
+        source,
+        tmp_path / "clones",
+        allow_execution=True,
+        tool_calls=tool_calls,
+        generated_diff=diff,
+    )
+    assert result.base_reward == 0
+    assert result.progress_reward == 0.25
+    assert result.criteria["example_created"]
+    assert not result.criteria["answer_extractable"]
+    assert not result.criteria["failure_valid"]
+
+
+def test_original_reward_requires_explicit_runtime_input_names(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.training.export_verifier import verify_export_answer
+
+    source = make_export_repository(tmp_path / "source")
+    answer = export_answer().replace(", input_names=['x']", "")
+    result = verify_export_answer(answer, source, tmp_path / "clones", allow_execution=True)
+    assert result.base_reward == 0.5
+    assert not result.criteria["failure_valid"]
+    assert result.replays[0]["observations"][0]["failure_observed"]
+
+
+def export_comparison_test(mode="passed"):
+    """Returns a runnable export test with an actual ONNX Runtime assertion."""
+    answer = export_answer(mode).replace("\nto_onnx(", "\nartifact = to_onnx(")
+    return answer.removesuffix("```") + (
+        "import numpy\n"
+        "import onnxruntime\n"
+        "options = onnxruntime.SessionOptions()\n"
+        "options.intra_op_num_threads = options.inter_op_num_threads = 1\n"
+        "session = onnxruntime.InferenceSession(artifact.SerializeToString(), options,\n"
+        "    providers=['CPUExecutionProvider'])\n"
+        "actual = session.run(None, {'x': torch.ones(2).numpy()})[0]\n"
+        "numpy.testing.assert_allclose(actual, torch.ones(2).numpy())\n"
+        "```"
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,base,progress", [("passed", 0.5, 0.75), ("comparison", 1.0, 0.5), ("both", 1.0, 1.0)]
+)
+def test_export_progress_milestones(tmp_path, mode, base, progress):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.training.export_verifier import verify_export_answer
+
+    source = make_export_repository(tmp_path / "source")
+    answer = export_comparison_test("passed" if mode == "both" else mode)
+    if mode == "both":
+        # The failing case uses distinct inputs to be a second case.
+        answer += "\n" + export_comparison_test("comparison").replace(
+            "torch.ones(2)", "torch.full((2,), 2.0)"
+        )
+    result = verify_export_answer(
+        answer,
+        source,
+        tmp_path / "clones",
+        allow_execution=True,
+        allowed_converters={"aten_fixture"},
+    )
+    assert result.base_reward == base
+    assert result.progress_reward == progress
+    assert result.total == base + progress
+    assert result.criteria["example_created"]
+    assert result.criteria["test_created"]
+    assert result.criteria["test_passed"] == (mode != "comparison")
+    # A failing case alone is not the distinct second case.
+    assert result.criteria["failure_confirmed"] == (mode == "both")
+
+
+def test_export_progress_creation_does_not_claim_execution(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.training.export_verifier import verify_export_answer
+
+    source = make_export_repository(tmp_path / "source")
+    body = export_comparison_test().removeprefix("```python\n").removesuffix("```")
+    answer = (
+        "```python\ndef test_export():\n"
+        + "".join("    " + line + "\n" for line in body.splitlines())
+        + "```"
+    )
+    result = verify_export_answer(answer, source, tmp_path / "clones", allow_execution=True)
+    assert result.total == 0.55
+    assert result.base_reward == 0.05
+    assert result.progress_reward == 0.5
+    assert result.criteria["example_created"]
+    assert result.criteria["test_created"]
+    assert not result.criteria["test_passed"]
+    assert not result.criteria["failure_confirmed"]
+    assert all(not replay["observations"] for replay in result.replays)
+
+
+@pytest.mark.parametrize("mode", ["passed", "comparison"])
+def test_export_progress_accepts_other_valid_export_options(tmp_path, mode):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.training.export_verifier import verify_export_answer
+
+    source = make_export_repository(tmp_path / "source")
+    answer = export_comparison_test(mode).replace(
+        "target_opset=18, optimize=False, input_names=['x']", "target_opset=21"
+    )
+    result = verify_export_answer(
+        answer,
+        source,
+        tmp_path / "clones",
+        allow_execution=True,
+        allowed_converters={"aten_fixture"},
+    )
+    assert result.base_reward == 0.25
+    assert result.progress_reward == (0.75 if mode == "passed" else 0.5)
+    assert not result.criteria["export_call_valid"]
+    assert not result.criteria["failure_valid"]
+    assert result.criteria["test_passed"] == (mode == "passed")
+    assert not result.criteria["failure_confirmed"]
+
+
+def test_progress_distinguishes_examples_tests_and_printed_claims():
+    from locodellm.training.export_verifier import example_progress
+
+    module = (
+        "from torch import nn\n"
+        "class Model(nn.Module):\n"
+        "    def forward(self, x):\n"
+        "        return x\n"
+    )
+    assert example_progress(module) == (True, False, False)
+    assert example_progress("print('All tests passed')") == (False, False, False)
+    printed = (
+        module
+        + "artifact = to_onnx(Model(), (torch.ones(2),))\n"
+        + "session = onnxruntime.InferenceSession(artifact.SerializeToString())\n"
+        + "print(numpy.allclose(session.run(None, {}), expected))\n"
+    )
+    assert example_progress(printed) == (True, False, True)
+    assert example_progress(printed.replace("print(", "assert (")) == (True, True, True)
+
+
+def test_tool_python_examples_are_extracted_without_running_shell():
+    from locodellm.training.export_verifier import tool_python_examples
+
+    code = "import torch\nprint('a concrete example')"
+    assert tool_python_examples(
+        [
+            {"tool": "python", "code": code},
+            {"tool": "bash", "code": f"cd /unavailable && python -c {shlex.quote(code)}"},
+            {"tool": "bash", "code": f"python - <<'PY'\n{code}\nPY\n"},
+            {"tool": "bash", "code": "echo 'not Python'; python -c 'unclosed"},
+        ]
+    ) == [code, code, code]
 
 
 @pytest.fixture
@@ -424,16 +604,19 @@ def test_export_evaluation_cli_report(saved_export_batch, tmp_path, capsys):
         ]
     )
     report = json.loads(output.read_text())
-    assert report["summary"]["mean_reward"] == 0.25
+    assert report["summary"]["mean_reward"] == 0.375
     assert report["summary"]["missing_tasks"] == 1
     assert report["summary"]["generation_tool_calls"] == 3
-    assert report["summary"]["independent_replays"] == 2
-    assert [row["total"] for row in report["results"]] == [1, 0, 0, 0]
+    assert report["summary"]["independent_replays"] == 4
+    assert [row["total"] for row in report["results"]] == [1.25, 0, 0.25, 0]
     assert report["results"][0]["criteria"]["reproduction_valid"]
     assert not report["results"][1]["criteria"]["answer_extractable"]
-    assert all(not row["replays"] for row in report["results"][1:])
+    assert not report["results"][1]["replays"]
+    assert not report["results"][3]["replays"]
+    assert report["results"][2]["base_reward"] == 0
+    assert report["results"][2]["progress_reward"] == 0.25
     stdout = capsys.readouterr().out
-    assert "Mean reward: 0.2500 / 1" in stdout
+    assert "Mean reward: 0.3750 / 2" in stdout
     assert "Evaluated: 4/5 tasks" in stdout
     assert "Confirmed converter failures: 1/4" in stdout
     assert "WARNING: 1 missing tasks" in stdout
@@ -441,6 +624,42 @@ def test_export_evaluation_cli_report(saved_export_batch, tmp_path, capsys):
     assert "Final answer refused" in stdout
     assert "Repository modified during generation" in stdout
     assert f"Report: {output}" in stdout
+    assert not source.diff()
+
+
+@pytest.mark.parametrize("evidence", ["tool", "diff"])
+def test_evaluation_credits_progress_without_a_final_script(
+    saved_export_batch, tmp_path, evidence
+):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from locodellm.bench.export_evaluation import evaluate
+
+    source, dataset, results = saved_export_batch
+    document = json.loads(results.read_text())
+    row = document["results"][0]
+    row["text"] = "The baseline passed before generation timed out."
+    row["error"] = "Problem time limit reached"
+    code = export_comparison_test().removeprefix("```python\n").removesuffix("```")
+    if evidence == "tool":
+        row["tool_calls"] = [{"tool": "bash", "code": f"python -c {shlex.quote(code)}"}]
+    else:
+        test_file = source.path / "test_export.py"
+        test_file.write_text(code)
+        row["diff"] = source.diff()
+        test_file.unlink()
+    document["results"] = [row]
+    results.write_text(json.dumps(document))
+    report = evaluate(dataset, results, allow_execution=True)
+    result = report["results"][0]
+    assert result["total"] == 0.75
+    assert result["base_reward"] == 0
+    assert result["progress_reward"] == 0.75
+    assert result["criteria"]["test_passed"]
+    assert not result["source_modified"]
+    assert not result["criteria"]["answer_extractable"]
+    assert report["summary"]["max_reward"] == 2
+    assert report["summary"]["mean_progress_reward"] == 0.75
     assert not source.diff()
 
 
@@ -491,7 +710,7 @@ def test_generate_automatically_evaluates_aten(saved_export_batch, mode, capsys)
         assert not output.exists()
     else:
         assert "ATen export evaluation" in stdout
-        assert "Mean reward: 0.5000 / 1" in stdout
+        assert "Mean reward: 0.6250 / 2" in stdout
         assert "Evaluated: 2/2 tasks" in stdout
         assert "Confirmed converter failures: 1/2" in stdout
         assert "The model returned an empty answer" in stdout
@@ -500,7 +719,7 @@ def test_generate_automatically_evaluates_aten(saved_export_batch, mode, capsys)
 
             report = json.loads(output.read_text())
             assert report["generation_sha256"] == hashlib.sha256(results.read_bytes()).hexdigest()
-            assert report["summary"]["mean_reward"] == 0.5
+            assert report["summary"]["mean_reward"] == 0.625
             assert f"Report: {output}" in stdout
         else:
             assert not output.exists()
@@ -541,7 +760,9 @@ def test_export_evaluation_execution_opt_in_and_paths(saved_export_batch, tmp_pa
     assert not (tmp_path / "evaluation.json").exists()
 
 
-@pytest.mark.parametrize("problem", ["revision", "unknown", "duplicate", "empty", "count"])
+@pytest.mark.parametrize(
+    "problem", ["revision", "unknown", "duplicate", "empty", "count", "tool"]
+)
 def test_export_evaluation_rejects_mismatched_results(saved_export_batch, problem):
     from locodellm.bench.export_evaluation import evaluate
 
@@ -555,8 +776,10 @@ def test_export_evaluation_rejects_mismatched_results(saved_export_batch, proble
         document["results"].append(document["results"][0])
     elif problem == "empty":
         document["results"] = []
-    else:
+    elif problem == "count":
         document["results"][0]["tool_call_count"] = -1
+    else:
+        document["results"][0]["tool_calls"] = [{"tool": "bash", "code": None}]
     results.write_text(json.dumps(document))
     with pytest.raises(ValueError):
         evaluate(dataset, results, allow_execution=True)
