@@ -669,12 +669,15 @@ def test_training_session_with_real_tool_feedback(tmp_path):
         assert turn.old_log_probs.numel() == len(tokenizer.encode(action)) + 1
 
 
-def test_aten_training_cli_offline(tmp_path, capsys):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_aten_training_cli_offline(tmp_path, capsys, device):
     torch = pytest.importorskip("torch")
     pytest.importorskip("peft")
     from locodellm.__main__ import main
     from locodellm.training.grpo import load_tasks
 
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("This check requires a CUDA device.")
     torch.set_num_threads(1)
     source = make_export_repository(tmp_path / "source")
     model_path = tmp_path / "model"
@@ -701,7 +704,7 @@ def test_aten_training_cli_offline(tmp_path, capsys):
         "--repo",
         str(source.path),
         "--device",
-        "cpu",
+        device,
         "--epochs",
         "1",
         "--group-size",
@@ -720,6 +723,11 @@ def test_aten_training_cli_offline(tmp_path, capsys):
     with pytest.raises(PermissionError, match="allow-code-execution"):
         main(common)
     assert not output.exists()
+    if device == "cuda":
+        common.append("--log-memory")
+    else:
+        with pytest.raises(ValueError, match="requires a CUDA device"):
+            main([*common, "--allow-code-execution", "--log-memory"])
     main([*common, "--allow-code-execution"])
     assert (output / "adapter" / "adapter_model.safetensors").exists()
     assert (output / "checkpoint-1" / "adapter_config.json").exists()
@@ -731,6 +739,35 @@ def test_aten_training_cli_offline(tmp_path, capsys):
     assert "REFERENCE MUST NOT LEAK" not in (output / "train.jsonl").read_text()
     assert json.loads((output / "config.json").read_text())["reward"] == "export_failure_reward"
     assert "update=2" in capsys.readouterr().out
+    if device == "cuda":
+        memory = [json.loads(line) for line in (output / "memory.jsonl").read_text().splitlines()]
+        assert {record["phase"] for record in memory} == {
+            "model_ready",
+            "generation",
+            "old_log_probs",
+            "forward",
+            "backward",
+            "optimizer_step",
+        }
+        snapshot = memory[0]
+        assert snapshot["frozen_parameter_bytes"] > 0
+        assert snapshot["trainable_parameter_bytes"] > 0
+        for record in memory:
+            assert record["peak_allocated_bytes"] >= record["allocated_bytes"] > 0
+            assert record["reserved_bytes"] >= record["allocated_bytes"]
+        phases = [record for record in memory if record["phase"] != "model_ready"]
+        assert len(phases) % 2 == 0
+        for begin, end in zip(phases[::2], phases[1::2]):
+            assert begin["event"] == "begin"
+            assert end["event"] == "end"
+            assert begin["phase"] == end["phase"]
+        assert all(
+            "total_tokens" in record and "member" in record
+            for record in memory
+            if record["phase"] in ("forward", "backward")
+        )
+    else:
+        assert not (output / "memory.jsonl").exists()
     with pytest.raises(ValueError, match="empty or absent"):
         main([*common, "--allow-code-execution"])
     task["verification"]["revision"] = "wrong"
@@ -1138,6 +1175,25 @@ def test_bf16_lora_training_and_fp32_adapter_reload(tmp_path):
     assert all(parameter.dtype == torch.bfloat16 for parameter in restored.parameters())
     with torch.no_grad():
         torch.testing.assert_close(completion_log_probs(restored, tokens, 2), expected)
+
+
+def test_cuda_memory_log_preserves_oom_error(tmp_path):
+    torch = pytest.importorskip("torch")
+    from locodellm.training.grpo import CudaMemoryLog
+
+    if not torch.cuda.is_available():
+        pytest.skip("This check requires a CUDA device.")
+    path = tmp_path / "memory.jsonl"
+    memory_log = CudaMemoryLog(path, "cuda")
+    error = torch.OutOfMemoryError("Diagnostic test: no allocation attempted.")
+    with pytest.raises(torch.OutOfMemoryError) as caught, memory_log.phase("backward", turn=3):
+        raise error
+    assert caught.value is error
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["event"] for record in records] == ["begin", "oom"]
+    assert records[-1]["phase"] == "backward"
+    assert records[-1]["turn"] == 3
+    assert records[-1]["error"] == str(error)
 
 
 def test_cli_rejects_unsafe_or_invalid_runs(tmp_path):

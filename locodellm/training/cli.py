@@ -38,6 +38,11 @@ def add_parser(subparsers):
     parser.add_argument("--limit", type=int)
     parser.add_argument("--verbose", "-v", type=int, default=0)
     parser.add_argument(
+        "--log-memory",
+        action="store_true",
+        help="Records CUDA memory usage and per-phase peaks in output/memory.jsonl.",
+    )
+    parser.add_argument(
         "--allow-code-execution",
         action="store_true",
         help="Allows arbitrary generated code; requires a disposable isolated environment.",

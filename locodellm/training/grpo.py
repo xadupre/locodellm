@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import json
 import math
@@ -25,6 +26,48 @@ from locodellm.training.optimization import completion_log_probs, group_advantag
 from locodellm.training.policy import load_policy, save_adapter
 
 
+class CudaMemoryLog:
+    """Records allocator statistics at CUDA phase boundaries and on out-of-memory errors."""
+
+    def __init__(self, path: Path, device):
+        self.path = path
+        self.device = torch.device(device)
+
+    def record(self, phase, event, **metadata):
+        """Appends a persistent memory snapshot with byte-valued measurements."""
+        free, total = torch.cuda.mem_get_info(self.device)
+        record = {
+            **metadata,
+            "timestamp": time.time(),
+            "phase": phase,
+            "event": event,
+            "device": str(self.device),
+            "allocated_bytes": torch.cuda.memory_allocated(self.device),
+            "reserved_bytes": torch.cuda.memory_reserved(self.device),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
+            "device_free_bytes": free,
+            "device_total_bytes": total,
+        }
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record) + "\n")
+
+    @contextmanager
+    def phase(self, phase, **metadata):
+        """Measures an isolated phase, recording OOM details before propagating the error."""
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self.record(phase, "begin", **metadata)
+        try:
+            yield
+        except torch.OutOfMemoryError as exc:
+            self.record(phase, "oom", error=str(exc), **metadata)
+            raise
+        else:
+            torch.cuda.synchronize(self.device)
+            self.record(phase, "end", **metadata)
+
+
 @dataclass
 class Turn:
     """Stores exact sampled tokens and frozen old-policy probabilities for one turn."""
@@ -37,23 +80,40 @@ class Turn:
 class TrainingSession(PyTorchSessionState):
     """Captures assistant actions without treating subsequent tool results as actions."""
 
-    def __init__(self, model, tokenizer, *, temperature):
+    def __init__(self, model, tokenizer, *, temperature, memory_log=None, memory_context=None):
         super().__init__(model, tokenizer)
         self.temperature = temperature
         self.turns: list[Turn] = []
         self.chat_template_kwargs = {"enable_thinking": False}
+        self.memory_log = memory_log
+        self.memory_context = memory_context or {}
 
     def generate(self, prompt, *args, **kwargs):
         """Records the original tokenization, including sampled end-of-turn tokens."""
         prompt_length = self.get_prompt_length(prompt)
-        super().generate(prompt, *args, **kwargs)
+        metadata = {
+            **self.memory_context,
+            "turn": len(self.turns),
+            "prompt_tokens": prompt_length,
+        }
+        with (
+            self.memory_log.phase("generation", **metadata) if self.memory_log else nullcontext()
+        ):
+            super().generate(prompt, *args, **kwargs)
         device = self.model.get_input_embeddings().weight.device
         tokens = torch.tensor(
             [[*self.tokens[:prompt_length].tolist(), *self.last_generated_tokens]],
             dtype=torch.long,
             device=device,
         )
-        with torch.no_grad():
+        with (
+            torch.no_grad(),
+            (
+                self.memory_log.phase("old_log_probs", **metadata, total_tokens=tokens.shape[1])
+                if self.memory_log
+                else nullcontext()
+            ),
+        ):
             old = completion_log_probs(
                 self.model, tokens, prompt_length, temperature=self.temperature
             )
@@ -61,7 +121,16 @@ class TrainingSession(PyTorchSessionState):
         return self
 
 
-def trajectory_backward(model, turns: list[Turn], advantage, *, temperature, group_size):
+def trajectory_backward(
+    model,
+    turns: list[Turn],
+    advantage,
+    *,
+    temperature,
+    group_size,
+    memory_log=None,
+    memory_context=None,
+):
     """Backpropagates the token-average GRPO loss over an entire trajectory.
 
     Each turn conditions on its own full conversation, but only that turn's
@@ -73,28 +142,44 @@ def trajectory_backward(model, turns: list[Turn], advantage, *, temperature, gro
         raise ValueError("Cannot optimize an empty trajectory.")
     device = model.get_input_embeddings().weight.device
     total = 0.0
-    for turn in turns:
-        current = completion_log_probs(
-            model, turn.tokens.to(device), turn.prompt_length, temperature=temperature
-        )
-        loss = policy_loss(
-            current,
-            turn.old_log_probs.to(device),
-            torch.ones_like(current, dtype=torch.bool),
-            advantage.reshape(1),
-        )
-        weighted = loss * (current.numel() / count) / group_size
-        weighted.backward()
+    for index, turn in enumerate(turns):
+        metadata = {
+            **(memory_context or {}),
+            "turn": index,
+            "prompt_tokens": turn.prompt_length,
+            "total_tokens": turn.tokens.shape[1],
+        }
+        with memory_log.phase("forward", **metadata) if memory_log else nullcontext():
+            current = completion_log_probs(
+                model, turn.tokens.to(device), turn.prompt_length, temperature=temperature
+            )
+            loss = policy_loss(
+                current,
+                turn.old_log_probs.to(device),
+                torch.ones_like(current, dtype=torch.bool),
+                advantage.reshape(1),
+            )
+            weighted = loss * (current.numel() / count) / group_size
+        with memory_log.phase("backward", **metadata) if memory_log else nullcontext():
+            weighted.backward()
         total += weighted.detach().item()
     return total
 
 
-def sample_trajectory(model, tokenizer, task, source, args):
+def sample_trajectory(
+    model, tokenizer, task, source, args, *, memory_log=None, memory_context=None
+):
     """Samples one independent multi-turn rollout and verifies only its final answer."""
     repository = GitRepository.clone(
         str(source.path), str(args.output / "repositories"), source.revision
     )
-    session = TrainingSession(model, tokenizer, temperature=args.temperature)
+    session = TrainingSession(
+        model,
+        tokenizer,
+        temperature=args.temperature,
+        memory_log=memory_log,
+        memory_context=memory_context,
+    )
     result = PythonHarness(
         timeout=args.tool_timeout,
         max_tool_calls=args.max_tool_calls,
@@ -166,6 +251,19 @@ def sample_trajectory(model, tokenizer, task, source, args):
 
 def train(model, tokenizer, tasks, source, args):
     """Optimizes grouped trajectory rewards with the SLM-GRPO hyperparameters."""
+    device = model.get_input_embeddings().weight.device
+    memory_log = CudaMemoryLog(args.output / "memory.jsonl", device) if args.log_memory else None
+    if memory_log:
+        memory_log.record(
+            "model_ready",
+            "snapshot",
+            frozen_parameter_bytes=sum(
+                p.numel() * p.element_size() for p in model.parameters() if not p.requires_grad
+            ),
+            trainable_parameter_bytes=sum(
+                p.numel() * p.element_size() for p in model.parameters() if p.requires_grad
+            ),
+        )
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=args.learning_rate,
@@ -182,7 +280,21 @@ def train(model, tokenizer, tasks, source, args):
                 rewards = []
                 model.eval()
                 for member in range(args.group_size):
-                    turns, record = sample_trajectory(model, tokenizer, task, source, args)
+                    memory_context = {
+                        "epoch": epoch + 1,
+                        "task_id": task["id"],
+                        "member": member,
+                        "optimizer_step": optimizer_step,
+                    }
+                    turns, record = sample_trajectory(
+                        model,
+                        tokenizer,
+                        task,
+                        source,
+                        args,
+                        memory_log=memory_log,
+                        memory_context=memory_context,
+                    )
                     group.append(turns)
                     rewards.append(record["total"])
                     stream.write(
@@ -220,13 +332,25 @@ def train(model, tokenizer, tasks, source, args):
                             advantage,
                             temperature=args.temperature,
                             group_size=args.group_size,
+                            memory_log=memory_log,
+                            memory_context={
+                                "epoch": epoch + 1,
+                                "task_id": task["id"],
+                                "member": member,
+                                "optimizer_step": optimizer_step,
+                            },
                         )
-                        for turns, advantage in zip(group, advantages)
+                        for member, (turns, advantage) in enumerate(zip(group, advantages))
                     )
                     norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), 1.0, error_if_nonfinite=True
                     )
-                    optimizer.step()
+                    with (
+                        memory_log.phase("optimizer_step", optimizer_step=optimizer_step)
+                        if memory_log
+                        else nullcontext()
+                    ):
+                        optimizer.step()
                     optimizer_step += 1
                     print(
                         f"[train] update={optimizer_step} loss={loss:.6f} "
@@ -291,6 +415,8 @@ def run(args: argparse.Namespace):
     args.device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is unavailable; use --device cpu.")
+    if args.log_memory and not args.device.startswith("cuda"):
+        raise ValueError("--log-memory requires a CUDA device.")
     revision = tasks[0]["verification"]["revision"]
     if args.repo:
         source = GitRepository(args.repo)

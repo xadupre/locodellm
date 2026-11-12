@@ -464,6 +464,14 @@ buffers and training log-probabilities use BF16, including when loading a saved
 FP32 adapter. PEFT's automatic FP32 adapter promotion is disabled. This reduces
 memory at the cost of numerical precision; CPU and other devices retain FP32.
 
+`--log-memory` writes CUDA diagnostics to `--output/memory.jsonl`: allocated and
+reserved bytes, per-phase peaks, device free memory, context lengths and
+epoch/task/sample identifiers. It measures generation, old-policy probabilities,
+training forward, backward and optimizer steps separately, and records OOM errors
+before propagating them. The initial snapshot includes frozen and trainable
+parameter sizes. Measurements synchronize CUDA and reset allocator peak counters,
+so enable this only for diagnostics. A running process must be restarted to use it.
+
 ### Export-failure reward
 
 `export_failure_reward` scores one clearly extracted example using four
