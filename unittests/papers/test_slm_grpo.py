@@ -993,7 +993,7 @@ def test_optimizer_updates_only_adapter_parameters(tmp_path):
     model.train()
     layer = model.get_base_model().model.layers[0]
     forward_calls = []
-    hook = layer.register_forward_hook(lambda *_: forward_calls.append(None))
+    hook = layer.register_forward_pre_hook(lambda *_: forward_calls.append(None))
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     try:
         optimizer = torch.optim.AdamW(
@@ -1052,6 +1052,90 @@ def test_completion_log_probs_only_projects_completion_logits(tmp_path):
         hook.remove()
     torch.testing.assert_close(actual, expected)
     assert projected_lengths == [tokens.shape[1] - prompt_length + 1]
+
+
+@pytest.mark.parametrize("architecture", ["qwen3", "qwen3_5"])
+def test_block_checkpointing_recomputes_only_trainable_layers(tmp_path, architecture):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from locodellm.training.optimization import completion_log_probs
+    from locodellm.training.policy import load_policy
+
+    torch.set_num_threads(1)
+    device = "cuda" if architecture == "qwen3_5" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("This hybrid-model check requires a CUDA device.")
+    path = tmp_path / "model"
+    make_tiny_policy(path, num_hidden_layers=4)
+    if architecture == "qwen3_5":
+        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+        model = Qwen3_5ForCausalLM(
+            Qwen3_5TextConfig(
+                vocab_size=8,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=4,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_num_key_heads=2,
+                linear_num_value_heads=2,
+                layer_types=[
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                    "full_attention",
+                ],
+                eos_token_id=1,
+                pad_token_id=2,
+            )
+        )
+        model.save_pretrained(path)
+    model, _ = load_policy(str(path), None, train=True, device=device, lora_layers="last-half")
+    assert model.is_gradient_checkpointing
+    calls = []
+    hooks = [
+        layer.register_forward_pre_hook(lambda module, inputs, i=i: calls.append(i))
+        for i, layer in enumerate(model.get_base_model().model.layers)
+    ]
+    projection_calls = []
+    hooks.append(
+        model.get_output_embeddings().register_forward_pre_hook(
+            lambda *_: projection_calls.append(None)
+        )
+    )
+    model.train()
+    tokens = torch.tensor([[3, 4, 5, 6]], device=device)
+    try:
+        actual = completion_log_probs(model, tokens, 2)
+        actual.sum().backward()
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert Counter(calls) == {0: 1, 1: 1, 2: 2, 3: 2}
+    assert len(projection_calls) == 1
+    gradients = {
+        name: parameter.grad.clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    assert gradients and all("lora_" in name for name in gradients)
+    model.zero_grad(set_to_none=True)
+    model.gradient_checkpointing_disable()
+    expected = completion_log_probs(model, tokens, 2)
+    expected.sum().backward()
+    torch.testing.assert_close(actual, expected)
+    for name, parameter in model.named_parameters():
+        if name in gradients:
+            torch.testing.assert_close(parameter.grad, gradients[name])
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.disable_input_require_grads()
+    model.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(completion_log_probs(model, tokens, 2), expected)
 
 
 @pytest.mark.parametrize("layer_count", [2, 3])

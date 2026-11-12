@@ -56,6 +56,13 @@ def load_policy(model_name, adapter, *, train, device, lora_layers="all"):
             autocast_adapter_dtype=False,
         )
     model.to(dtype=dtype)
+    if train:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        # Non-reentrant checkpoints track LoRA gradients without unfreezing the prefix.
+        if hasattr(model, "_require_grads_hook") or getattr(model, "_require_grads_hooks", None):
+            model.disable_input_require_grads()
     model.eval()
     return model, tokenizer
 

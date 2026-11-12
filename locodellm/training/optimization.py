@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 
 import torch
-from torch.utils.checkpoint import checkpoint
 
 
 def group_advantages(rewards: torch.Tensor, *, normalize=False, epsilon=1e-4):
@@ -68,13 +67,7 @@ def completion_log_probs(model, tokens, prompt_length, *, temperature=0.9):
     if supports_logits_to_keep:
         model_kwargs["logits_to_keep"] = completion_length + 1
 
-    def forward(input_ids):
-        return model(input_ids=input_ids, **model_kwargs).logits
-
-    if model.training and torch.is_grad_enabled():
-        logits = checkpoint(forward, tokens, use_reentrant=False)
-    else:
-        logits = forward(tokens)
+    logits = model(input_ids=tokens, **model_kwargs).logits
     if supports_logits_to_keep:
         logits = logits[:, :-1]
     else:
