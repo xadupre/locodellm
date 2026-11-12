@@ -453,6 +453,17 @@ published every 10 minutes at an update boundary; `--checkpoint-minutes` and
 `--checkpoint-steps` adjust this. `--adapter PATH` warm-starts saved LoRA weights,
 not optimizer/RNG state. Use set 2 separately for held-out evaluation.
 
+`--lora-layers last-half` attaches new LoRA adapters only to the last half of the
+decoder layers (rounding up for an odd layer count). The frozen first half does
+not require backward activations. All base weights remain loaded, so this does
+not halve total GPU memory. The default is `--lora-layers all`. When resuming with
+`--adapter PATH`, omit this option: the saved adapter retains its layer selection.
+
+On BF16-capable CUDA devices, base weights, LoRA weights, gradients, AdamW moment
+buffers and training log-probabilities use BF16, including when loading a saved
+FP32 adapter. PEFT's automatic FP32 adapter promotion is disabled. This reduces
+memory at the cost of numerical precision; CPU and other devices retain FP32.
+
 ### Export-failure reward
 
 `export_failure_reward` scores one clearly extracted example using four

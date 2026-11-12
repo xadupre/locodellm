@@ -180,6 +180,7 @@ def train(model, tokenizer, tasks, source, args):
             for task in order:
                 group = []
                 rewards = []
+                model.eval()
                 for member in range(args.group_size):
                     turns, record = sample_trajectory(model, tokenizer, task, source, args)
                     group.append(turns)
@@ -204,10 +205,14 @@ def train(model, tokenizer, tasks, source, args):
                     )
                 device = model.get_input_embeddings().weight.device
                 advantages = group_advantages(
-                    torch.tensor(rewards, device=device), normalize=args.normalize_advantages
+                    torch.tensor(
+                        rewards, device=device, dtype=model.get_input_embeddings().weight.dtype
+                    ),
+                    normalize=args.normalize_advantages,
                 )
                 for _ in range(args.updates_per_group):
                     optimizer.zero_grad()
+                    model.train()
                     loss = sum(
                         trajectory_backward(
                             model,
@@ -242,11 +247,14 @@ def train(model, tokenizer, tasks, source, args):
                             },
                         )
                         last_checkpoint = time.monotonic()
+                model.eval()
     save_adapter(model, tokenizer, args.output / "adapter")
 
 
 def run(args: argparse.Namespace):
     """Validates a training run before loading models or cloning repositories."""
+    if args.adapter and args.lora_layers != "all":
+        raise ValueError("--lora-layers cannot override a saved adapter's layer selection.")
     for name in ("epochs", "max_new_tokens", "max_tool_calls", "updates_per_group"):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive.")
@@ -308,7 +316,9 @@ def run(args: argparse.Namespace):
         ],
     )
     (args.output / "config.json").write_text(json.dumps(configuration, indent=2) + "\n")
-    model, tokenizer = load_policy(args.model, args.adapter, train=True, device=args.device)
+    model, tokenizer = load_policy(
+        args.model, args.adapter, train=True, device=args.device, lora_layers=args.lora_layers
+    )
     previous = model.generation_config
     model.generation_config = GenerationConfig(
         bos_token_id=previous.bos_token_id,

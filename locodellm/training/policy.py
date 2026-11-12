@@ -9,12 +9,16 @@ import tempfile
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "gate_proj", "down_proj"]
 
 
-def load_policy(model_name, adapter, *, train, device):
+def load_policy(model_name, adapter, *, train, device, lora_layers="all"):
     """Loads a frozen base with trainable or saved LoRA adapters."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, PeftModel, get_peft_model
 
+    if lora_layers not in ("all", "last-half"):
+        raise ValueError(f"Unknown LoRA layer selection: {lora_layers!r}")
+    if adapter and lora_layers != "all":
+        raise ValueError("--lora-layers cannot override a saved adapter's layer selection.")
     if device.startswith("cuda"):
         torch.cuda.set_device(torch.device(device).index or 0)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -29,8 +33,15 @@ def load_policy(model_name, adapter, *, train, device):
     )
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
     if adapter:
-        model = PeftModel.from_pretrained(model, adapter, is_trainable=train)
+        model = PeftModel.from_pretrained(
+            model, adapter, is_trainable=train, autocast_adapter_dtype=False
+        )
     elif train:
+        layers_to_transform = None
+        if lora_layers == "last-half":
+            config = model.config.get_text_config()
+            count = config.num_hidden_layers
+            layers_to_transform = list(range(count // 2, count))
         model = get_peft_model(
             model,
             LoraConfig(
@@ -39,8 +50,12 @@ def load_policy(model_name, adapter, *, train, device):
                 lora_dropout=0.0,
                 target_modules=TARGET_MODULES,
                 task_type="CAUSAL_LM",
+                layers_to_transform=layers_to_transform,
+                layers_pattern="layers" if layers_to_transform is not None else None,
             ),
+            autocast_adapter_dtype=False,
         )
+    model.to(dtype=dtype)
     model.eval()
     return model, tokenizer
 

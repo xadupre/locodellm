@@ -184,7 +184,7 @@ def test_group_advantages_and_clipped_objectives():
         )
 
 
-def make_tiny_policy(path):
+def make_tiny_policy(path, *, num_hidden_layers=1):
     """Creates a genuine tiny Qwen3 checkpoint and local tokenizer for offline tests."""
     pytest.importorskip("peft")
     from tokenizers import Tokenizer
@@ -214,7 +214,7 @@ def make_tiny_policy(path):
             vocab_size=len(vocabulary),
             hidden_size=16,
             intermediate_size=32,
-            num_hidden_layers=1,
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=2,
             num_key_value_heads=1,
             head_dim=8,
@@ -706,6 +706,8 @@ def test_aten_training_cli_offline(tmp_path, capsys):
         "1",
         "--group-size",
         "2",
+        "--lora-layers",
+        "last-half",
         "--max-new-tokens",
         "2",
         "--max-tool-calls",
@@ -951,20 +953,28 @@ def test_optimizer_updates_only_adapter_parameters(tmp_path):
     model_path = tmp_path / "model"
     make_tiny_policy(model_path)
     model, _ = experiment.load_policy(str(model_path), None, train=True, device="cpu")
+    model.train()
+    layer = model.get_base_model().model.layers[0]
+    forward_calls = []
+    hook = layer.register_forward_hook(lambda *_: forward_calls.append(None))
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
-    )
-    tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]])
-    log_probs = optimization.completion_log_probs(model, tokens, 2)
-    loss = optimization.policy_loss(
-        log_probs,
-        log_probs.detach(),
-        torch.ones_like(log_probs, dtype=torch.bool),
-        torch.tensor([1.0, -1.0]),
-    )
-    loss.backward()
-    optimizer.step()
+    try:
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
+        )
+        tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]])
+        log_probs = optimization.completion_log_probs(model, tokens, 2)
+        loss = optimization.policy_loss(
+            log_probs,
+            log_probs.detach(),
+            torch.ones_like(log_probs, dtype=torch.bool),
+            torch.tensor([1.0, -1.0]),
+        )
+        loss.backward()
+        optimizer.step()
+    finally:
+        hook.remove()
+    assert len(forward_calls) >= 2
     changed = [
         name
         for name, parameter in model.named_parameters()
@@ -975,6 +985,159 @@ def test_optimizer_updates_only_adapter_parameters(tmp_path):
     assert all(
         "lora_" in name for name, parameter in model.named_parameters() if parameter.requires_grad
     )
+
+
+def test_completion_log_probs_only_projects_completion_logits(tmp_path):
+    torch = pytest.importorskip("torch")
+    optimization = importlib.import_module(f"{PACKAGE}.optimization")
+    torch.set_num_threads(1)
+    model_path = tmp_path / "model"
+    model, _ = make_tiny_policy(model_path)
+    model.eval()
+    tokens = torch.tensor([[3, 4, 5, 6]])
+    prompt_length = 2
+    with torch.no_grad():
+        expected = model(input_ids=tokens, use_cache=False).logits[:, 1:-1].float()
+        expected = (
+            expected.log_softmax(dim=-1)
+            .gather(-1, tokens[:, prompt_length:].unsqueeze(-1))
+            .squeeze(-1)
+        )
+    projected_lengths = []
+
+    def record_projection(module, inputs, output):
+        projected_lengths.append(output.shape[1])
+
+    hook = model.lm_head.register_forward_hook(record_projection)
+    try:
+        actual = optimization.completion_log_probs(model, tokens, prompt_length, temperature=1.0)
+    finally:
+        hook.remove()
+    torch.testing.assert_close(actual, expected)
+    assert projected_lengths == [tokens.shape[1] - prompt_length + 1]
+
+
+@pytest.mark.parametrize("layer_count", [2, 3])
+def test_lora_last_half_updates_and_reloads_only_selected_layers(tmp_path, layer_count):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from locodellm.training.optimization import completion_log_probs
+    from locodellm.training.policy import load_policy, save_adapter
+
+    torch.set_num_threads(1)
+    path = tmp_path / "model"
+    make_tiny_policy(path, num_hidden_layers=layer_count)
+    model, tokenizer = load_policy(
+        str(path), None, train=True, device="cpu", lora_layers="last-half"
+    )
+    selected = list(range(layer_count // 2, layer_count))
+    assert model.peft_config["default"].layers_to_transform == selected
+    for index, layer in enumerate(model.get_base_model().model.layers):
+        assert hasattr(layer.self_attn.q_proj, "lora_A") == (index in selected)
+    frozen_outputs = []
+
+    def record_frozen_output(module, inputs, output):
+        frozen_outputs.append(output.requires_grad)
+
+    hook = model.get_base_model().model.layers[0].register_forward_hook(record_frozen_output)
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=0.01)
+    tokens = torch.tensor([[3, 4, 5, 6]])
+    model.train()
+    try:
+        completion_log_probs(model, tokens, 2).sum().backward()
+        optimizer.step()
+    finally:
+        hook.remove()
+    assert frozen_outputs and not any(frozen_outputs)
+    changed = [
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(before[name], parameter)
+    ]
+    assert changed
+    assert all(
+        "lora_" in name and any(f".layers.{index}." in name for index in selected)
+        for name in changed
+    )
+    model.eval()
+    with torch.no_grad():
+        expected = completion_log_probs(model, tokens, 2)
+    save_adapter(model, tokenizer, tmp_path / "adapter")
+    restored, _ = load_policy(str(path), str(tmp_path / "adapter"), train=True, device="cpu")
+    assert restored.peft_config["default"].layers_to_transform == selected
+    with torch.no_grad():
+        torch.testing.assert_close(completion_log_probs(restored, tokens, 2), expected)
+    with pytest.raises(ValueError, match="cannot override"):
+        load_policy(
+            str(path),
+            str(tmp_path / "adapter"),
+            train=True,
+            device="cpu",
+            lora_layers="last-half",
+        )
+
+
+def test_bf16_lora_training_and_fp32_adapter_reload(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from locodellm.training.optimization import (
+        completion_log_probs,
+        group_advantages,
+        policy_loss,
+    )
+    from locodellm.training.policy import load_policy, save_adapter
+
+    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+        pytest.skip("This check requires a BF16-capable CUDA device.")
+    torch.set_num_threads(1)
+    path = tmp_path / "model"
+    make_tiny_policy(path, num_hidden_layers=2)
+    model, tokenizer = load_policy(
+        str(path), None, train=True, device="cuda", lora_layers="last-half"
+    )
+    assert all(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
+    model.train()
+    tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]], device="cuda")
+    current = completion_log_probs(model, tokens, 2)
+    assert current.dtype == torch.bfloat16
+    advantages = group_advantages(torch.tensor([0.0, 0.25], device="cuda", dtype=current.dtype))
+    loss = policy_loss(
+        current, current.detach(), torch.ones_like(current, dtype=torch.bool), advantages
+    )
+    assert loss.dtype == torch.bfloat16 and torch.isfinite(loss)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
+    )
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    loss.backward()
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None
+            assert parameter.grad.dtype == torch.bfloat16
+            assert torch.isfinite(parameter.grad).all()
+    optimizer.step()
+    assert any(
+        not torch.equal(before[name], parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    for state in optimizer.state.values():
+        assert state["exp_avg"].dtype == torch.bfloat16
+        assert state["exp_avg_sq"].dtype == torch.bfloat16
+    model.eval()
+    with torch.no_grad():
+        expected = completion_log_probs(model, tokens, 2)
+    model.float()
+    save_adapter(model, tokenizer, tmp_path / "adapter")
+    restored, _ = load_policy(str(path), str(tmp_path / "adapter"), train=True, device="cuda")
+    assert all(parameter.dtype == torch.bfloat16 for parameter in restored.parameters())
+    with torch.no_grad():
+        torch.testing.assert_close(completion_log_probs(restored, tokens, 2), expected)
 
 
 def test_cli_rejects_unsafe_or_invalid_runs(tmp_path):

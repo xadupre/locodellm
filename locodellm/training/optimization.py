@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+
 import torch
+from torch.utils.checkpoint import checkpoint
 
 
 def group_advantages(rewards: torch.Tensor, *, normalize=False, epsilon=1e-4):
@@ -58,8 +61,25 @@ def completion_log_probs(model, tokens, prompt_length, *, temperature=0.9):
     """Computes completion-token log probabilities under the sampling policy."""
     if temperature <= 0 or not 0 < prompt_length < tokens.shape[1]:
         raise ValueError("Expected a positive temperature and a nonempty prompt and completion.")
-    logits = model(input_ids=tokens, use_cache=False).logits
-    logits = logits[:, prompt_length - 1 : -1].float() / temperature
+    completion_length = tokens.shape[1] - prompt_length
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+    supports_logits_to_keep = "logits_to_keep" in inspect.signature(base_model.forward).parameters
+    model_kwargs = {"use_cache": False}
+    if supports_logits_to_keep:
+        model_kwargs["logits_to_keep"] = completion_length + 1
+
+    def forward(input_ids):
+        return model(input_ids=input_ids, **model_kwargs).logits
+
+    if model.training and torch.is_grad_enabled():
+        logits = checkpoint(forward, tokens, use_reentrant=False)
+    else:
+        logits = forward(tokens)
+    if supports_logits_to_keep:
+        logits = logits[:, :-1]
+    else:
+        logits = logits[:, prompt_length - 1 : -1]
+    logits = logits / temperature
     targets = tokens[:, prompt_length:]
     return logits.log_softmax(dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
