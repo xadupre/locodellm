@@ -10,7 +10,7 @@ import tempfile
 
 from locodellm.generate.repository import GitRepository
 from locodellm.training.export_verifier import (
-    ExportReward,
+    added_python_examples,
     allowed_converters,
     load_tasks,
     verify_export_answer,
@@ -23,17 +23,25 @@ def diagnosis(result: dict) -> str:
         return f"Generation failed: {result['error']}"
     if result["source_modified"]:
         return "Repository modified during generation"
-    if not result["criteria"]["answer_extractable"]:
-        return "No extractable runnable Python"
     if any(replay["timed_out"] for replay in result["replays"]):
         return "Verification timed out"
     if result["criteria"]["reproduction_valid"]:
         return "Converter failure confirmed by two independent replays"
     if result["criteria"]["failure_valid"]:
         return "Failure observed, not independently reproduced"
+    if result["criteria"]["failure_confirmed"]:
+        return "Converter failure confirmed outside the original export protocol"
+    if result["criteria"]["test_passed"]:
+        return "Passing export comparison test confirmed"
     for replay in result["replays"]:
         if replay["returncode"] and replay["stderr"].strip():
             return replay["stderr"].strip().splitlines()[-1]
+    if result["criteria"]["test_created"]:
+        return "Comparison test created; no passing baseline confirmed"
+    if result["criteria"]["example_created"]:
+        return "PyTorch example created; no comparison test confirmed"
+    if not result["criteria"]["answer_extractable"]:
+        return "No extractable runnable Python"
     return "No converter failure confirmed"
 
 
@@ -86,6 +94,13 @@ def evaluate(
             or row["tool_call_count"] < 0
             or (row.get("error") is not None and not isinstance(row["error"], str))
             or not isinstance(row.get("diff", ""), str)
+            or not isinstance(row.get("tool_calls", []), list)
+            or any(
+                not isinstance(call, dict)
+                or not isinstance(call.get("code"), str)
+                or call.get("tool", "python") not in ("python", "bash")
+                for call in row.get("tool_calls", [])
+            )
         ):
             raise ValueError("Invalid generation tool count, error or diff.")
     source = GitRepository(document["repo"])
@@ -96,37 +111,24 @@ def evaluate(
     evaluated = []
     for row in document["results"]:
         task = by_prompt[row["prompt"]]
-        if row.get("error") or row.get("diff"):
-            reward = ExportReward(
-                0.0,
-                dict.fromkeys(
-                    (
-                        "reference_valid",
-                        "export_call_valid",
-                        "failure_valid",
-                        "reproduction_valid",
-                        "answer_extractable",
-                    ),
-                    False,
-                ),
-                [],
+        with tempfile.TemporaryDirectory(prefix="locodellm-evaluation-") as directory:
+            reward = verify_export_answer(
+                row["text"],
+                source,
+                Path(directory),
+                allow_execution=allow_execution,
+                timeout=timeout,
+                allowed_converters=allowed_converters(task),
+                tool_calls=row.get("tool_calls", []),
+                generated_diff=row.get("diff", ""),
+                base_eligible=not bool(row.get("error")),
             )
-        else:
-            with tempfile.TemporaryDirectory(prefix="locodellm-evaluation-") as directory:
-                reward = verify_export_answer(
-                    row["text"],
-                    source,
-                    Path(directory),
-                    allow_execution=allow_execution,
-                    timeout=timeout,
-                    allowed_converters=allowed_converters(task),
-                )
         result = {
             "task_id": task["id"],
             "function": task["function"],
             "tool_call_count": row["tool_call_count"],
             "error": row.get("error"),
-            "source_modified": bool(row.get("diff")),
+            "source_modified": added_python_examples(row.get("diff", "")) is None,
             **reward.to_dict(),
         }
         result["diagnosis"] = diagnosis(result)
@@ -142,6 +144,11 @@ def evaluate(
             "evaluated_tasks": len(evaluated),
             "missing_tasks": len(tasks) - len(evaluated),
             "mean_reward": sum(result["total"] for result in evaluated) / len(evaluated),
+            "mean_base_reward": sum(result["base_reward"] for result in evaluated)
+            / len(evaluated),
+            "mean_progress_reward": sum(result["progress_reward"] for result in evaluated)
+            / len(evaluated),
+            "max_reward": 2.0,
             "criteria_validated": {
                 name: sum(result["criteria"][name] for result in evaluated)
                 for name in evaluated[0]["criteria"]
@@ -168,7 +175,18 @@ def print_report(report: dict) -> None:
     criteria = summary["criteria_validated"]
     print("\nATen export evaluation")
     print(f"Evaluated: {count}/{summary['dataset_tasks']} tasks")
-    print(f"Mean reward: {summary['mean_reward']:.4f} / 1")
+    print(f"Mean reward: {summary['mean_reward']:.4f} / 2")
+    print(
+        f"Original reward: {summary['mean_base_reward']:.4f} / 1; "
+        f"progress bonuses: {summary['mean_progress_reward']:.4f} / 1"
+    )
+    for name, label in (
+        ("example_created", "PyTorch examples created"),
+        ("test_created", "Export comparison tests created"),
+        ("test_passed", "Passing comparison tests"),
+        ("failure_confirmed", "Confirmed failure examples"),
+    ):
+        print(f"{label}: {criteria[name]}/{count}")
     print(f"Confirmed converter failures: {criteria['failure_valid']}/{count}")
     print(f"Independently reproduced failures: {criteria['reproduction_valid']}/{count}")
     print(f"Valid PyTorch references: {criteria['reference_valid']}/{count}")
@@ -184,10 +202,11 @@ def print_report(report: dict) -> None:
     )
     if summary["missing_tasks"]:
         print(f"WARNING: {summary['missing_tasks']} missing tasks are not included in the mean.")
-    print("\nFunction | Reward | Tools | Diagnosis")
+    print("\nFunction | Reward | Original | Progress | Tools | Diagnosis")
     for result in report["results"]:
         print(
             f"{result['function']} | {result['total']:.2f} | "
+            f"{result['base_reward']:.2f} | {result['progress_reward']:.2f} | "
             f"{result['tool_call_count']} | {result['diagnosis']}"
         )
     print("\nPartial reward is not a bug-discovery success rate.", flush=True)

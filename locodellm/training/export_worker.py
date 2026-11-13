@@ -72,6 +72,8 @@ def main():
             "reference_valid": False,
             "export_call_valid": False,
             "failure_valid": False,
+            "failure_observed": False,
+            "comparison_valid": False,
             "stage": "pytorch",
             "converters": [],
             "error_type": None,
@@ -91,8 +93,9 @@ def main():
         record["reference_outputs"] = fingerprint(expected)
         record["stage"] = "export_call"
         signature.bind(module, inputs, *args, **kwargs)
-        if args or kwargs.get("target_opset") != 18 or kwargs.get("optimize", True):
-            raise ValueError("Verification requires target_opset=18, optimize=False.")
+        legacy_protocol = (
+            not args and kwargs.get("target_opset") == 18 and not kwargs.get("optimize", True)
+        )
         for name, count in (("input_names", len(inputs)), ("output_names", len(expected))):
             names = kwargs.get(name)
             if names is not None and (
@@ -102,7 +105,7 @@ def main():
                 or len(set(names)) != count
             ):
                 raise ValueError(f"{name} must uniquely name each tensor.")
-        record["export_call_valid"] = True
+        record["export_call_valid"] = legacy_protocol
         record["stage"] = "export"
         converters = set()
 
@@ -117,13 +120,15 @@ def main():
         previous_profile = sys.getprofile()
         try:
             sys.setprofile(profile)
-            model = original(module, inputs, **kwargs)
+            model = original(module, inputs, *args, **kwargs)
         except export_errors as error:
+            converter_failure = any(
+                "yobx" in frame.filename and frame.name.startswith("aten_")
+                for frame in traceback.extract_tb(error.__traceback__)
+            )
             record.update(
-                failure_valid=any(
-                    "yobx" in frame.filename and frame.name.startswith("aten_")
-                    for frame in traceback.extract_tb(error.__traceback__)
-                ),
+                failure_valid=legacy_protocol and converter_failure,
+                failure_observed=converter_failure,
                 error_type=type(error).__name__,
                 error=re.sub(r"0x[0-9a-fA-F]+", "0xADDRESS", str(error))[:2000],
             )
@@ -155,9 +160,8 @@ def main():
             record["stage"] = "ort_run"
             names = kwargs.get("input_names")
             if names is None:
-                # Arbitrary nested/pruned input mapping cannot be inferred safely.
-                record["stage"] = "unverified_input_mapping"
-                return model
+                # Maps only named forward arguments, never guesses pruned input positions.
+                names = list(inspect.signature(module.forward).bind(*inputs).arguments)
             if len(names) != len(inputs) or any(
                 not isinstance(value, torch.Tensor) for value in inputs
             ):
@@ -177,9 +181,15 @@ def main():
                 assert got.shape == want.shape, "Incorrect runtime shape."
                 assert got.dtype == want.dtype, "Incorrect runtime dtype."
                 numpy.testing.assert_allclose(got, want, rtol=2e-3, atol=2e-3)
+            record["comparison_valid"] = True
         except (AssertionError, *ort_errors) as error:
             record.update(
-                failure_valid=True,
+                failure_valid=legacy_protocol
+                and (
+                    kwargs.get("input_names") is not None
+                    or record["stage"] in ("metadata", "ort_load")
+                ),
+                failure_observed=True,
                 error_type=type(error).__name__,
                 error=re.sub(r"0x[0-9a-fA-F]+", "0xADDRESS", str(error))[:2000],
             )

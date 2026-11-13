@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
 import tempfile
 
 from locodellm.bench.python_harness import PythonHarness
@@ -73,6 +74,8 @@ class ExportReward:
     total: float
     criteria: dict[str, bool]
     replays: list[dict]
+    base_reward: float = 0.0
+    progress_reward: float = 0.0
 
     def to_dict(self):
         """Returns serializable verification diagnostics."""
@@ -90,6 +93,124 @@ def extract_example(answer: str) -> str:
     except SyntaxError:
         return ""
     return code
+
+
+def example_progress(code: str) -> tuple[bool, bool, bool]:
+    """Identifies module examples, comparison tests and export calls in Python."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False, False, False
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            aliases.update(
+                (name.asname or name.name, f"{node.module}.{name.name}") for name in node.names
+            )
+        elif isinstance(node, ast.Import):
+            aliases.update((name.asname or name.name, name.name) for name in node.names)
+
+    def name(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return f"{name(node.value)}.{node.attr}"
+        return ""
+
+    calls = [name(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    example = any(
+        isinstance(node, ast.ClassDef)
+        and any(name(base) in {"torch.nn.Module", "nn.Module", "Module"} for base in node.bases)
+        and any(
+            isinstance(member, ast.FunctionDef) and member.name == "forward"
+            for member in node.body
+        )
+        for node in ast.walk(tree)
+    ) or any(
+        call.startswith("torch.nn.") and call.rsplit(".", 1)[-1][:1].isupper() for call in calls
+    )
+    export = any(
+        call.rsplit(".", 1)[-1] in {"to_onnx", "_to_onnx", "_call_exporter"} for call in calls
+    )
+    comparison = any(
+        call.rsplit(".", 1)[-1]
+        in {
+            "assert_allclose",
+            "assert_array_equal",
+            "assert_equal",
+            "assert_close",
+            "assertEqualArray",
+            "assert_conversion_with_ort_on_cpu",
+        }
+        for call in calls
+    ) or any(
+        isinstance(node, ast.Assert) and isinstance(node.test, (ast.Call, ast.Compare))
+        for node in ast.walk(tree)
+    )
+    runtime = any(
+        call.rsplit(".", 1)[-1]
+        in {
+            "InferenceSession",
+            "ExtendedReferenceEvaluator",
+            "ReferenceEvaluator",
+            "assert_conversion_with_ort_on_cpu",
+        }
+        for call in calls
+    )
+    return example, export and comparison and runtime, export
+
+
+def added_python_examples(diff: str) -> dict[str, str] | None:
+    """Extracts added Python artifacts, rejecting changes to existing source files."""
+    if not diff:
+        return {}
+    files = {}
+    for patch in re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE):
+        if not patch:
+            continue
+        match = re.search(
+            r"^new file mode 100(?:644|755)\n.*?^--- /dev/null\n^\+\+\+ b/([^\n]+\.py)\n",
+            patch,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not patch.startswith("diff --git ") or match is None:
+            return None
+        body = patch[match.end() :]
+        files[match[1]] = "\n".join(
+            line[1:] for line in body.splitlines() if line.startswith("+")
+        )
+    return files or None
+
+
+def tool_python_examples(tool_calls: list[dict]) -> list[str]:
+    """Extracts Python tool bodies and literal Bash Python commands, never shell code."""
+    examples = []
+    for call in tool_calls:
+        code = call.get("code", "")
+        if call.get("tool", "python") == "python":
+            examples.append(code)
+            continue
+        # Heredoc bodies are Python only when passed directly to the interpreter.
+        examples.extend(
+            match[3]
+            for match in re.finditer(
+                r"(?:^|\n|&&)\s*python(?:3(?:\.\d+)?)?\s+-\s*<<\s*"
+                r"(['\"]?)([A-Za-z_]\w*)\1[ \t]*\n(.*?)^\2[ \t]*(?:\n|$)",
+                code,
+                re.MULTILINE | re.DOTALL,
+            )
+        )
+        try:
+            tokens = shlex.split(code)
+        except ValueError:
+            continue
+        for index, token in enumerate(tokens[:-2]):
+            if (
+                re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(token).name)
+                and tokens[index + 1] == "-c"
+            ):
+                examples.append(tokens[index + 2])
+    return [example.strip() for example in examples]
 
 
 def replay_example(code: str, repository: GitRepository, *, timeout: float) -> dict:
@@ -130,8 +251,11 @@ def verify_export_answer(
     allow_execution: bool,
     timeout: float = 60,
     allowed_converters: set[str] | None = None,
+    tool_calls: list[dict] | None = None,
+    generated_diff: str = "",
+    base_eligible: bool = True,
 ) -> ExportReward:
-    """Scores the best observed example using two independent clean replays.
+    """Adds verified progress to the best original score across saved Python evidence.
 
     Runs arbitrary generated Python, not a sandbox. The caller must provide an
     isolated environment. No claimed boolean or expected answer is used as evidence.
@@ -141,46 +265,104 @@ def verify_export_answer(
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("The verification timeout must be finite and positive.")
     code = extract_example(answer)
+    base_eligible = base_eligible and not generated_diff
     empty = {
         "reference_valid": False,
         "export_call_valid": False,
         "failure_valid": False,
         "reproduction_valid": False,
-        "answer_extractable": bool(code),
+        "answer_extractable": bool(code) and base_eligible,
+        "example_created": False,
+        "test_created": False,
+        "test_passed": False,
+        "failure_confirmed": False,
     }
-    if not code:
-        return ExportReward(export_failure_reward(**empty), empty, [])
+    files = added_python_examples(generated_diff)
+    if files is None:
+        return ExportReward(0.0, dict.fromkeys(empty, False), [])
+    candidates = [code, *tool_python_examples(tool_calls or []), *files.values()]
     replays = []
-    for _ in range(2):
-        repository = GitRepository.clone(
-            str(source_repository.path), str(clone_directory), source_repository.revision
+    best_criteria = empty.copy()
+    base_reward = export_failure_reward(**empty) if base_eligible else 0.0
+    progress = dict.fromkeys(
+        ("example_created", "test_created", "test_passed", "failure_confirmed"), False
+    )
+    passing_cases, failing_cases = set(), set()
+    for candidate in dict.fromkeys(candidates):
+        if not candidate:
+            continue
+        example, test, export = example_progress(candidate)
+        progress["example_created"] |= example
+        progress["test_created"] |= test
+        if not export:
+            continue
+        pair = []
+        for _ in range(2):
+            repository = GitRepository.clone(
+                str(source_repository.path), str(clone_directory), source_repository.revision
+            )
+            replay = replay_example(candidate, repository, timeout=timeout)
+            pair.append(replay)
+            replays.append(replay)
+        first, second = pair
+        if first["source_modified"] or second["source_modified"]:
+            continue
+        for index, observed in enumerate(first["observations"]):
+            base_relevant = allowed_converters is None or bool(
+                allowed_converters.intersection(observed["converters"])
+            )
+            relevant = bool(observed["converters"]) and base_relevant
+            reproduced = (
+                not first["timed_out"]
+                and not second["timed_out"]
+                and index < len(second["observations"])
+                and observed == second["observations"][index]
+                and relevant
+            )
+            criteria = {
+                **empty,
+                "reference_valid": observed["reference_valid"],
+                "export_call_valid": observed["export_call_valid"],
+                "failure_valid": observed["failure_valid"] and base_relevant,
+                "reproduction_valid": reproduced and observed["failure_valid"],
+            }
+            if base_eligible and candidate == code:
+                total = export_failure_reward(**criteria)
+                if total > base_reward:
+                    base_reward, best_criteria = total, criteria
+            progress["example_created"] |= observed["reference_valid"]
+            passed = (
+                test
+                and reproduced
+                and observed["comparison_valid"]
+                and all(
+                    replay["returncode"] == 0
+                    or any(item["failure_observed"] for item in replay["observations"])
+                    for replay in pair
+                )
+            )
+            progress["test_passed"] |= passed
+            # A case is identified by its converters, input values and PyTorch outputs.
+            case = (
+                tuple(observed["converters"]),
+                observed.get("inputs"),
+                observed.get("reference_outputs"),
+            )
+            if passed:
+                passing_cases.add(case)
+            if reproduced and observed["failure_observed"]:
+                failing_cases.add(case)
+        # The failure bonus requires a second case distinct from a passing test case.
+        progress["failure_confirmed"] = bool(passing_cases) and bool(
+            failing_cases - passing_cases
         )
-        replays.append(replay_example(code, repository, timeout=timeout))
-    best = ExportReward(export_failure_reward(**empty), empty, replays)
-    first, second = replays
-    if first["source_modified"] or second["source_modified"]:
-        return best
-    for index, observed in enumerate(first["observations"]):
-        relevant = allowed_converters is None or bool(
-            allowed_converters.intersection(observed["converters"])
-        )
-        reproduced = (
-            not first["timed_out"]
-            and not second["timed_out"]
-            and index < len(second["observations"])
-            and observed == second["observations"][index]
-            and observed["failure_valid"]
-            and bool(observed["converters"])
-            and relevant
-        )
-        criteria = {
-            **empty,
-            "reference_valid": observed["reference_valid"],
-            "export_call_valid": observed["export_call_valid"],
-            "failure_valid": observed["failure_valid"] and relevant,
-            "reproduction_valid": bool(reproduced),
-        }
-        total = export_failure_reward(**criteria)
-        if total > best.total:
-            best = ExportReward(total, criteria, replays)
-    return best
+        if all(progress.values()) and (base_reward == 1.0 or not base_eligible):
+            break
+    progress_reward = 0.25 * sum(progress.values())
+    return ExportReward(
+        base_reward + progress_reward,
+        {**best_criteria, **progress},
+        replays,
+        base_reward,
+        progress_reward,
+    )
