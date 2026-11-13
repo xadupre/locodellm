@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
@@ -17,7 +17,7 @@ from locodellm.bench.python_harness import PythonHarness
 from locodellm.generate.repository import GitRepository
 from locodellm.session.pytorch_session import PyTorchSessionState
 from locodellm.training.export_verifier import (
-    ExportReward,
+    added_python_examples,
     allowed_converters,
     load_tasks,
     verify_export_answer,
@@ -169,7 +169,7 @@ def trajectory_backward(
 def sample_trajectory(
     model, tokenizer, task, source, args, *, memory_log=None, memory_context=None
 ):
-    """Samples one independent multi-turn rollout and verifies only its final answer."""
+    """Samples a multi-turn rollout and verifies final, tool and added-test evidence."""
     repository = GitRepository.clone(
         str(source.path), str(args.output / "repositories"), source.revision
     )
@@ -204,28 +204,19 @@ def sample_trajectory(
     )
     if not session.turns:
         raise RuntimeError("The rollout produced no sampled assistant actions.")
-    source_modified = bool(repository.diff())
-    if result.error or source_modified:
-        reward = ExportReward(
-            0.0,
-            {
-                "reference_valid": False,
-                "export_call_valid": False,
-                "failure_valid": False,
-                "reproduction_valid": False,
-                "answer_extractable": False,
-            },
-            [],
-        )
-    else:
-        reward = verify_export_answer(
-            result.text,
-            source,
-            args.output / "repositories",
-            allow_execution=args.allow_code_execution,
-            timeout=args.verification_timeout,
-            allowed_converters=allowed_converters(task),
-        )
+    diff = repository.diff()
+    source_modified = added_python_examples(diff) is None
+    reward = verify_export_answer(
+        result.text,
+        source,
+        args.output / "repositories",
+        allow_execution=args.allow_code_execution,
+        timeout=args.verification_timeout,
+        allowed_converters=allowed_converters(task),
+        tool_calls=[asdict(call) for call in result.tool_calls],
+        generated_diff=diff,
+        base_eligible=not bool(result.error),
+    )
     return session.turns, {
         "task_id": task["id"],
         "text": result.text,
