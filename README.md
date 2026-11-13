@@ -467,6 +467,31 @@ published every 10 minutes at an update boundary; `--checkpoint-minutes` and
 `--checkpoint-steps` adjust this. `--adapter PATH` warm-starts saved LoRA weights,
 not optimizer/RNG state. Use set 2 separately for held-out evaluation.
 
+`--lora-layers last-half` attaches new LoRA adapters only to the last half of the
+decoder layers (rounding up for an odd layer count). The frozen first half does
+not require backward activations. All base weights remain loaded, so this does
+not halve total GPU memory. The default is `--lora-layers all`. When resuming with
+`--adapter PATH`, omit this option: the saved adapter retains its layer selection.
+
+Training enables Transformers' native per-block, non-reentrant activation
+checkpointing instead of checkpointing the entire model forward. Backward
+recomputes each decoder block's intermediates separately; the frozen prefix does
+not require input gradients. Rollout generation remains in evaluation mode and
+does not checkpoint activations.
+
+On BF16-capable CUDA devices, base weights, LoRA weights, gradients, AdamW moment
+buffers and training log-probabilities use BF16, including when loading a saved
+FP32 adapter. PEFT's automatic FP32 adapter promotion is disabled. This reduces
+memory at the cost of numerical precision; CPU and other devices retain FP32.
+
+`--log-memory` writes CUDA diagnostics to `--output/memory.jsonl`: allocated and
+reserved bytes, per-phase peaks, device free memory, context lengths and
+epoch/task/sample identifiers. It measures generation, old-policy probabilities,
+training forward, backward and optimizer steps separately, and records OOM errors
+before propagating them. The initial snapshot includes frozen and trainable
+parameter sizes. Measurements synchronize CUDA and reset allocator peak counters,
+so enable this only for diagnostics. A running process must be restarted to use it.
+
 ### Export-failure reward
 
 `export_failure_reward` preserves the original four independently verified

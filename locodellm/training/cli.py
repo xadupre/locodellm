@@ -12,6 +12,12 @@ def add_parser(subparsers):
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--repo", help="Clean local source at the recorded revision.")
     parser.add_argument("--adapter", help="Warm-start LoRA weights, not optimizer state.")
+    parser.add_argument(
+        "--lora-layers",
+        choices=["all", "last-half"],
+        default="all",
+        help="Selects decoder layers for a new adapter; saved adapters retain their selection.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--group-size", type=int, default=8)
@@ -31,6 +37,11 @@ def add_parser(subparsers):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--verbose", "-v", type=int, default=0)
+    parser.add_argument(
+        "--log-memory",
+        action="store_true",
+        help="Records CUDA memory usage and per-phase peaks in output/memory.jsonl.",
+    )
     parser.add_argument(
         "--allow-code-execution",
         action="store_true",

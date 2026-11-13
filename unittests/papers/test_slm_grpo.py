@@ -185,7 +185,7 @@ def test_group_advantages_and_clipped_objectives():
         )
 
 
-def make_tiny_policy(path):
+def make_tiny_policy(path, *, num_hidden_layers=1):
     """Creates a genuine tiny Qwen3 checkpoint and local tokenizer for offline tests."""
     pytest.importorskip("peft")
     from tokenizers import Tokenizer
@@ -215,7 +215,7 @@ def make_tiny_policy(path):
             vocab_size=len(vocabulary),
             hidden_size=16,
             intermediate_size=32,
-            num_hidden_layers=1,
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=2,
             num_key_value_heads=1,
             head_dim=8,
@@ -892,12 +892,15 @@ def test_training_session_with_real_tool_feedback(tmp_path):
         assert turn.old_log_probs.numel() == len(tokenizer.encode(action)) + 1
 
 
-def test_aten_training_cli_offline(tmp_path, capsys):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_aten_training_cli_offline(tmp_path, capsys, device):
     torch = pytest.importorskip("torch")
     pytest.importorskip("peft")
     from locodellm.__main__ import main
     from locodellm.training.grpo import load_tasks
 
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("This check requires a CUDA device.")
     torch.set_num_threads(1)
     source = make_export_repository(tmp_path / "source")
     model_path = tmp_path / "model"
@@ -924,11 +927,13 @@ def test_aten_training_cli_offline(tmp_path, capsys):
         "--repo",
         str(source.path),
         "--device",
-        "cpu",
+        device,
         "--epochs",
         "1",
         "--group-size",
         "2",
+        "--lora-layers",
+        "last-half",
         "--max-new-tokens",
         "2",
         "--max-tool-calls",
@@ -941,6 +946,11 @@ def test_aten_training_cli_offline(tmp_path, capsys):
     with pytest.raises(PermissionError, match="allow-code-execution"):
         main(common)
     assert not output.exists()
+    if device == "cuda":
+        common.append("--log-memory")
+    else:
+        with pytest.raises(ValueError, match="requires a CUDA device"):
+            main([*common, "--allow-code-execution", "--log-memory"])
     main([*common, "--allow-code-execution"])
     assert (output / "adapter" / "adapter_model.safetensors").exists()
     assert (output / "checkpoint-1" / "adapter_config.json").exists()
@@ -952,6 +962,35 @@ def test_aten_training_cli_offline(tmp_path, capsys):
     assert "REFERENCE MUST NOT LEAK" not in (output / "train.jsonl").read_text()
     assert json.loads((output / "config.json").read_text())["reward"] == "export_failure_reward"
     assert "update=2" in capsys.readouterr().out
+    if device == "cuda":
+        memory = [json.loads(line) for line in (output / "memory.jsonl").read_text().splitlines()]
+        assert {record["phase"] for record in memory} == {
+            "model_ready",
+            "generation",
+            "old_log_probs",
+            "forward",
+            "backward",
+            "optimizer_step",
+        }
+        snapshot = memory[0]
+        assert snapshot["frozen_parameter_bytes"] > 0
+        assert snapshot["trainable_parameter_bytes"] > 0
+        for record in memory:
+            assert record["peak_allocated_bytes"] >= record["allocated_bytes"] > 0
+            assert record["reserved_bytes"] >= record["allocated_bytes"]
+        phases = [record for record in memory if record["phase"] != "model_ready"]
+        assert len(phases) % 2 == 0
+        for begin, end in zip(phases[::2], phases[1::2]):
+            assert begin["event"] == "begin"
+            assert end["event"] == "end"
+            assert begin["phase"] == end["phase"]
+        assert all(
+            "total_tokens" in record and "member" in record
+            for record in memory
+            if record["phase"] in ("forward", "backward")
+        )
+    else:
+        assert not (output / "memory.jsonl").exists()
     with pytest.raises(ValueError, match="empty or absent"):
         main([*common, "--allow-code-execution"])
     task["verification"]["revision"] = "wrong"
@@ -1174,20 +1213,28 @@ def test_optimizer_updates_only_adapter_parameters(tmp_path):
     model_path = tmp_path / "model"
     make_tiny_policy(model_path)
     model, _ = experiment.load_policy(str(model_path), None, train=True, device="cpu")
+    model.train()
+    layer = model.get_base_model().model.layers[0]
+    forward_calls = []
+    hook = layer.register_forward_pre_hook(lambda *_: forward_calls.append(None))
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
-    )
-    tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]])
-    log_probs = optimization.completion_log_probs(model, tokens, 2)
-    loss = optimization.policy_loss(
-        log_probs,
-        log_probs.detach(),
-        torch.ones_like(log_probs, dtype=torch.bool),
-        torch.tensor([1.0, -1.0]),
-    )
-    loss.backward()
-    optimizer.step()
+    try:
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
+        )
+        tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]])
+        log_probs = optimization.completion_log_probs(model, tokens, 2)
+        loss = optimization.policy_loss(
+            log_probs,
+            log_probs.detach(),
+            torch.ones_like(log_probs, dtype=torch.bool),
+            torch.tensor([1.0, -1.0]),
+        )
+        loss.backward()
+        optimizer.step()
+    finally:
+        hook.remove()
+    assert len(forward_calls) >= 2
     changed = [
         name
         for name, parameter in model.named_parameters()
@@ -1198,6 +1245,262 @@ def test_optimizer_updates_only_adapter_parameters(tmp_path):
     assert all(
         "lora_" in name for name, parameter in model.named_parameters() if parameter.requires_grad
     )
+
+
+def test_completion_log_probs_only_projects_completion_logits(tmp_path):
+    torch = pytest.importorskip("torch")
+    optimization = importlib.import_module(f"{PACKAGE}.optimization")
+    torch.set_num_threads(1)
+    model_path = tmp_path / "model"
+    model, _ = make_tiny_policy(model_path)
+    model.eval()
+    tokens = torch.tensor([[3, 4, 5, 6]])
+    prompt_length = 2
+    with torch.no_grad():
+        expected = model(input_ids=tokens, use_cache=False).logits[:, 1:-1].float()
+        expected = (
+            expected.log_softmax(dim=-1)
+            .gather(-1, tokens[:, prompt_length:].unsqueeze(-1))
+            .squeeze(-1)
+        )
+    projected_lengths = []
+
+    def record_projection(module, inputs, output):
+        projected_lengths.append(output.shape[1])
+
+    hook = model.lm_head.register_forward_hook(record_projection)
+    try:
+        actual = optimization.completion_log_probs(model, tokens, prompt_length, temperature=1.0)
+    finally:
+        hook.remove()
+    torch.testing.assert_close(actual, expected)
+    assert projected_lengths == [tokens.shape[1] - prompt_length + 1]
+
+
+@pytest.mark.parametrize("architecture", ["qwen3", "qwen3_5"])
+def test_block_checkpointing_recomputes_only_trainable_layers(tmp_path, architecture):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from locodellm.training.optimization import completion_log_probs
+    from locodellm.training.policy import load_policy
+
+    torch.set_num_threads(1)
+    device = "cuda" if architecture == "qwen3_5" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("This hybrid-model check requires a CUDA device.")
+    path = tmp_path / "model"
+    make_tiny_policy(path, num_hidden_layers=4)
+    if architecture == "qwen3_5":
+        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+        model = Qwen3_5ForCausalLM(
+            Qwen3_5TextConfig(
+                vocab_size=8,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=4,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_num_key_heads=2,
+                linear_num_value_heads=2,
+                layer_types=[
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                    "full_attention",
+                ],
+                eos_token_id=1,
+                pad_token_id=2,
+            )
+        )
+        model.save_pretrained(path)
+    model, _ = load_policy(str(path), None, train=True, device=device, lora_layers="last-half")
+    assert model.is_gradient_checkpointing
+    calls = []
+    hooks = [
+        layer.register_forward_pre_hook(lambda module, inputs, i=i: calls.append(i))
+        for i, layer in enumerate(model.get_base_model().model.layers)
+    ]
+    projection_calls = []
+    hooks.append(
+        model.get_output_embeddings().register_forward_pre_hook(
+            lambda *_: projection_calls.append(None)
+        )
+    )
+    model.train()
+    tokens = torch.tensor([[3, 4, 5, 6]], device=device)
+    try:
+        actual = completion_log_probs(model, tokens, 2)
+        actual.sum().backward()
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert Counter(calls) == {0: 1, 1: 1, 2: 2, 3: 2}
+    assert len(projection_calls) == 1
+    gradients = {
+        name: parameter.grad.clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    assert gradients and all("lora_" in name for name in gradients)
+    model.zero_grad(set_to_none=True)
+    model.gradient_checkpointing_disable()
+    expected = completion_log_probs(model, tokens, 2)
+    expected.sum().backward()
+    torch.testing.assert_close(actual, expected)
+    for name, parameter in model.named_parameters():
+        if name in gradients:
+            torch.testing.assert_close(parameter.grad, gradients[name])
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.disable_input_require_grads()
+    model.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(completion_log_probs(model, tokens, 2), expected)
+
+
+@pytest.mark.parametrize("layer_count", [2, 3])
+def test_lora_last_half_updates_and_reloads_only_selected_layers(tmp_path, layer_count):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from locodellm.training.optimization import completion_log_probs
+    from locodellm.training.policy import load_policy, save_adapter
+
+    torch.set_num_threads(1)
+    path = tmp_path / "model"
+    make_tiny_policy(path, num_hidden_layers=layer_count)
+    model, tokenizer = load_policy(
+        str(path), None, train=True, device="cpu", lora_layers="last-half"
+    )
+    selected = list(range(layer_count // 2, layer_count))
+    assert model.peft_config["default"].layers_to_transform == selected
+    for index, layer in enumerate(model.get_base_model().model.layers):
+        assert hasattr(layer.self_attn.q_proj, "lora_A") == (index in selected)
+    frozen_outputs = []
+
+    def record_frozen_output(module, inputs, output):
+        frozen_outputs.append(output.requires_grad)
+
+    hook = model.get_base_model().model.layers[0].register_forward_hook(record_frozen_output)
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=0.01)
+    tokens = torch.tensor([[3, 4, 5, 6]])
+    model.train()
+    try:
+        completion_log_probs(model, tokens, 2).sum().backward()
+        optimizer.step()
+    finally:
+        hook.remove()
+    assert frozen_outputs and not any(frozen_outputs)
+    changed = [
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(before[name], parameter)
+    ]
+    assert changed
+    assert all(
+        "lora_" in name and any(f".layers.{index}." in name for index in selected)
+        for name in changed
+    )
+    model.eval()
+    with torch.no_grad():
+        expected = completion_log_probs(model, tokens, 2)
+    save_adapter(model, tokenizer, tmp_path / "adapter")
+    restored, _ = load_policy(str(path), str(tmp_path / "adapter"), train=True, device="cpu")
+    assert restored.peft_config["default"].layers_to_transform == selected
+    with torch.no_grad():
+        torch.testing.assert_close(completion_log_probs(restored, tokens, 2), expected)
+    with pytest.raises(ValueError, match="cannot override"):
+        load_policy(
+            str(path),
+            str(tmp_path / "adapter"),
+            train=True,
+            device="cpu",
+            lora_layers="last-half",
+        )
+
+
+def test_bf16_lora_training_and_fp32_adapter_reload(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    from locodellm.training.optimization import (
+        completion_log_probs,
+        group_advantages,
+        policy_loss,
+    )
+    from locodellm.training.policy import load_policy, save_adapter
+
+    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+        pytest.skip("This check requires a BF16-capable CUDA device.")
+    torch.set_num_threads(1)
+    path = tmp_path / "model"
+    make_tiny_policy(path, num_hidden_layers=2)
+    model, tokenizer = load_policy(
+        str(path), None, train=True, device="cuda", lora_layers="last-half"
+    )
+    assert all(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
+    model.train()
+    tokens = torch.tensor([[3, 4, 5, 6], [3, 4, 7, 5]], device="cuda")
+    current = completion_log_probs(model, tokens, 2)
+    assert current.dtype == torch.bfloat16
+    advantages = group_advantages(torch.tensor([0.0, 0.25], device="cuda", dtype=current.dtype))
+    loss = policy_loss(
+        current, current.detach(), torch.ones_like(current, dtype=torch.bool), advantages
+    )
+    assert loss.dtype == torch.bfloat16 and torch.isfinite(loss)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.01
+    )
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    loss.backward()
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None
+            assert parameter.grad.dtype == torch.bfloat16
+            assert torch.isfinite(parameter.grad).all()
+    optimizer.step()
+    assert any(
+        not torch.equal(before[name], parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    for state in optimizer.state.values():
+        assert state["exp_avg"].dtype == torch.bfloat16
+        assert state["exp_avg_sq"].dtype == torch.bfloat16
+    model.eval()
+    with torch.no_grad():
+        expected = completion_log_probs(model, tokens, 2)
+    model.float()
+    save_adapter(model, tokenizer, tmp_path / "adapter")
+    restored, _ = load_policy(str(path), str(tmp_path / "adapter"), train=True, device="cuda")
+    assert all(parameter.dtype == torch.bfloat16 for parameter in restored.parameters())
+    with torch.no_grad():
+        torch.testing.assert_close(completion_log_probs(restored, tokens, 2), expected)
+
+
+def test_cuda_memory_log_preserves_oom_error(tmp_path):
+    torch = pytest.importorskip("torch")
+    from locodellm.training.grpo import CudaMemoryLog
+
+    if not torch.cuda.is_available():
+        pytest.skip("This check requires a CUDA device.")
+    path = tmp_path / "memory.jsonl"
+    memory_log = CudaMemoryLog(path, "cuda")
+    error = torch.OutOfMemoryError("Diagnostic test: no allocation attempted.")
+    with pytest.raises(torch.OutOfMemoryError) as caught, memory_log.phase("backward", turn=3):
+        raise error
+    assert caught.value is error
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["event"] for record in records] == ["begin", "oom"]
+    assert records[-1]["phase"] == "backward"
+    assert records[-1]["turn"] == 3
+    assert records[-1]["error"] == str(error)
 
 
 def test_cli_rejects_unsafe_or_invalid_runs(tmp_path):
